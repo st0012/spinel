@@ -2610,7 +2610,10 @@ static int emit_constant_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         return 1;
       }
     } }
-    LocalVar *cpcv = nm ? comp_const(c, nm) : NULL;
+    /* a builtin parent the program does not define: never another scope's
+       constant of the same leaf name (see the analyzer's ConstantPathNode arm) */
+    int cp_bi_par = const_path_parent_is_builtin(c, id);
+    LocalVar *cpcv = nm && !cp_bi_par ? comp_const(c, nm) : NULL;
     /* --share-strings: a constant holding the shared handle (#6765) */
     if (cpcv && !slot && repr_of_slot(c, cpcv).kind == RK_STRBUF) {
       char sref[256]; snprintf(sref, sizeof sref, "cst_%s", nm);

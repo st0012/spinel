@@ -1183,6 +1183,8 @@ int builtin_class_id(const char *name);
 int builtin_class_parent_id(int id);   /* analyze_util.c */
 int is_builtin_class_name(const char *n);
 int is_builtin_module_name(const char *n);
+int program_defines_class_leaf(Compiler *c, const char *nm);
+int const_path_parent_is_builtin(Compiler *c, int node);
 int builtin_module_at(int i, const char **name, int *id);
 int is_builtin_exception_name(const char *n);
 const char *superclass_builtin_exc_name(const NodeTable *nt, int sc);   /* analyze_util.c */

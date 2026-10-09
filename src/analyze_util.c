@@ -1,5 +1,6 @@
 #include "analyze_internal.h"
 #include "builtin_names.h"
+#include "holder.h"
 #include <errno.h>
 #include <limits.h>
 
@@ -161,6 +162,56 @@ static const BuiltinClass *builtin_row(const char *n) {
 int is_builtin_class_name(const char *n) {
   const BuiltinClass *r = builtin_row(n);
   return r && (r->flags & BC_CLASS);
+}
+/* Whether the program defines a class or module whose last name is `nm`,
+   at the top level or nested (a nested one is registered under its
+   qualified name, joined with `__`: Frame__JSON__Encoding). */
+int program_defines_class_leaf(Compiler *c, const char *nm) {
+  if (comp_class_index(c, nm) >= 0) return 1;
+  size_t nl = strlen(nm);
+  for (int q = 0; q < c->nclasses; q++) {
+    const char *cn = c->classes[q].name;
+    size_t cl = cn ? strlen(cn) : 0;
+    if (cl > nl + 2 && sp_streq(cn + cl - nl, nm) && cn[cl - nl - 1] == '_' && cn[cl - nl - 2] == '_') return 1;
+  }
+  return 0;
+}
+/* The last name of a registered class: a nested one that the collision
+   qualifier renamed is joined with `__` (Frame__JSON__Encoding). */
+static const char *class_leaf_name(const char *cn) {
+  const char *leaf = cn;
+  for (const char *p = cn; p && p[0]; p++)
+    if (p[0] == '_' && p[1] == '_' && p[2]) leaf = p + 2;
+  return leaf;
+}
+/* Whether the parent of the constant path `node` names the builtin class or
+   module of its name rather than one of the program's. Only a bare parent
+   (`Encoding::BINARY`) or a root one (`::Encoding::BINARY`) can; a parent
+   that is itself a path (`Frame::JSON::Encoding::X`) names the program's.
+   Ruby resolves a bare parent lexically: the bodies enclosing the read,
+   innermost first, then the top level. So `Encoding::BINARY` inside
+   `module Prism` is the builtin's, while inside `module RDoc` it would be
+   RDoc::Encoding's. */
+int const_path_parent_is_builtin(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  int pn = nt_ref(nt, node, "parent");
+  if (pn < 0) return 0;
+  NodeKind pk = nt_kind(nt, pn);
+  int root = pk == NK_ConstantPathNode && nt_ref(nt, pn, "parent") < 0;
+  if (pk != NK_ConstantReadNode && !root) return 0;
+  const char *par = nt_str(nt, pn, "name");
+  if (!par || !(is_builtin_class_name(par) || is_builtin_module_name(par))) return 0;
+  if (!program_defines_class_leaf(c, par)) return 1;
+  if (root) return comp_class_index(c, par) < 0;
+  int ci = holder_scope_class(c, node, holder_cbody(c, node));
+  int guard = 0;
+  for (int k = ci; k >= 0 && guard < 64; k = c->classes[k].enclosing_class, guard++)
+    for (int j = 0; j < c->nclasses; j++)
+      if (c->classes[j].enclosing_class == k && c->classes[j].name &&
+          sp_streq(class_leaf_name(c->classes[j].name), par)) return 0;
+  for (int j = 0; j < c->nclasses; j++)
+    if (c->classes[j].enclosing_class < 0 && c->classes[j].name && sp_streq(c->classes[j].name, par)) return 0;
+  return 1;
 }
 int is_builtin_module_name(const char *n) {
   const BuiltinClass *r = builtin_row(n);

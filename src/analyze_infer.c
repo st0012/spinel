@@ -8279,7 +8279,13 @@ static int infer_constant_path(Compiler *c, int id, const NodeTable *nt, NodeKin
       if (nc > 0 && uniform && ct != TY_UNKNOWN) { *out = ct; return 1; }
     }
   }
-  LocalVar *lv = nm ? comp_const(c, nm) : NULL;
+  /* `Encoding::BINARY` names the builtin's constant, not a program constant
+     that happens to share the leaf (prism's IntegerBaseFlags::BINARY): when
+     the parent is a builtin class or module the program neither defines nor
+     reopens, the leaf lookup below would answer some unrelated scope's
+     constant. */
+  int bi_par = sp_streq(nt_type(nt, id), "ConstantPathNode") && const_path_parent_is_builtin(c, id);
+  LocalVar *lv = nm && !bi_par ? comp_const(c, nm) : NULL;
   /* Same guard the bare ConstantReadNode carries: a registered constant
      whose type never settled (Block = Struct.new(:kind), which registers
      the name before the anonymous class exists) must not shadow the
