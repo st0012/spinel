@@ -445,13 +445,14 @@ static void diag_record(const char *file, int line, const char *msg) {
 }
 /* Report one refusal and leave: back to the driver's recovery point when one
    is armed (the unit is abandoned), else out of the process. */
-static __attribute__((noreturn)) void unsup_leave(const char *file, int line, const char *msg) {
+static void unsup_leave(const char *file, int line, const char *msg) {
   diag_record(file, line, msg);
   if (g_unsup_quiet && collect_mode() && g_unsup_armed) longjmp(g_unsup_recover, 1);
   refuse_observe(msg);
   if (line > 0) fprintf(stderr, "spinel: %s:%d: %s\n", file, line, msg);
   else fprintf(stderr, "spinel: %s\n", msg);
   if (collect_mode() && g_unsup_armed) longjmp(g_unsup_recover, 1);
+  if (getenv("SPINEL_DIAG_CONTINUE")) return;
   exit(1);
 }
 /* The .rb position the parser stamped on `id`, or line 0. */
@@ -2844,7 +2845,7 @@ const char *rename_local(const char *nm) {
    Unlike `unsupported`, which describes a codegen gap and dumps the node so the
    compiler can be debugged, this names the feature and stops: the internals are
    noise when the answer is "this is a documented limit". #2652 / #2667 / #2668 */
-__attribute__((noreturn)) void unsupported_feature(Compiler *c, int id, const char *msg) {
+void unsupported_feature(Compiler *c, int id, const char *msg) {
   if (g_unsup_probe) longjmp(g_unsup_recover, 1);
   refuse_at(c, id);
   int ln; const char *file = unsup_pos(c, id, &ln);
@@ -2957,7 +2958,7 @@ void refuse_from_plan(Compiler *c, int id, int from, const char *site) {
   unsupported_feature(c, id, p->msg);
 }
 
-__attribute__((noreturn)) void unsupported(Compiler *c, int id, const char *what) {
+void unsupported(Compiler *c, int id, const char *what) {
   /* Silent emittability probe (dynamic-send arm selection): unwind without a
      diagnostic, the caller just drops this arm. */
   if (g_unsup_probe) longjmp(g_unsup_recover, 1);

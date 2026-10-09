@@ -1160,10 +1160,10 @@ void emit_str_cmp_prologue(Compiler *c, const char *rtxt, int operand,
 /* 1 iff any class defines a usable #to_int / #to_str -- see codegen.c. */
 int prog_has_conv_method(Compiler *c, const char *conv, TyKind want);
 
-__attribute__((noreturn)) void unsupported(Compiler *c, int id, const char *what);
+void unsupported(Compiler *c, int id, const char *what);
 int unsup_message(Compiler *c, int id, const char *what, int self_ci, char *msg, size_t cap);
 void refuse_from_plan(Compiler *c, int id, int from, const char *site);
-__attribute__((noreturn)) void unsupported_feature(Compiler *c, int id, const char *msg);
+void unsupported_feature(Compiler *c, int id, const char *msg);
 
 /* Compile a regexp literal with the engine and throw the result away, to
    refuse at COMPILE time a pattern that would only have failed at the

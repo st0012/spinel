@@ -15879,7 +15879,7 @@ static int poly_local_shows_string(Compiler *c, const char *vn, Scope *vs) {
   return 0;
 }
 static int sa_unseen_element(Compiler *c, int u, int k);
-static __attribute__((noreturn)) void sa_refuse(Compiler *c, int id, int route);
+static void sa_refuse(Compiler *c, int id, int route);
 static void sa_refuse_element(Compiler *c, int e, int u);
 /* A master route refusal at node `site` for String node `v` that the
    route hands along as a copy: under --share-strings the copy is right
@@ -34417,7 +34417,7 @@ static const char *sa_msg(int route) {
       "variable (a String is not yet shared by reference through such an Array element). Push the "
       "variable itself into a local Array with `<<` or `push`.";
 }
-static __attribute__((noreturn)) void sa_refuse(Compiler *c, int id, int route) {
+static void sa_refuse(Compiler *c, int id, int route) {
   unsupported_feature(c, id, sa_msg(route));
 }
 /* Route 3 for String `e` that Array call `u` adds: under --share-strings
