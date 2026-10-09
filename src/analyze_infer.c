@@ -7947,7 +7947,7 @@ static int value_arm_is(const NodeTable *nt, int v, int node) {
    rebuilt per fixpoint iteration and when the table grows, like the
    receiver set above, and each node on it is checked as the walk did, so
    one that no longer holds the yield answers no. */
-enum { YU_WRITE, YU_ELEMENT, YU_ARGUMENT, YU_RECEIVER, YU_FRAME, YU_BLOCK };
+enum { YU_WRITE, YU_ELEMENT, YU_ARGUMENT, YU_RECEIVER, YU_FRAME, YU_BLOCK, YU_RETURN };
 static const NodeKind yu_write_kinds[] = {
   NK_LocalVariableWriteNode, NK_LocalVariableOperatorWriteNode,
   NK_LocalVariableOrWriteNode, NK_LocalVariableAndWriteNode,
@@ -8033,6 +8033,11 @@ static int yield_uses(Compiler *c, int y) {
       int bn = 0; const int *bs = nt_arr(nt, st, "body", &bn);
       if (bs && bn > 0 && bs[bn - 1] >= 0 && bs[bn - 1] < nt->count &&
           nt_kind(nt, bs[bn - 1]) == NK_YieldNode) yu_add(bs[bn - 1], w, YU_FRAME);
+    }
+    NT_FOREACH_KIND(nt, NK_ReturnNode, w) {
+      int an = nt_ref(nt, w, "arguments"), ac = 0;
+      const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
+      if (av && ac == 1) yu_collect(nt, av[0], w, YU_RETURN);
     }
     g_yu_gen = g_narrow_gen; g_yu_nt = nt; g_yu_cnt = nt->count;
   }
@@ -8513,6 +8518,16 @@ static int infer_yield_node(Compiler *c, int id, const NodeTable *nt, NodeKind n
            a wrong value into C that does not compile when this arm widened
            every method. */
         if (yield_recv_builtin_every_site(c, w)) { *out = TY_POLY; return 1; }
+        break;
+      }
+      case YU_RETURN: {
+        /* `return yield` in the same position: the method's value is the
+           yield's, its return slot settles at the first site analyzed, and
+           method_call_ret's per-site arm only reads a bare-yield tail. So
+           `with { nil }` ahead of `p(with { "xyz" })` printed nil. */
+        int an = nt_ref(nt, w, "arguments"), ac = 0;
+        const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
+        if (av && ac == 1 && value_arm_is(nt, av[0], id)) { *out = TY_POLY; return 1; }
         break;
       }
       case YU_FRAME: {
