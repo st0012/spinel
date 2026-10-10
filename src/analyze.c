@@ -15389,9 +15389,15 @@ static int strbuf_ivar_any_str_mut(Compiler *c, int cid, const char *nm) {
 /* True if ivar `nm` of class `cid` is handed to a method as an argument
    anywhere in that class's own scopes. Such a call may take the slot by
    reference, which only works when the receiver itself is a heap object.
-   A keyword hands over its value just as a positional argument does. */
-static int an_ivar_passed_as_arg(Compiler *c, int cid, const char *nm) {
+   A keyword hands over its value just as a positional argument does.
+   The (class, ivar) pairs are collected in one walk of the tree on the first
+   question and answered from that set after: the walk per question made the
+   value-type check grow with classes times nodes. */
+typedef struct { int cid; const char *nm; } IvArgPair;
+typedef struct { IvArgPair *v; int n, cap, built; } IvArgSet;
+static void ivarg_build(Compiler *c, IvArgSet *set) {
   const NodeTable *nt = c->nt;
+  set->built = 1;
   for (int id = 0; id < nt->count; id++) {
     if (nt_kind(nt, id) != NK_CallNode) continue;
     int args = nt_ref(nt, id, "arguments");
@@ -15406,12 +15412,24 @@ static int an_ivar_passed_as_arg(Compiler *c, int cid, const char *nm) {
         int v = kw ? nt_ref(nt, el[e], "value") : el[e];
         if (nt_kind(nt, v) != NK_InstanceVariableReadNode) continue;
         const char *ivn = nt_str(nt, v, "name");
-        if (!ivn || !nm || !sp_streq(ivn, nm)) continue;
-        Scope *sc = comp_scope_of(c, v);
-        if (sc && sc->class_id == cid) return 1;
+        Scope *sc = ivn ? comp_scope_of(c, v) : NULL;
+        if (!sc) continue;
+        if (set->n == set->cap) {
+          set->cap = set->cap ? set->cap * 2 : 16;
+          set->v = realloc(set->v, (size_t)set->cap * sizeof *set->v);
+        }
+        set->v[set->n].cid = sc->class_id;
+        set->v[set->n].nm = ivn;
+        set->n++;
       }
     }
   }
+}
+static int an_ivar_passed_as_arg(Compiler *c, IvArgSet *set, int cid, const char *nm) {
+  if (!nm) return 0;
+  if (!set->built) ivarg_build(c, set);
+  for (int i = 0; i < set->n; i++)
+    if (set->v[i].cid == cid && sp_streq(set->v[i].nm, nm)) return 1;
   return 0;
 }
 
@@ -41216,6 +41234,7 @@ static void an_phase_value_types(Compiler *c) {
      represented by value (sp_X, no heap/GC) when it is a small, immutable,
      scalar-only leaf whose instances never need a heap pointer (never boxed,
      stored, passed, or captured). See reference_legacy_value_type_logic. */
+  IvArgSet ivargs = { NULL, 0, 0, 0 };
   for (int i = 0; i < c->nclasses; i++) {
     ClassInfo *ci = &c->classes[i];
     if (ci->is_struct) continue;
@@ -41244,7 +41263,7 @@ static void an_phase_value_types(Compiler *c) {
       /* the same mutation one call away: `helper(@s, x)` where the helper
          appends to its parameter writes through the slot's address, and a
          by-value receiver would hand it the address of a copy */
-      if (t == TY_STRING && an_ivar_passed_as_arg(c, i, ci->ivars[j])) { scalar = 0; break; }
+      if (t == TY_STRING && an_ivar_passed_as_arg(c, &ivargs, i, ci->ivars[j])) { scalar = 0; break; }
     }
     if (!scalar) continue;
     int has_sub = 0;
@@ -41253,6 +41272,7 @@ static void an_phase_value_types(Compiler *c) {
     if (has_sub) continue;
     ci->is_value_type = 1;   /* tentative; disqualified below */
   }
+  free(ivargs.v);
   unsigned char *vt_cand = NULL;
   if (g_nil_check) {
     vt_cand = calloc((size_t)c->nclasses + 1, 1);
