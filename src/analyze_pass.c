@@ -3219,6 +3219,16 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
           lv->type = TY_POLY_ARRAY; lv->push_widened = 1; changed = 1;
           continue;
         }
+        /* An UNTYPED parameter, which no call site has typed: every caller
+           passes an empty `[]` this push fills. What it pushes is recorded
+           for the binding, which gives such a caller's array the element
+           (fill_empty_array_arg), as a push in the caller's scope would. */
+        if (lv->type == TY_UNKNOWN && is_push && vt != TY_UNKNOWN && !concat_scalar) {
+          TyKind was = lv->unbound_push_elem;
+          TyKind now = (was == TY_UNKNOWN) ? vt : (was == vt ? was : TY_POLY);
+          if (now != was) { lv->unbound_push_elem = now; changed = 1; }
+          continue;
+        }
         /* A BOXED parameter is the same hazard with the container hidden:
            the callee pushes through it into the caller's own array, and the
            container is not visible here to compare against. Record WHAT is
@@ -6809,6 +6819,64 @@ static int call_in_transplanted_source(Compiler *c, int call_id) {
   return cs && cs->is_transplanted_source;
 }
 
+/* 1 when class `cls` writes instance variable `ivn` somewhere, and every
+   write is an empty `[]` (`@list = []`, `@list ||= []`). */
+static int ivar_writes_all_empty_array(Compiler *c, int cls, const char *ivn) {
+  const NodeTable *nt = c->nt;
+  int saw = 0;
+  static const NodeKind kinds[] = { NK_InstanceVariableWriteNode, NK_InstanceVariableOrWriteNode,
+                                    NK_InstanceVariableAndWriteNode, NK_InstanceVariableOperatorWriteNode };
+  for (int k = 0; k < 4; k++) {
+    NT_FOREACH_KIND(nt, kinds[k], w) {
+      const char *wn = nt_str(nt, w, "name");
+      if (!wn || !sp_streq(wn, ivn) || comp_ivar_owner(c, w) != cls) continue;
+      if (kinds[k] != NK_InstanceVariableWriteNode && kinds[k] != NK_InstanceVariableOrWriteNode) return 0;
+      int v = nt_ref(nt, w, "value");
+      int en = 0;
+      if (v < 0 || nt_kind(nt, v) != NK_ArrayNode) return 0;
+      nt_arr(nt, v, "elements", &en);
+      if (en != 0) return 0;
+      saw = 1;
+    }
+  }
+  return saw;
+}
+
+/* An empty `[]` handed to a parameter the method pushes `elem` into
+   (unbound_push_elem): a local or an instance variable whose every write is
+   the empty literal is that array, filled inside the callee through the
+   reference. It takes the element, as a push in its own scope would give
+   it. Untyped, it bound the parameter nothing and the push typed neither
+   until after inference, where a call that needs the element kind
+   (`list.partition { }`) had been left without one. An instance variable
+   the re-narrow clears is filled again by the next binding. 1 on a
+   change. */
+static int fill_empty_array_arg(Compiler *c, int arg, TyKind elem) {
+  const NodeTable *nt = c->nt;
+  arg = unwrap_parens(c, arg);
+  TyKind want = ty_array_of(elem);
+  if (!ty_is_array(want)) return 0;
+  if (nt_kind(nt, arg) == NK_LocalVariableReadNode) {
+    const char *an = nt_str(nt, arg, "name");
+    Scope *asc = an ? comp_scope_of(c, arg) : NULL;
+    LocalVar *al = asc ? scope_local(asc, an) : NULL;
+    if (!al || al->is_param || al->is_block_param || al->rbs_seeded || al->type != TY_UNKNOWN ||
+        !local_all_writes_empty_array(c, asc, an)) return 0;
+    al->type = want;
+    return 1;
+  }
+  if (nt_kind(nt, arg) == NK_InstanceVariableReadNode) {
+    const char *ivn = nt_str(nt, arg, "name");
+    int cls = ivn ? comp_ivar_owner(c, arg) : -1;
+    int iv = cls >= 0 ? comp_ivar_index(&c->classes[cls], ivn) : -1;
+    if (iv < 0 || c->classes[cls].ivar_types[iv] != TY_UNKNOWN ||
+        !ivar_writes_all_empty_array(c, cls, ivn)) return 0;
+    c->classes[cls].ivar_types[iv] = want;
+    return 1;
+  }
+  return 0;
+}
+
 static int bind_args_params(Compiler *c, int call_id, int mi, const int *argv, int argc) {
   if (mi < 0) return 0;
   const NodeTable *nt = c->nt;
@@ -6955,6 +7023,9 @@ static int bind_args_params(Compiler *c, int call_id, int mi, const int *argv, i
     else
       merged = ty_unify(p->type, at);
     changed |= slot_set(c, p, merged, at, anode);
+    /* Reverse binding for an empty `[]` the method fills (fill_empty_array_arg) */
+    if (at == TY_UNKNOWN && p->unbound_push_elem != TY_UNKNOWN)
+      changed |= fill_empty_array_arg(c, anode, p->unbound_push_elem);
     /* Reverse binding: an empty-`{}`-only local passed to a hash parameter is
        that hash container, filled inside the callee through the reference.
        Type the local as the param's hash so it is constructed (sp_<H>Hash_new)
