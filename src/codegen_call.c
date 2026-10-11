@@ -26827,10 +26827,92 @@ int emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b) {
    nil answers only its own surface, so such an answer is the value's
    non-nilness rather than a constant */
 int g_rto_nil_obj = 0;
+/* set by respond_to_static_answer when the receiver's class and the
+   subclasses its instances may have answer differently: the class whose
+   instances the call must then ask by their own class id */
+int g_rto_by_cls = -1;
+/* What an instance whose class is exactly cid answers to Object#respond_to?
+   (qm): 1 / 0, or -1 when only the runtime can tell (its class defines
+   respond_to?, or a private match under a runtime include_all). implicit_ok
+   adds the names a class answers without a method entry (Enumerable's,
+   Comparable's, a Struct's); the receiverless form leaves them out. */
+static int rto_exact_class_answer(Compiler *c, int cid, const char *qm,
+                                  int include_all, int foldable, int implicit_ok) {
+  /* the class's own respond_to? answers, not the method table */
+  if (comp_method_in_chain(c, cid, "respond_to?", NULL) >= 0) return -1;
+  /* a writer query (`m=`) consults the writer table under its base name */
+  size_t ql = strlen(qm);
+  int is_wr = ql > 0 && qm[ql - 1] == '=';
+  char wbase[256]; wbase[0] = '\0';
+  if (is_wr && ql - 1 < sizeof wbase) { memcpy(wbase, qm, ql - 1); wbase[ql - 1] = '\0'; }
+  int found = ((comp_method_in_chain(c, cid, qm, NULL) >= 0 &&
+                !method_hidden_from_reflection(c, cid, qm)) ||
+               comp_reader_in_chain(c, cid, qm, NULL) ||
+               (is_wr && comp_writer_in_chain(c, cid, wbase, NULL))) &&
+              !comp_is_undeffed_in_chain(c, cid, qm);
+  /* the names the class answers without a method-table entry: an
+     Enumerable includer's, a Comparable's, a Struct's or a Data's
+     core names (#2663) */
+  if (!found) return implicit_ok && class_implicit_responds(c, cid, qm);
+  if (comp_method_vis_in_chain(c, cid, qm) == SP_VIS_PUBLIC) return 1;
+  return foldable ? include_all : -1;
+}
+/* The answer for a receiver typed as class cid, which holds an instance of
+   cid or of any subclass: a method the base class runs on self
+   (`respond_to?("do_" + m)` in a servlet base, where only the subclass
+   defines do_GET) must see the subclass's methods. When the classes an
+   instance may have disagree, g_rto_by_cls names cid and the answer is -1,
+   for the emitter to ask the object's class id. */
+static int rto_subtree_answer(Compiler *c, int cid, const char *qm,
+                              int include_all, int foldable, int implicit_ok) {
+  int a = rto_exact_class_answer(c, cid, qm, include_all, foldable, implicit_ok);
+  if (a < 0 || c->classes[cid].is_value_type) return a;
+  int mixed = 0;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (k == cid || !c->classes[k].instantiated || !is_descendant(c, k, cid)) continue;
+    int ak = rto_exact_class_answer(c, k, qm, include_all, foldable, implicit_ok);
+    if (ak < 0) return -1;
+    if (ak != a) mixed = 1;
+  }
+  if (!mixed) return a;
+  g_rto_by_cls = cid;
+  return -1;
+}
+/* Emit the per-class answer g_rto_by_cls asked for, after a -1 from
+   respond_to_static_answer for the call id: the instance's class id read
+   off the object (self when recv < 0), true for the classes under the
+   receiver's class that answer qm. A nil slot answers nil's own surface.
+   Answers 1 when it emitted. */
+int emit_respond_to_by_cls(Compiler *c, int recv, const char *qm, int argc,
+                           const int *argv, Buf *b) {
+  int cid = g_rto_by_cls;
+  if (cid < 0) return 0;
+  int include_all = argc >= 2 && nt_kind(c->nt, argv[1]) == NK_TrueNode;
+  int nil_slot = recv >= 0 && g_rto_nil_obj;
+  int t = ++g_tmp;
+  buf_printf(b, "({ sp_int *_t%d = (sp_int *)(", t);
+  if (recv >= 0) emit_expr(c, recv, b); else buf_puts(b, g_self);
+  buf_puts(b, "); ");
+  if (nil_slot) buf_printf(b, "_t%d ? ", t);
+  buf_puts(b, "(");
+  int any = 0;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (!is_descendant(c, k, cid)) continue;
+    if (rto_exact_class_answer(c, k, qm, include_all, 1, recv >= 0) != 1) continue;
+    buf_printf(b, "%s*_t%d == %d", any ? " || " : "", t, k);
+    any = 1;
+  }
+  if (!any) buf_puts(b, "0");
+  buf_puts(b, ")");
+  if (nil_slot) buf_printf(b, " : %d", nil_answers_name(qm) || sp_streq(qm, "rationalize"));
+  buf_puts(b, "; })");
+  return 1;
+}
 int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm,
                                     int argc, const int *argv) {
   const NodeTable *nt = c->nt;
   g_rto_nil_obj = 0;
+  g_rto_by_cls = -1;
   /* respond_to?(sym, include_all=false): by default only public methods
      answer true; a literal `true` 2nd arg includes private+protected. A
      non-literal 2nd arg can't be folded, so a private/protected match is
@@ -26993,29 +27075,9 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       /* a heap object slot holds nil as NULL (a defaulted `host = nil`
          parameter), and nil answers only its own surface */
       if (!comp_ty_value_obj(c, rt)) g_rto_nil_obj = 1;
-      /* the class's own respond_to? answers, not the method table */
-      if (comp_method_in_chain(c, cid, "respond_to?", NULL) >= 0) return -1;
-      /* a writer query (`m=`) consults the writer table under its base name */
-      size_t ql = strlen(qm);
-      int is_wr = ql > 0 && qm[ql - 1] == '=';
-      char wbase[256]; wbase[0] = '\0';
-      if (is_wr && ql - 1 < sizeof wbase) { memcpy(wbase, qm, ql - 1); wbase[ql - 1] = '\0'; }
-      int found = ((comp_method_in_chain(c, cid, qm, NULL) >= 0 &&
-                    !method_hidden_from_reflection(c, cid, qm)) ||
-                   comp_reader_in_chain(c, cid, qm, NULL) ||
-                   (is_wr && comp_writer_in_chain(c, cid, wbase, NULL))) &&
-                  !comp_is_undeffed_in_chain(c, cid, qm);
-      /* the names the class answers without a method-table entry: an
-         Enumerable includer's, a Comparable's, a Struct's or a Data's
-         core names (#2663) */
-      if (!found && class_implicit_responds(c, cid, qm)) { resolved = 1; yes = 1; }
-      else if (!found) { resolved = 1; yes = 0; }
-      else {
-        int v = comp_method_vis_in_chain(c, cid, qm);
-        if (v == SP_VIS_PUBLIC) { resolved = 1; yes = 1; }       /* public: always */
-        else if (foldable) { resolved = 1; yes = include_all; }  /* private/protected */
-        /* else: private/protected + runtime include_all -> unresolved */
-      }
+      int a = rto_subtree_answer(c, cid, qm, include_all, foldable, 1);
+      if (a < 0) return -1;
+      resolved = 1; yes = a;
     }
     else if (recv < 0) {
       /* implicit self: resolve against the enclosing scope's class. An
@@ -27028,10 +27090,6 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       if (ss && ss->class_id >= 0) {
         int cid = ss->class_id;
         if (!ss->is_cmethod && comp_method_in_chain(c, cid, "respond_to?", NULL) >= 0) return -1;
-        size_t ql = strlen(qm);
-        int is_wr = ql > 0 && qm[ql - 1] == '=';
-        char wbase[256]; wbase[0] = '\0';
-        if (is_wr && ql - 1 < sizeof wbase) { memcpy(wbase, qm, ql - 1); wbase[ql - 1] = '\0'; }
         if (ss->is_cmethod) {
           /* implicit self is the class object itself: same answer as
              the explicit `Const.respond_to?` fold, including the
@@ -27044,20 +27102,11 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
             yes = 1;
         }
         else {
-          int found = ((comp_method_in_chain(c, cid, qm, NULL) >= 0 &&
-                        !method_hidden_from_reflection(c, cid, qm)) ||
-                       comp_reader_in_chain(c, cid, qm, NULL) ||
-                       (is_wr && comp_writer_in_chain(c, cid, wbase, NULL))) &&
-                      !comp_is_undeffed_in_chain(c, cid, qm);
-          if (!found) { resolved = 1; yes = 0; }
-          else {
-            /* receiverless respond_to? still answers false for a private
-               or protected match unless include_all folded true. */
-            int v = comp_method_vis_in_chain(c, cid, qm);
-            if (v == SP_VIS_PUBLIC) { resolved = 1; yes = 1; }
-            else if (foldable) { resolved = 1; yes = include_all; }
-            /* else: private/protected + runtime include_all -> unresolved */
-          }
+          /* receiverless respond_to? still answers false for a private
+             or protected match unless include_all folded true. */
+          int a = rto_subtree_answer(c, cid, qm, include_all, foldable, 0);
+          if (a < 0) return -1;
+          resolved = 1; yes = a;
         }
       }
       /* in a class body, self is the class object: as in a class method
