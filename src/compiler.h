@@ -271,6 +271,15 @@ typedef struct {
   unsigned char oa_grace; /* narrow_object_arrays reached no decision on this
                        slot last round and kept its own pin once; a second
                        such round drops the pin (#4962) */
+  TyKind wt_prev;   /* the type infer_write_types started from the time
+                       before last (its stash then), for poly_cycle */
+  unsigned char poly_cycle; /* times the write pass brought this slot back
+                       from poly to the type it had before. A read ahead of
+                       the slot's own write carries the last round's type
+                       only when it is concrete, so `to, f = File.split(t)`
+                       then `to = to.split("/")` derives poly from a String
+                       and a String from poly, round after round, to the
+                       cap. Past a few returns the slot stays poly. */
   TyKind rbs_type;  /* the type an --rbs seed declared for this slot, kept
                        beside `type` because inference may narrow the slot
                        afterwards. A narrowing of an `untyped` (poly) seed is

@@ -4555,6 +4555,20 @@ int infer_write_types(Compiler *c) {
     for (int i = 0; i < c->scopes[s].nlocals; i++)
       lv_keep_decisions(&c->scopes[s].locals[i], 1);
 
+  /* A slot the pass keeps bringing back from poly to the type it had the
+     time before (LocalVar.poly_cycle) settles poly: what it alternates
+     with is the narrower half of its own writes */
+  for (int s = 0; s < c->nscopes; s++)
+    for (int i = 0; i < c->scopes[s].nlocals; i++) {
+      LocalVar *lv = &c->scopes[s].locals[i];
+      if (lv->is_param || lv->is_block_param || lv->rbs_seeded) continue;
+      TyKind was = (TyKind)lv->gc_root;
+      if (was == TY_POLY && lv->type != TY_POLY && lv->type != TY_UNKNOWN &&
+          lv->type == lv->wt_prev && lv->poly_cycle < 255) lv->poly_cycle++;
+      if (lv->poly_cycle >= 3) lv->type = TY_POLY;
+      lv->wt_prev = was;
+    }
+
   /* Detect change vs the stashed old types -- over EXACTLY the slots the reset
      above stashed. It used to skip only params and block params, so a slot the
      reset skips for the third reason, rbs_seeded, was compared against a
