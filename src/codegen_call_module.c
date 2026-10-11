@@ -11,6 +11,18 @@
 #include "repr.h"
 #include "codegen_call_arms.h"
 
+/* A File.join part, boxed: a splat's operand (`File.join(*parts)`, whose
+   length only the run time knows) as the Array it spreads, which the join
+   flattens */
+static void emit_file_join_part(Compiler *c, int node, Buf *b) {
+  if (nt_kind(c->nt, node) == NK_SplatNode && nt_ref(c->nt, node, "expression") >= 0) {
+    buf_puts(b, "sp_splat_to_array(");
+    emit_boxed(c, nt_ref(c->nt, node, "expression"), b);
+    buf_puts(b, ")");
+  }
+  else emit_boxed(c, node, b);
+}
+
 /* File.join's scalar and flattened routes keep their operands alive
    across every later argument, including argument setup emitted in g_pre. */
 static void emit_file_join_args(Compiler *c, const int *argv, int argc, int boxed, Buf *b) {
@@ -28,7 +40,7 @@ static void emit_file_join_args(Compiler *c, const int *argv, int argc, int boxe
   int first = emit_rooted_arg_list(c, argv, argc,
                                  boxed ? "sp_RbVal" : "const char *",
                                  boxed ? "SP_GC_ROOT_RBVAL" : "SP_GC_ROOT_STR",
-                                 boxed ? emit_boxed : emit_path_expr, NULL, b);
+                                 boxed ? emit_file_join_part : emit_path_expr, NULL, b);
   buf_printf(b, "%s((%s[]){", boxed ? "sp_file_join_vals" : "sp_file_join",
              boxed ? "sp_RbVal" : "const char *");
   for (int i = 0; i < argc; i++) buf_printf(b, "%s_t%d", i ? ", " : "", first + i);
@@ -347,7 +359,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       for (int k = 0; k < argc; k++) {
         Repr jr = repr_of(c, argv[k]);
         TyKind jt = jr.as_ty;
-        if (ty_is_array(jt) || jt == TY_POLY_ARRAY || jr.kind == RK_BOXED) has_dyn = 1;
+        if (ty_is_array(jt) || jt == TY_POLY_ARRAY || jr.kind == RK_BOXED ||
+            nt_kind(c->nt, argv[k]) == NK_SplatNode) has_dyn = 1;
       }
       emit_file_join_args(c, argv, argc, has_dyn, b);
       return 1;
