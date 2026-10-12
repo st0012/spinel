@@ -2448,18 +2448,15 @@ const BuiltinOp *an_bop_find(Compiler *c, int id, TyKind rt, const char *name,
   return op;
 }
 
-/* (generic builtin entry prototype) A call on a boxed receiver whose only
-   argument is a splat, of a name some builtin answers: where a user class
-   also owns the name, the class-id dispatch's builtin default cannot read
-   the list (its emitters take typed arguments of a fixed count), so it
-   calls the builtin's generic entry instead, which takes the list as a
-   boxed (argc, argv) and answers boxed. The methods every object has and
-   the key-list and line readers keep the arms that read a splat
-   themselves. SPINEL_NO_BI_GENERIC turns it off. */
+/* A call on a boxed receiver whose only argument is a splat, of a name a
+   builtin answers when called with a receiver: where a user class also
+   owns the name, the class-id dispatch's builtin default cannot read the
+   list (its emitters take typed arguments of a fixed count), so it calls
+   the builtin's generic entry instead (bi_generic_fn), which takes the list
+   as (argc, argv) and answers boxed. Object's own methods, and the names
+   whose builtin default reads a splat itself (poly_splat_keyed), keep the
+   arms they have. */
 int an_bi_generic_splat(Compiler *c, int id) {
-  static int off = -1;
-  if (off < 0) off = getenv("SPINEL_NO_BI_GENERIC") != NULL;
-  if (off) return 0;
   const NodeTable *nt = c->nt;
   if (id < 0 || nt_kind(nt, id) != NK_CallNode || nt_ref(nt, id, "block") >= 0) return 0;
   if (nt_ref(nt, id, "receiver") < 0 || call_is_safe_nav(nt, id)) return 0;
@@ -2468,14 +2465,9 @@ int an_bi_generic_splat(Compiler *c, int id) {
   int an = nt_ref(nt, id, "arguments"), n = 0;
   const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &n) : NULL;
   if (n != 1 || nt_kind(nt, av[0]) != NK_SplatNode) return 0;
-  static const char *const own[] = {
-    "respond_to?", "is_a?", "kind_of?", "instance_of?", "inspect", "to_s", "==", "!=",
-    "eql?", "equal?", "hash", "nil?", "frozen?", "class", "object_id", "===",
-    "slice", "values_at", "fetch_values", "dig", "except", "delete", NULL };
-  for (int k = 0; own[k]; k++) if (sp_streq(name, own[k])) return 0;
-  if (is_line_read(name)) return 0;
+  if (object_public_method_name(name) || poly_splat_keyed(name)) return 0;
   int lo, hi;
-  return builtin_name_arity_span(name, 0, &lo, &hi);
+  return builtin_recv_arity_span(name, &lo, &hi);
 }
 
 /* A boxed receiver or a boxed first operand (infer_call_inner's rules, in their order) */
