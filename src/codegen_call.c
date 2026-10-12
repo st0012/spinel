@@ -7078,6 +7078,14 @@ static int emit_poly_builtin_default_spread(Compiler *c, int id, int recv, const
   free(arms.p);
   return 1;
 }
+/* Set while a count's arm of a builtin's generic entry is emitted
+   (bi_generic_fn): the answer the analysis recorded for the call is the
+   splatted form's, so each count asks its own. */
+static int g_bi_count_arm = 0;
+static int emit_poly_builtin_default_generic(Compiler *c, int id, int recv, const char *name,
+                                             int argc, const int *argv, const int *atmp,
+                                             const TyKind *atmp_ty, TyKind ret, int tv, int tr,
+                                             int label, Buf *b);
 int emit_poly_builtin_default(Compiler *c, int id, int recv, const char *name,
                                      int argc, const int *argv, const int *atmp,
                                      const TyKind *atmp_ty, TyKind ret, int tv, int tr,
@@ -7085,7 +7093,9 @@ int emit_poly_builtin_default(Compiler *c, int id, int recv, const char *name,
   if (recv >= 0 && name && argc > 0 && atmp && nt_kind(c->nt, argv[0]) == NK_SplatNode &&
       emit_poly_builtin_default_spread(c, id, recv, name, argc, argv, atmp, ret, tv, tr, label, b))
     return 1;
-  return emit_poly_builtin_default_at(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, tv, tr, label, b);
+  if (emit_poly_builtin_default_at(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, tv, tr, label, b))
+    return 1;
+  return emit_poly_builtin_default_generic(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, tv, tr, label, b);
 }
 /* Emits call `id` through fn under the silent probe the dynamic-send arms
    use, so an emitter that refuses drops the arm and not the build, with the
@@ -7176,7 +7186,7 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
         (rereads || (repr_of(c, argv[a]).as_ty != atmp_ty[a] && !held_h)))
       return 0;
   }
-  TyKind bt = (c->poly_builtin_ty && id < c->node_cap)
+  TyKind bt = (c->poly_builtin_ty && id < c->node_cap && !g_bi_count_arm)
                 ? c->poly_builtin_ty[id] : TY_UNKNOWN;
   /* `to_s` / `inspect` answer a String on every builtin receiver, with or
      without an argument (Integer#to_s(base)); the analysis types them by the
@@ -7263,6 +7273,8 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
       buf_printf(&ib, " : sp_String_new_shared(%s))", nb->p);
     }
     else if (wrap_h && !is_raise) buf_printf(&ib, "sp_String_new_shared(%s)", nb->p);
+    /* a generic entry's arm typed boxed: boxed by the C type it has */
+    else if (g_bi_count_arm && ret == TY_POLY && bt == TY_POLY && !is_raise) buf_printf(&ib, "SP_BI_BOX(%s)", nb->p);
     else buf_puts(&ib, nb->p);
   }
   free(nb->p); free(nb);
@@ -7559,6 +7571,219 @@ static int pd_hoist(Compiler *c, int id, const char *name, Buf *b, size_t from, 
   for (int a = 0; a < np; a++) buf_printf(b, "%s_t%d", a ? ", " : "", pid[a]);
   buf_puts(b, ");");
   free(tnum); free(tdecl); free(canon); free(body.p); free(sig.p); free(key.p);
+  return 1;
+}
+
+/* ---- Generic builtin entries (prototype) ----
+
+   A builtin reached through a boxed receiver is C written inline at the
+   call site, specialized to its arguments' count and types. A call whose
+   arguments are one splat (`io.read(*args)` beside a user `read`) has
+   neither until the run, so the class-id dispatch's builtin default had
+   nothing to write and raised NoMethodError.
+
+   The generic entry is that builtin as a function of its own: it takes the
+   receiver and the list boxed, as (argc, argv) -- the way CRuby's C methods
+   are called -- and answers boxed. Its body is one arm per count the name
+   takes, each the same re-entered emission the builtin default writes for
+   a call of that many boxed arguments, on a call node of its own so no
+   site's facts shape it. One function per name, shared by every site that
+   needs it, and written out only when the finished program calls it
+   (pd_emit_used). The analysis types such a call boxed
+   (an_bi_generic_splat). SPINEL_NO_BI_GENERIC turns it off. */
+#define BI_GENERIC_MAX 4
+static struct { char *name; int fn; } *bi_tab;
+static int bi_n, bi_cap;
+int g_bi_stats[3];   /* entries built, sites served, sites declined */
+
+/* Does the text name only temps it declares (and the two it is handed),
+   nothing of the function it was emitted inside -- a local, self, a frame
+   slot, a label, a return? pd_hoist's test, for a body of our own. */
+static int bi_self_contained(const char *r, int tv, int tr) {
+  size_t rn = strlen(r);
+  int cap = 64, nt = 0, ok = 1;
+  int *seen = malloc(sizeof(int) * (size_t)cap);
+  for (size_t i = 0; i < rn && ok; ) {
+    char ch = r[i];
+    if (ch == '"' || ch == '\'') {
+      char q = ch; i++;
+      while (i < rn && r[i] != q) { if (r[i] == '\\') i++; i++; }
+      i++;
+      continue;
+    }
+    if (ch == '#') {   /* a #line directive: skip to its end */
+      while (i < rn && r[i] != '\n') i++;
+      continue;
+    }
+    if (!pd_idch(ch) || (ch >= '0' && ch <= '9')) { i++; continue; }
+    size_t st = i;
+    while (i < rn && pd_idch(r[i])) i++;
+    size_t len = i - st;
+    const char *w = r + st;
+    if ((st >= 2 && r[st - 2] == '-' && r[st - 1] == '>') || (st >= 1 && r[st - 1] == '.')) continue;
+#define BI_IS(lit) (len == sizeof(lit) - 1 && memcmp(w, lit, len) == 0)
+    if (BI_IS("self") || BI_IS("goto") || BI_IS("return") || BI_IS("continue") ||
+        BI_IS("__label__") || BI_IS("_gcf") || (len > 3 && memcmp(w, "lv_", 3) == 0)) { ok = 0; break; }
+#undef BI_IS
+    if (len < 3 || w[0] != '_' || w[1] != 't') continue;
+    int is_t = 1;
+    for (size_t k = 2; k < len && is_t; k++) if (w[k] < '0' || w[k] > '9') is_t = 0;
+    if (!is_t) continue;
+    int num = atoi(w + 2);
+    if (num == tv || num == tr) continue;
+    int known = 0;
+    for (int k = 0; k < nt; k++) if (seen[k] == num) { known = 1; break; }
+    if (known) continue;
+    /* its first appearance must declare it: a type word (or `*`) before it,
+       `=` or `;` after it */
+    size_t q = st;
+    while (q > 0 && r[q - 1] == ' ') q--;
+    if (q > 0 && r[q - 1] == '*') { q--; while (q > 0 && r[q - 1] == ' ') q--; }
+    size_t e = q;
+    while (q > 0 && pd_idch(r[q - 1])) q--;
+    size_t a = i;
+    while (a < rn && r[a] == ' ') a++;
+    int decl = e > q && !(r[q] >= '0' && r[q] <= '9') &&
+               a < rn && ((r[a] == '=' && (a + 1 >= rn || r[a + 1] != '=')) || r[a] == ';');
+    if (decl) {
+      size_t wl = e - q;
+      if ((wl == 4 && memcmp(r + q, "else", 4) == 0) || (wl == 6 && memcmp(r + q, "return", 6) == 0) ||
+          (wl == 4 && memcmp(r + q, "case", 4) == 0)) decl = 0;
+    }
+    if (!decl) { ok = 0; break; }
+    if (nt == cap) { cap *= 2; seen = realloc(seen, sizeof(int) * (size_t)cap); }
+    seen[nt++] = num;
+  }
+  free(seen);
+  return ok;
+}
+
+/* The generic entry of `name`, built from the arms the builtin surface
+   writes for a boxed receiver: sp_pd_<fn>, or -1 when no count has one. */
+static int bi_generic_fn(Compiler *c, int id, const char *name) {
+  for (int i = 0; i < bi_n; i++) if (sp_streq(bi_tab[i].name, name)) return bi_tab[i].fn;
+  NodeTable *nt = (NodeTable *)c->nt;
+  int lo = 0, hi = -1;
+  if (!builtin_name_arity_span(name, 0, &lo, &hi)) { lo = 0; hi = BI_GENERIC_MAX; }
+  int maxn = (hi < 0 || hi > BI_GENERIC_MAX) ? BI_GENERIC_MAX : hi;
+  if (lo > maxn) lo = maxn;
+  /* a call of its own: a boxed receiver and boxed arguments, bound to the
+     function's parameters, in the site's scope */
+  int call = nt_new_node(nt, "CallNode");
+  int self = nt_new_node(nt, "LocalVariableReadNode");
+  int el[BI_GENERIC_MAX], an[BI_GENERIC_MAX + 1];
+  for (int k = 0; k < BI_GENERIC_MAX; k++) {
+    el[k] = nt_new_node(nt, "LocalVariableReadNode");
+    nt_node_set_str(nt, el[k], "name", "__spinel_bi_arg");
+  }
+  for (int n = 0; n <= BI_GENERIC_MAX; n++) {
+    an[n] = nt_new_node(nt, "ArgumentsNode");
+    nt_node_set_arr(nt, an[n], "arguments", el, n);
+  }
+  nt_node_set_str(nt, self, "name", "__spinel_bi_self");
+  nt_node_set_str(nt, call, "name", name);
+  nt_node_set_ref(nt, call, "receiver", self);
+  nt_node_set_ref(nt, call, "block", -1);
+  comp_grow_node_arrays(c);
+  int sc = c->nscope[id];
+  /* the parameters are no locals of the site's scope: a read the inference
+     asks answers boxed through the read's own narrowing */
+  c->ntype[self] = TY_POLY; c->nilnarrow[self] = TY_POLY; c->nscope[self] = sc; c->nscope[call] = sc;
+  for (int k = 0; k < BI_GENERIC_MAX; k++) {
+    c->ntype[el[k]] = TY_POLY; c->nilnarrow[el[k]] = TY_POLY; c->nscope[el[k]] = sc;
+  }
+  for (int n = 0; n <= BI_GENERIC_MAX; n++) c->nscope[an[n]] = sc;
+  int tv = ++g_tmp, tr = ++g_tmp;
+  RenPark rp = ren_park(0);
+  Buf arms; memset(&arms, 0, sizeof arms);
+  int any = 0;
+  for (int n = lo; n <= maxn; n++) {
+    int slot = g_n_argov;
+    for (int k = 0; k < n; k++) view_bind(el[k], "_bi_argv[%d]", k);
+    nt_node_set_ref(nt, call, "arguments", n ? an[n] : -1);
+    int eatmp[BI_GENERIC_MAX];
+    TyKind ety[BI_GENERIC_MAX];
+    for (int k = 0; k < BI_GENERIC_MAX; k++) { eatmp[k] = tv; ety[k] = TY_POLY; }
+    Buf one; memset(&one, 0, sizeof one);
+    int sv = g_bi_count_arm;
+    g_bi_count_arm = 1;
+    int ok = emit_poly_builtin_default_at(c, call, self, name, n, n ? el : NULL, n ? eatmp : NULL,
+                                          n ? ety : NULL, TY_POLY, tv, tr, 0, &one);
+    g_bi_count_arm = sv;
+    view_unbind(slot);
+    if (ok && one.p && bi_self_contained(one.p, tv, tr)) {
+      buf_printf(&arms, "  case %d:%s\n", n, one.p);
+      any = 1;
+    }
+    /* a count the surface has no arm for raises what the dispatch raised
+       before there was an entry */
+    else buf_printf(&arms, "  case %d: sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)); break;\n", n, name, tv);
+    free(one.p);
+  }
+  ren_unpark(&rp);
+  int fn = -1;
+  if (any) {
+    char key[300];
+    snprintf(key, sizeof key, "bi:%s", name);
+    int is_new = 0;
+    fn = pd_lookup_or_add(key, &is_new);
+    if (fn >= pd_def_cap) {
+      int nc = pd_def_cap ? pd_def_cap * 2 : 1024;
+      while (nc <= fn) nc *= 2;
+      pd_proto = realloc(pd_proto, sizeof(char *) * (size_t)nc);
+      pd_def = realloc(pd_def, sizeof(char *) * (size_t)nc);
+      pd_def_cap = nc;
+    }
+    Buf pb; memset(&pb, 0, sizeof pb);
+    buf_printf(&pb, "static SP_UNUSED SP_NOINLINE sp_RbVal sp_pd_%d(sp_RbVal _bi_self, sp_int _bi_argc, "
+                    "const sp_RbVal *_bi_argv);\n", fn);
+    Buf db; memset(&db, 0, sizeof db);
+    buf_printf(&db, "/* %s(*args) on a builtin: the generic entry */\n", name);
+    buf_printf(&db, "static sp_RbVal sp_pd_%d(sp_RbVal _bi_self, sp_int _bi_argc, const sp_RbVal *_bi_argv) {\n"
+                    "  SP_GC_SAVE();\n  sp_RbVal _t%d = _bi_self; sp_RbVal _t%d = sp_box_nil();\n"
+                    "  switch (_bi_argc) {\n%s",
+               fn, tv, tr, arms.p);
+    /* past the counts written out (a name some builtin takes any number of
+       arguments for): what the dispatch raised before */
+    if (hi < 0)
+      buf_printf(&db, "  default: if (_bi_argc < %d) sp_raise_arity(_bi_argc, %d, -1, NULL); "
+                      "sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)); break;\n", lo, lo, name, tv);
+    else
+      buf_printf(&db, "  default: sp_raise_arity(_bi_argc, %d, %d, NULL); break;\n", lo, hi);
+    buf_printf(&db, "  }\n  return _t%d;\n}\n", tr);
+    pd_proto[fn] = pb.p; pd_def[fn] = db.p;
+    g_bi_stats[0]++;
+  }
+  free(arms.p);
+  if (bi_n == bi_cap) { bi_cap = bi_cap ? bi_cap * 2 : 16; bi_tab = realloc(bi_tab, sizeof *bi_tab * (size_t)bi_cap); }
+  bi_tab[bi_n].name = strdup(name); bi_tab[bi_n].fn = fn; bi_n++;
+  return fn;
+}
+
+/* The dispatch's builtin default for a lone splat no arm reads: the
+   generic entry, handed the list the dispatch already flattened. */
+static int emit_poly_builtin_default_generic(Compiler *c, int id, int recv, const char *name,
+                                             int argc, const int *argv, const int *atmp,
+                                             const TyKind *atmp_ty, TyKind ret, int tv, int tr,
+                                             int label, Buf *b) {
+  (void)recv;
+  if (argc != 1 || !atmp || !atmp_ty || tr < 0 || !an_bi_generic_splat(c, id)) return 0;
+  (void)argv;
+  if (ret != TY_POLY || atmp_ty[0] != TY_POLY_ARRAY) {
+    g_bi_stats[2]++;
+    if (getenv("SPINEL_BI_DEBUG"))
+      fprintf(stderr, "bi-generic: %s declined (slot %d, list %d)\n", name, (int)ret, (int)atmp_ty[0]);
+    return 0;
+  }
+  int fn = bi_generic_fn(c, id, name);
+  if (fn < 0) {
+    g_bi_stats[2]++;
+    if (getenv("SPINEL_BI_DEBUG")) fprintf(stderr, "bi-generic: %s has no arm\n", name);
+    return 0;
+  }
+  g_bi_stats[1]++;
+  buf_printf(b, "%s _t%d = sp_pd_%d(_t%d, _t%d->len, _t%d->data); break;",
+             label ? " default:" : "", tr, fn, tv, atmp[0], atmp[0]);
   return 1;
 }
 

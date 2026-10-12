@@ -2448,6 +2448,36 @@ const BuiltinOp *an_bop_find(Compiler *c, int id, TyKind rt, const char *name,
   return op;
 }
 
+/* (generic builtin entry prototype) A call on a boxed receiver whose only
+   argument is a splat, of a name some builtin answers: where a user class
+   also owns the name, the class-id dispatch's builtin default cannot read
+   the list (its emitters take typed arguments of a fixed count), so it
+   calls the builtin's generic entry instead, which takes the list as a
+   boxed (argc, argv) and answers boxed. The methods every object has and
+   the key-list and line readers keep the arms that read a splat
+   themselves. SPINEL_NO_BI_GENERIC turns it off. */
+int an_bi_generic_splat(Compiler *c, int id) {
+  static int off = -1;
+  if (off < 0) off = getenv("SPINEL_NO_BI_GENERIC") != NULL;
+  if (off) return 0;
+  const NodeTable *nt = c->nt;
+  if (id < 0 || nt_kind(nt, id) != NK_CallNode || nt_ref(nt, id, "block") >= 0) return 0;
+  if (nt_ref(nt, id, "receiver") < 0 || call_is_safe_nav(nt, id)) return 0;
+  const char *name = nt_str(nt, id, "name");
+  if (!name) return 0;
+  int an = nt_ref(nt, id, "arguments"), n = 0;
+  const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &n) : NULL;
+  if (n != 1 || nt_kind(nt, av[0]) != NK_SplatNode) return 0;
+  static const char *const own[] = {
+    "respond_to?", "is_a?", "kind_of?", "instance_of?", "inspect", "to_s", "==", "!=",
+    "eql?", "equal?", "hash", "nil?", "frozen?", "class", "object_id", "===",
+    "slice", "values_at", "fetch_values", "dig", "except", "delete", NULL };
+  for (int k = 0; own[k]; k++) if (sp_streq(name, own[k])) return 0;
+  if (is_line_read(name)) return 0;
+  int lo, hi;
+  return builtin_name_arity_span(name, 0, &lo, &hi);
+}
+
 /* A boxed receiver or a boxed first operand (infer_call_inner's rules, in their order) */
 static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt, TyKind a0, TyKind *out) {
   /* poly receiver / poly operand: result type of operations on sp_RbVal */
@@ -2907,6 +2937,10 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
          The builtin answer's own shape is recorded for codegen, which emits
          the builtin arm by re-entering the ordinary emission and has to know
          whether that produces an array pointer or a boxed value. */
+      /* a splat the dispatch hands to a builtin's generic entry: its answer
+         is boxed, whatever the count the list has at run time */
+      if (found && !an_builtin_only && rt == TY_POLY && an_bi_generic_splat(c, id))
+        { *out = TY_POLY; return 1; }
       if (found && !an_builtin_only && poly_container_read_p(name) &&
           nt_ref(nt, id, "block") < 0 && poly_expr_flows_container(c, recv)) {
         { *out = an_poly_concrete(c, name, TY_POLY); return 1; }
