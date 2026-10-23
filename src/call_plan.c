@@ -120,6 +120,14 @@ int cplan_super_chain_mi(Compiler *c, Scope *s, int par, const char *name) {
     int up = c->classes[c->scopes[mi].class_id].parent;
     mi = up >= 0 ? comp_cmethod_in_chain(c, up, name, NULL) : -1;
   }
+  /* (a superclass chain ends in Object: a reopening of it is the last
+     class the super looks in) */
+  if (mi < 0 && par >= 0 && !s->is_cmethod) {
+    int top = par;
+    while (c->classes[top].parent >= 0) top = c->classes[top].parent;
+    int obj = comp_super_parent(c, top, 0);
+    if (obj >= 0 && obj != top) mi = comp_method_in_chain(c, obj, name, NULL);
+  }
   return mi;
 }
 

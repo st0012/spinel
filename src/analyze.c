@@ -24625,8 +24625,11 @@ static int an_ret_handle(Compiler *c, RetHandles *R, int mi);
 int an_super_object_text(Compiler *c, int n, int mi) {
   if (mi <= 0 || mi >= c->nscopes) return 0;
   const Scope *s = &c->scopes[mi];
-  if (!s->name || s->is_cmethod || s->class_id < 0 || s->nparams != 0 ||
-      (!sp_streq(s->name, "inspect") && !sp_streq(s->name, "to_s")))
+  /* (an included module's method under the class's own is a shadow of the
+     class: `__inc_0_inspect`) */
+  const char *nm = s->name ? comp_prep_user_name(s->name) : NULL;
+  if (!nm || s->is_cmethod || s->class_id < 0 || s->nparams != 0 ||
+      (!sp_streq(nm, "inspect") && !sp_streq(nm, "to_s")))
     return 0;
   NodeKind k = nt_kind(c->nt, n);
   if (k != NK_SuperNode && k != NK_ForwardingSuperNode) return 0;
@@ -24639,7 +24642,10 @@ int an_super_object_text(Compiler *c, int n, int mi) {
       ci->is_native_class || ci->nsub_root > 0 ||
       comp_ary_root(c, cid) >= 0 || class_inherits_builtin_exception(c, cid) || class_is_exc_subclass(c, cid))
     return 0;
-  return ci->parent < 0 || comp_method_in_chain(c, ci->parent, s->name, NULL) < 0;
+  if (ci->parent >= 0 && comp_method_in_chain(c, ci->parent, nm, NULL) >= 0) return 0;
+  /* (an included module's method, or an Object reopening's, is the call
+     plan's target) */
+  return cplan_user_fresh(c, n)->mi < 0;
 }
 /* Method mi is decided: yes or no, and for the handle walk its field. */
 static int an_ret_decided(Compiler *c, RetHandles *R, int mi, int yes) {
@@ -24712,6 +24718,16 @@ static int an_tail_recv_answer(Compiler *c, int n) {
    tap, whose literal block takes no parameter and leaves by no `break`? It
    answers x, and the block has no name for it
    (`take(n) = @b.byteslice(@pos, n).tap { @pos += n }`). */
+/* Does method mi end in `self` (`def tap; yield self; self; end`)? */
+static int tap_answers_self(Compiler *c, int mi) {
+  const NodeTable *nt = c->nt;
+  int dn = c->scopes[mi].def_node, body = dn >= 0 ? nt_ref(nt, dn, "body") : -1;
+  if (body >= 0 && nt_kind(nt, body) == NK_StatementsNode) {
+    int bn = 0; const int *bb = nt_arr(nt, body, "body", &bn);
+    body = bn > 0 ? bb[bn - 1] : -1;
+  }
+  return body >= 0 && nt_kind(nt, body) == NK_SelfNode;
+}
 static int an_tail_tap_blind(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, n, "receiver"), blk = nt_ref(nt, n, "block");
@@ -24720,8 +24736,15 @@ static int an_tail_tap_blind(Compiler *c, int n) {
       call_breaks(c, n) || comp_method_index(c, "tap") >= 0) return 0;
   TyKind rt = comp_ntype(c, recv);
   if (rt != TY_STRING && rt != TY_STRBUF) return 0;
-  int si = comp_class_index(c, "String");
-  return si < 0 || comp_method_in_chain(c, si, "tap", NULL) < 0;
+  /* (a String's tap is found in String, Comparable, Object, Kernel and
+     BasicObject: a reopening of any of them can give it another) */
+  static const char *const owners[] = { "String", "Comparable", "Object", "Kernel", "BasicObject" };
+  for (size_t i = 0; i < sizeof owners / sizeof *owners; i++) {
+    int oi = comp_class_index(c, owners[i]);
+    int mi = oi >= 0 ? comp_method_in_chain(c, oi, "tap", NULL) : -1;
+    if (mi >= 0 && !tap_answers_self(c, mi)) return 0;
+  }
+  return 1;
 }
 /* ---- a local a method builds its answer up in (#9258) ----
    `out = +""; ...; out << x; ...; out`: every write of the local is a new
