@@ -4063,15 +4063,24 @@ static int main_call_site(Compiler *c, int call_id) {
 /* The method of top-level module entry k that a bare call named `name`
    reaches: an instance method, else a module method. An extend gives main
    only a module_function's private copy of one (mf_only): a plain
-   `def self.x` is the module's own. (An include keeps every module method:
-   a builtin module's module functions, ERB::Util's, are spelled
-   `def self.x`.) */
+   `def self.x` is the module's own, and CRuby raises NameError for a bare
+   `x`. An include takes the same copies, and also a class-side copy from
+   another module. */
 static int toplevel_mod_method(Compiler *c, int k, const char *name, int mf_only) {
   int ci = c->toplevel_includes[k];
   int mi = comp_method_in_chain(c, ci, name, NULL);
   if (mi >= 0) return mi;
   mi = comp_cmethod_in_chain(c, ci, name, NULL);
-  return mi >= 0 && (!mf_only || c->scopes[mi].is_module_function) ? mi : -1;
+  if (mi < 0 || c->scopes[mi].is_module_function) return mi;
+  if (mf_only) return -1;
+  /* An include does not bring the module's own singleton methods (a plain
+     `def self.x`, or one in its `class << self`): CRuby raises NameError
+     for a bare `x`. A copy that another module brought to the class side
+     (a `singleton_class.prepend` or an extend, in front of the module's own
+     module function of the name) still answers. */
+  const Scope *ms = &c->scopes[mi];
+  int own = ms->class_id == ci && !ms->origin_module_ci && !ms->is_prepend_copy && !ms->is_extend_copy;
+  return own ? -1 : mi;
 }
 int comp_included_method_index(Compiler *c, const char *name, int call_id) {
   if (!name) return -1;
