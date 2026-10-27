@@ -53,6 +53,23 @@ p pick(1).merge!({r: 1}, {s: 2})
 p pick(0).merge!({r: 1}, {s: 2})
 [Pair.new, {q: 1}].each { |x| p x.merge!({r: 1}, {s: 2}) }
 
+# a Hash in a value that may be a Hash or an Integer, beside a program
+# class with a merge of one argument: every argument is merged in
+class Flash
+  def merge(other) = self
+end
+def opts(x) = x
+cfg = opts(ARGV.size > 2 ? 1 : {k: 1})
+p cfg.merge({l: 1}, {m: 1})
+p cfg.merge({k: 5}, {k: 7}) { |k, o, n| o + n }
+p Flash.new.merge({}).class
+
+# Set#merge with several arguments
+require "set"
+st = Set[1]
+st.merge([2], [3])
+p st
+
 # update with several Hashes and a block, on a plain Hash
 u = {x: 1, y: 2}
 u.update({x: 1}, {y: 2}) { |k, o, n| o + n }

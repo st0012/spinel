@@ -8086,6 +8086,16 @@ static int lit_name_is(const NodeTable *nt, int n, const char *nm) {
    knows (`%i[merge! update].each { |m| define_method(m) ... }`); or a
    module prepended, whose methods are not followed here (`Hash.prepend(M)`
    is a `prepend M` in a `class Hash` by now) */
+/* Call `call` is an alias_method or define_method that may bind `nm`: of
+   that name, or of a name not written out. */
+static int dyn_def_binds_name(const NodeTable *nt, int call, const char *nm) {
+  const char *cn = nt_kind(nt, call) == NK_CallNode ? nt_str(nt, call, "name") : NULL;
+  if (!cn || (!sp_streq(cn, "alias_method") && !sp_streq(cn, "define_method"))) return 0;
+  int ca = nt_ref(nt, call, "arguments"), an = 0;
+  const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &an) : NULL;
+  NodeKind ak = an >= 1 ? nt_kind(nt, av[0]) : NK_NONE;
+  return an >= 1 && ((ak != NK_SymbolNode && ak != NK_StringNode) || lit_name_is(nt, av[0], nm));
+}
 static int binds_name_under(const NodeTable *nt, int root, const char *nm) {
   if (root < 0 || root >= nt->count) return 0;
   NodeKind k = nt_kind(nt, root);
@@ -8093,12 +8103,7 @@ static int binds_name_under(const NodeTable *nt, int root, const char *nm) {
   if (k == NK_AliasMethodNode && lit_name_is(nt, nt_ref(nt, root, "new_name"), nm)) return 1;
   const char *cn = k == NK_CallNode ? nt_str(nt, root, "name") : NULL;
   if (cn && sp_streq(cn, "prepend") && nt_ref(nt, root, "receiver") < 0) return 1;
-  if (cn && (sp_streq(cn, "alias_method") || sp_streq(cn, "define_method"))) {
-    int ca = nt_ref(nt, root, "arguments"), an = 0;
-    const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &an) : NULL;
-    NodeKind ak = an >= 1 ? nt_kind(nt, av[0]) : NK_NONE;
-    if (an >= 1 && ((ak != NK_SymbolNode && ak != NK_StringNode) || lit_name_is(nt, av[0], nm))) return 1;
-  }
+  if (dyn_def_binds_name(nt, root, nm)) return 1;
   for (int j = 0; j < nt_num_refs(nt, root); j++) if (binds_name_under(nt, nt_ref_at(nt, root, j), nm)) return 1;
   for (int j = 0; j < nt_num_arrs(nt, root); j++) {
     int an = 0; const int *ids = nt_arr_at(nt, root, j, &an);
@@ -8142,29 +8147,31 @@ static int hash_merges_own(const NodeTable *nt, const char *nm, int memo[3]) {
   if (memo[2] < 0) memo[2] = hash_reopen_defines(nt, "merge");
   return memo[i] || memo[2];
 }
+/* Whether def node `d` takes `an` positional arguments. A def with
+   required keywords is said to take them, as is one whose parameters are
+   not read here. */
+static int def_takes_argc(const NodeTable *nt, int d, int an) {
+  int pn = d >= 0 ? nt_ref(nt, d, "parameters") : -1;
+  if (pn < 0) return an == 0;
+  int rn = 0, on = 0, qn = 0;
+  nt_arr(nt, pn, "requireds", &rn); nt_arr(nt, pn, "optionals", &on); nt_arr(nt, pn, "posts", &qn);
+  return an >= rn + qn && (nt_ref(nt, pn, "rest") >= 0 || an <= rn + qn + on);
+}
+
 /* Whether the program may give some object its own `nm` (merge, merge! or
-   update): a def of it on any receiver, an alias to it, an alias_method or
+   update) that takes `an` arguments in one call: a def of it on any
+   receiver that takes them, an alias to it, an alias_method or
    define_method of it or of a name not written out, or a method_missing.
-   The classes are not registered yet, so every binding counts. Asked once
-   per pass for each name (`memo[]` -1 until then). */
-static int hash_merge_name_owned(const NodeTable *nt, const char *nm, int memo[3]) {
-  int i = sp_streq(nm, "merge") ? 0 : sp_streq(nm, "merge!") ? 1 : 2;
-  if (memo[i] >= 0) return memo[i];
-  memo[i] = 0;
+   The classes are not registered yet, so every such binding counts. */
+static int hash_merge_name_owned(const NodeTable *nt, const char *nm, int an) {
   NT_FOREACH_KIND(nt, NK_DefNode, d) {
     const char *dn = nt_str(nt, d, "name");
-    if (dn && (sp_streq(dn, nm) || sp_streq(dn, "method_missing"))) return memo[i] = 1;
+    if (dn && ((sp_streq(dn, nm) && def_takes_argc(nt, d, an)) || sp_streq(dn, "method_missing"))) return 1;
   }
   NT_FOREACH_KIND(nt, NK_AliasMethodNode, a)
-    if (lit_name_is(nt, nt_ref(nt, a, "new_name"), nm)) return memo[i] = 1;
-  NT_FOREACH_KIND(nt, NK_CallNode, call) {
-    const char *cn = nt_str(nt, call, "name");
-    if (!cn || (!sp_streq(cn, "alias_method") && !sp_streq(cn, "define_method"))) continue;
-    int ca = nt_ref(nt, call, "arguments"), an = 0;
-    const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &an) : NULL;
-    NodeKind ak = an >= 1 ? nt_kind(nt, av[0]) : NK_NONE;
-    if (an >= 1 && ((ak != NK_SymbolNode && ak != NK_StringNode) || lit_name_is(nt, av[0], nm))) return memo[i] = 1;
-  }
+    if (lit_name_is(nt, nt_ref(nt, a, "new_name"), nm)) return 1;
+  NT_FOREACH_KIND(nt, NK_CallNode, call)
+    if (dyn_def_binds_name(nt, call, nm)) return 1;
   return 0;
 }
 
@@ -8264,33 +8271,53 @@ static int hash_merge_fold(Compiler *c, int id, int typed) {
   return 1;
 }
 
+/* Whether method mi takes `an` arguments in one call: a method with no def
+   node (define_method, an attribute) is said to. */
+static int scope_takes_argc(Compiler *c, int mi, int an) {
+  return c->scopes[mi].def_node < 0 || def_takes_argc(c->nt, c->scopes[mi].def_node, an);
+}
+/* Whether class k answers `nm` with a method of its own (a Hash subclass's
+   or Hash's reopened one included) that takes `an` arguments. */
+static int class_takes_merge_argc(Compiler *c, int k, const char *nm, int an) {
+  int mi = comp_method_in_chain(c, k, nm, NULL);
+  return mi >= 0 && scope_takes_argc(c, mi, an);
+}
+
 /* The fold of hash_merge_fold, for a call desugar_enum_chain_shapes left
-   because the program may own the name: once the receiver is typed a Hash
-   (or a Hash subclass instance) whose class takes the builtin method, the
-   call folds as it would have before. */
+   (marked merge_fold_wait) because the program may own the name. Once the
+   receiver is typed, a Hash or an object of a class with no method of the
+   name that takes every argument in one call folds as it would have
+   before. Any other receiver (a class, a String, ...) keeps the call. */
 int desugar_hash_merge_fold(Compiler *c) {
   /* the fold cannot be taken back: a block parameter typed a Hash in an
      optimistic round may hold the program's own object after */
   if (g_infer_optimistic) return 0;
   NodeTable *nt = (NodeTable *)c->nt;
   int changed = 0;
-  int memo[3] = { -1, -1, -1 };
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    if (!nt_int(nt, id, "merge_fold_wait", 0)) continue;
     const char *nm = nt_str(nt, id, "name");
-    if (!nm || (!sp_streq(nm, "merge") && !is_hash_merge_bang(nm))) continue;
     int recv = nt_ref(nt, id, "receiver"), argsn = nt_ref(nt, id, "arguments"), an = 0;
-    if (recv < 0 || argsn < 0) continue;
-    const int *av = nt_arr(nt, argsn, "arguments", &an);
-    if (an < 2 || nt_argv_has_splat(nt, av, an)) continue;
-    if (!hash_merge_name_owned(nt, nm, memo)) continue;
+    if (!nm || recv < 0 || argsn < 0) continue;
+    nt_arr(nt, argsn, "arguments", &an);
+    if (an < 2) continue;
     TyKind t = infer_type(c, recv);
-    /* (a receiver nothing typed, such as a `{}` only these calls fill, holds
-       no object of the program's) */
-    if (t == TY_UNKNOWN) {}
-    else if (ty_is_hash(t)) { if (comp_builtin_kind_reopen_mi(c, t, nm) >= 0) continue; }
-    else if (!ty_is_object(t) || !comp_ary_is_hash(c, ty_object_class(t)) ||
-             comp_method_in_chain(c, ty_object_class(t), nm, NULL) >= 0) continue;
-    changed |= hash_merge_fold(c, id, 1);
+    int own = 0;
+    if (ty_is_object(t)) own = class_takes_merge_argc(c, ty_object_class(t), nm, an);
+    else if (ty_is_hash(t)) {
+      int mi = comp_builtin_kind_reopen_mi(c, t, nm);
+      own = mi >= 0 && scope_takes_argc(c, mi, an);
+    }
+    /* a value of either kind: the dispatch's merge! / update arms take every
+       argument, to a Hash and to an object alike (its merge arm reads the
+       first one only, so a merge still folds) */
+    else if (t == TY_POLY) {
+      for (int k = 0; k < c->nclasses && !own && is_hash_merge_bang(nm); k++)
+        own = class_takes_merge_argc(c, k, nm, an);
+    }
+    /* (a receiver nothing typed, such as a `{}` only these calls fill) */
+    else own = t != TY_UNKNOWN;
+    if (!own) changed |= hash_merge_fold(c, id, 1);
   }
   return changed;
 }
@@ -8316,7 +8343,6 @@ static void desugar_enum_chain_shapes(Compiler *c) {
   int n0 = nt->count;
   int *kept_par = NULL;   /* enum_chain_kept's parent map */
   int hash_own_merge[3] = { -1, -1, -1 };   /* hash_merges_own's answers */
-  int hash_merge_owned[3] = { -1, -1, -1 };   /* hash_merge_name_owned's */
   /* A string-bounded range literal bound to a variable (`cr = ('a'..'e')`)
      has no sp_Range representation (int bounds only): materialize it into a
      string array at the assignment, like the literal-receiver interpose
@@ -8367,10 +8393,15 @@ static void desugar_enum_chain_shapes(Compiler *c) {
       nt_node_set_str(nt, id, "name", "merge");
       nm = "merge";
     }
-    if ((sp_streq(nm, "merge") || is_hash_merge_bang(nm)) && recv >= 0) {
+    /* (update without a block keeps its own several-Hash arm) */
+    if ((sp_streq(nm, "merge") || sp_streq(nm, "merge!") ||
+         (sp_streq(nm, "update") && nt_ref(nt, id, "block") >= 0)) && recv >= 0) {
+      int argsn = nt_ref(nt, id, "arguments"), an = 0;
+      if (argsn >= 0) nt_arr(nt, argsn, "arguments", &an);
       /* a receiver that may be the program's own object waits for its type
          (desugar_hash_merge_fold) */
-      if (!hash_merge_name_owned(nt, nm, hash_merge_owned)) hash_merge_fold(c, id, 0);
+      if (an >= 2 && hash_merge_name_owned(nt, nm, an)) nt_node_set_int(nt, id, "merge_fold_wait", 1);
+      else hash_merge_fold(c, id, 0);
       continue;
     }
     /* `m(&lambda_literal)`: attach the lambda's block directly as m's block
