@@ -1,0 +1,20 @@
+"merge 1 1"
+"merge! [:x] [:y]"
+3
+"class merge 1+2"
+{a: 1, b: 2, c: 3}
+{a: 6}
+{a: 5, z: 1}
+{1 => "a", "s" => 2}
+{"b" => 2, "c" => 3}
+side p
+side q
+{p: 1, q: 1}
+{a: 1, b: 2, c: 3}
+H
+"own 1 {c: 3}"
+"merge! [:r] [:s]"
+{q: 1, r: 1, s: 2}
+"merge! [:r] [:s]"
+{q: 1, r: 1, s: 2}
+{x: 2, y: 4}
