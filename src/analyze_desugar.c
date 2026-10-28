@@ -8882,8 +8882,10 @@ int desugar_splat_to_a(Compiler *c) {
       if (!ty_is_object(t)) continue;
       int cid = ty_object_class(t);
       if (cid < 0) continue;
+      /* a Struct answers to_a; a Data value has none, and splats as itself */
       int st = 0;
-      for (int k = cid; k >= 0 && !st; k = c->classes[k].parent) st = c->classes[k].is_struct;
+      for (int k = cid; k >= 0 && !st; k = c->classes[k].parent)
+        st = c->classes[k].is_struct && !c->classes[k].is_data;
       if (!st && !class_answers_own(c, cid, "to_a")) continue;
     }
     int base = nt->count;

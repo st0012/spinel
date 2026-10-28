@@ -1,0 +1,11 @@
+[#<data D a=1>]
+[0, #<data D a=1>, 2]
+1
+[#<data D a=1>]
+#<data D a=1>
+nil
+#<data D a=1>
+[#<data E a=2>]
+[3, 3]
+[#<data G>]
+[3, 4]
