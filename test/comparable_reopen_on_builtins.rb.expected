@@ -1,0 +1,17 @@
+[:cmp, 5]
+[:cmp, 1.5]
+[:cmp, "s"]
+[:cmp, :s]
+[:cmp, #<Box 1>]
+:in
+:out
+[:cmp, 5]
+[:cmp, "s"]
+[:cmp, :s]
+[:cmp, 5]
+[:cmp, "s"]
+[:cmp, 1.5]
+[:cmp, :s]
+:string
+:cmp
+3

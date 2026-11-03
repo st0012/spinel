@@ -22829,6 +22829,237 @@ static const char *rbself_module_host(NodeTable *nt, int n0, const char *mod) {
   return host;
 }
 
+/* ---- a method added to Comparable, on the builtins that include it -------
+ *
+ *   module Comparable
+ *     def clim = [:cmp, self]
+ *   end
+ *   p "s".clim, 2r.clim     # [:cmp, "s"], [:cmp, (2/1)]
+ *
+ * Integer, Float, String and Symbol include Comparable, so a method the
+ * program adds to it is theirs too. Spinel's builtin classes do not list
+ * the program's Comparable among their ancestors: the call raised
+ * NoMethodError on a String or a Symbol, and on any boxed value
+ * (`def g(v) = v.clim; g(5)`). Each such method is
+ * also written into a body of each of those classes, placed right after
+ * the module's body, as the program's own reopening of the class would be:
+ *
+ *   class String
+ *     def clim = [:cmp, self]
+ *   end
+ *
+ * The module keeps its method for the program's own classes that include
+ * it. Only what CRuby would reach through Comparable is copied:
+ *   - a module body of defs (and constant writes) alone: a visibility
+ *     call, an alias or any other statement leaves the whole body as it is;
+ *   - a method name no builtin class has (a builtin's own method comes
+ *     before Comparable's), with no super;
+ *   - not for a class whose program bodies (or Numeric's, for a number)
+ *     define the name, or include or prepend a module: those come before
+ *     Comparable too.
+ * A constant the method reads stays Comparable's: a read of a name the
+ * module body writes becomes the path Comparable::X. A read of a name the
+ * class's own body writes would find the class's instead, so such a
+ * method is not copied into that class. Rational and Complex include
+ * Comparable too, but their reopened methods fold into Object's
+ * (desugar_builtin_reopen_methods), and that fold then compiled the
+ * module's own method with an unknown self: they keep the old answer. */
+static const char *const cmpb_classes[] = { "Integer", "Float", "String", "Symbol" };
+enum { CMPB_N = 4 };
+static int cmpb_is_number(const char *k) { return !sp_streq(k, "String") && !sp_streq(k, "Symbol"); }
+static const char *cmpb_header(const NodeTable *nt, int st) {
+  if (!class_def_opens_cref(nt, st)) return NULL;
+  int cp = nt_ref(nt, st, "constant_path");
+  return cp >= 0 && nt_kind(nt, cp) == NK_ConstantReadNode ? nt_str(nt, cp, "name") : NULL;
+}
+/* Does the subtree hold a node of kind k (named nm, when nm is set)? */
+static int cmpb_has(const NodeTable *nt, int n, NodeKind k, const char *nm) {
+  if (n < 0) return 0;
+  if (nt_kind(nt, n) == k && (!nm || (nt_str(nt, n, "name") && sp_streq(nt_str(nt, n, "name"), nm)))) return 1;
+  int nr = nt_num_refs(nt, n);
+  for (int i = 0; i < nr; i++) if (cmpb_has(nt, nt_ref_at(nt, n, i), k, nm)) return 1;
+  int na = nt_num_arrs(nt, n);
+  for (int i = 0; i < na; i++) {
+    int m = 0; const int *ids = nt_arr_at(nt, n, i, &m);
+    for (int q = 0; q < m; q++) if (cmpb_has(nt, ids[q], k, nm)) return 1;
+  }
+  return 0;
+}
+/* Does a program body named cn (top level, any file) define method nm,
+   write constant nm (want_const), or mix a module in (nm NULL)? */
+static int cmpb_body_has(const NodeTable *nt, const char *cn, const char *nm, int want_const) {
+  for (int r = 0; r < nt_nroots(nt); r++) {
+    int st = nt_ref(nt, nt_root(nt, r), "statements"), bn = 0;
+    const int *bs = st >= 0 ? nt_arr(nt, st, "body", &bn) : NULL;
+    for (int k = 0; k < bn; k++) {
+      const char *hn = cmpb_header(nt, bs[k]);
+      if (!hn || !sp_streq(hn, cn)) continue;
+      int b = class_def_body(nt, bs[k]);
+      if (want_const) { if (cmpb_has(nt, b, NK_ConstantWriteNode, nm)) return 1; continue; }
+      if (!nm) {
+        if (cmpb_has(nt, b, NK_CallNode, "include") || cmpb_has(nt, b, NK_CallNode, "prepend")) return 1;
+        continue;
+      }
+      if (cmpb_has(nt, b, NK_DefNode, nm)) return 1;
+      if (cmpb_has(nt, b, NK_CallNode, "attr_reader") || cmpb_has(nt, b, NK_CallNode, "attr_accessor") ||
+          cmpb_has(nt, b, NK_CallNode, "define_method") || cmpb_has(nt, b, NK_CallNode, "alias_method") ||
+          cmpb_has(nt, b, NK_AliasMethodNode, NULL)) return 1;
+    }
+  }
+  return 0;
+}
+/* A receiverless between? or clamp in the module's method becomes
+   self.between?: the module's own method, compiled for its self, had no
+   arm for the bare form once a builtin class held a method of the name */
+static void cmpb_self_calls(NodeTable *nt, int n) {
+  if (n < 0) return;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode) return;
+  if (k == NK_CallNode && nt_ref(nt, n, "receiver") < 0 && nt_str(nt, n, "name") &&
+      (sp_streq(nt_str(nt, n, "name"), "between?") || sp_streq(nt_str(nt, n, "name"), "clamp"))) {
+    int self = fwd_new_node_like(nt, n, "SelfNode");
+    if (self >= 0) nt_node_set_ref(nt, n, "receiver", self);
+  }
+  int nr = nt_num_refs(nt, n);
+  for (int i = 0; i < nr; i++) cmpb_self_calls(nt, nt_ref_at(nt, n, i));
+  int na = nt_num_arrs(nt, n);
+  for (int i = 0; i < na; i++) {
+    int m = 0; const int *ids = nt_arr_at(nt, n, i, &m);
+    for (int q = 0; q < m; q++) cmpb_self_calls(nt, ids[q]);
+  }
+}
+static const char *const cmpb_own[] = { "==", "<", "<=", ">", ">=", "between?", "clamp", "<=>" };
+static int cmpb_own_name(const char *nm) {
+  for (int j = 0; j < (int)(sizeof cmpb_own / sizeof cmpb_own[0]); j++) if (sp_streq(nm, cmpb_own[j])) return 1;
+  return 0;
+}
+/* Does subtree n call, bare or on self, a method some Comparable body
+   defines that is not one of the copied defs (ms[q] with elig[q])? */
+static int cmpb_calls_left(const NodeTable *nt, int n, const int *ms, const int *elig, int mn) {
+  if (n < 0) return 0;
+  if (nt_kind(nt, n) == NK_CallNode) {
+    int rv = nt_ref(nt, n, "receiver");
+    const char *nm = nt_str(nt, n, "name");
+    /* (Comparable's own methods, which builtins/comparable.rb defines,
+       are the class's as well) */
+    if (nm && (rv < 0 || nt_kind(nt, rv) == NK_SelfNode) && !cmpb_own_name(nm) &&
+        cmpb_body_has(nt, "Comparable", nm, 0)) {
+      int kept = 0;
+      for (int q = 0; q < mn && !kept; q++)
+        kept = elig[q] && nt_str(nt, ms[q], "name") && sp_streq(nt_str(nt, ms[q], "name"), nm);
+      if (!kept) return 1;
+    }
+  }
+  int nr = nt_num_refs(nt, n);
+  for (int i = 0; i < nr; i++) if (cmpb_calls_left(nt, nt_ref_at(nt, n, i), ms, elig, mn)) return 1;
+  int na = nt_num_arrs(nt, n);
+  for (int i = 0; i < na; i++) {
+    int m = 0; const int *ids = nt_arr_at(nt, n, i, &m);
+    for (int q = 0; q < m; q++) if (cmpb_calls_left(nt, ids[q], ms, elig, mn)) return 1;
+  }
+  return 0;
+}
+/* The copy of def d for class k, its reads of the module's constants made
+   paths; -1 when the method is not copied into k */
+static int cmpb_copy(NodeTable *nt, int d, const char *k, int mbody) {
+  int clone = nt_clone_subtree(nt, d);
+  if (clone < 0) return -1;
+  int lo = clone, hi = nt->count;
+  for (int n = lo; n < hi; n++) {
+    if (nt_kind(nt, n) != NK_ConstantReadNode) continue;
+    const char *nm = nt_str(nt, n, "name");
+    if (!nm) continue;
+    if (cmpb_has(nt, mbody, NK_ConstantWriteNode, nm)) {
+      int par = fwd_new_node_like(nt, n, "ConstantReadNode");
+      if (par < 0) return -1;
+      nt_node_set_str(nt, par, "name", "Comparable");
+      nt_node_set_type(nt, n, "ConstantPathNode");
+      nt_node_set_ref(nt, n, "parent", par);
+    }
+    else if (cmpb_body_has(nt, k, nm, 1)) { nt_subtree_blank(nt, clone); return -1; }
+  }
+  return clone;
+}
+int desugar_comparable_reopen_builtins(Compiler *c) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int changed = 0;
+  for (int r = 0; r < nt_nroots(nt); r++) {
+    int st = nt_ref(nt, nt_root(nt, r), "statements"), bn = 0;
+    const int *bs0 = st >= 0 ? nt_arr(nt, st, "body", &bn) : NULL;
+    if (!bs0 || bn == 0) continue;
+    int *bs = malloc(sizeof(int) * (size_t)bn);
+    if (!bs) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    memcpy(bs, bs0, sizeof(int) * (size_t)bn);
+    int *out = malloc(sizeof(int) * (size_t)(bn * (CMPB_N + 1)));
+    if (!out) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    int no = 0, any = 0;
+    for (int i = 0; i < bn; i++) {
+      out[no++] = bs[i];
+      const char *hn = cmpb_header(nt, bs[i]);
+      if (!hn || !sp_streq(hn, "Comparable") || nt_kind(nt, bs[i]) != NK_ModuleNode) continue;
+      int mbody = class_def_body(nt, bs[i]), mn = 0;
+      const int *ms0 = mbody >= 0 ? nt_arr(nt, mbody, "body", &mn) : NULL;
+      int ok = mn > 0;
+      for (int q = 0; q < mn && ok; q++) {
+        NodeKind sk = nt_kind(nt, ms0[q]);
+        if (sk == NK_DefNode ? nt_ref(nt, ms0[q], "receiver") >= 0 : sk != NK_ConstantWriteNode) ok = 0;
+      }
+      if (!ok) continue;
+      int *ms = malloc(sizeof(int) * (size_t)mn);
+      if (!ms) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      memcpy(ms, ms0, sizeof(int) * (size_t)mn);
+      for (int q = 0; q < mn; q++) if (nt_kind(nt, ms[q]) == NK_DefNode) cmpb_self_calls(nt, ms[q]);
+      for (int kc = 0; kc < CMPB_N; kc++) {
+        const char *k = cmpb_classes[kc];
+        if (cmpb_body_has(nt, k, NULL, 0) || (cmpb_is_number(k) && cmpb_body_has(nt, "Numeric", NULL, 0))) continue;
+        int *defs = malloc(sizeof(int) * (size_t)mn), nd = 0;
+        int *elig = calloc((size_t)mn, sizeof(int));
+        if (!defs || !elig) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        for (int q = 0; q < mn; q++) {
+          int d = ms[q];
+          if (nt_kind(nt, d) != NK_DefNode) continue;
+          const char *nm = nt_str(nt, d, "name");
+          int skip = !nm || builtin_instance_name_known(nm) || builtin_method_known_any(nm) ||
+                     builtin_object_method_known(nm);
+          if (!skip) skip = cmpb_own_name(nm);
+          if (!skip) skip = cmpb_has(nt, d, NK_SuperNode, NULL) || cmpb_has(nt, d, NK_ForwardingSuperNode, NULL);
+          if (!skip) skip = cmpb_body_has(nt, k, nm, 0) || (cmpb_is_number(k) && cmpb_body_has(nt, "Numeric", nm, 0));
+          if (!skip) elig[q] = 1;
+        }
+        /* a method that calls (bare or on self) another of Comparable's
+           methods goes only with that one: a call to one left behind would
+           find Kernel's or nothing in the class */
+        for (int again = 1; again; ) {
+          again = 0;
+          for (int q = 0; q < mn; q++)
+            if (elig[q] && cmpb_calls_left(nt, ms[q], ms, elig, mn)) { elig[q] = 0; again = 1; }
+        }
+        for (int q = 0; q < mn; q++) {
+          if (!elig[q]) continue;
+          int cp = cmpb_copy(nt, ms[q], k, mbody);
+          if (cp >= 0) defs[nd++] = cp;
+        }
+        if (nd > 0) {
+          int cls = fwd_new_node_like(nt, bs[i], "ClassNode"), cpn = fwd_new_node_like(nt, bs[i], "ConstantReadNode");
+          int body = fwd_new_node_like(nt, bs[i], "StatementsNode");
+          nt_node_set_str(nt, cpn, "name", k);
+          nt_node_set_ref(nt, cls, "constant_path", cpn);
+          nt_node_set_arr(nt, body, "body", defs, nd);
+          nt_node_set_ref(nt, cls, "body", body);
+          out[no++] = cls;
+          any = 1;
+        }
+        free(defs); free(elig);
+      }
+      free(ms);
+    }
+    if (any) { nt_node_set_arr(nt, st, "body", out, no); changed = 1; }
+    free(out); free(bs);
+  }
+  if (changed) comp_grow_node_arrays(c);
+  return changed;
+}
+
 int desugar_builtin_reopen_self_calls(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n0 = nt->count, changed = 0;
