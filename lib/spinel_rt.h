@@ -6587,7 +6587,11 @@ static int sp_poly_coerce_binop(const char *op, sp_RbVal a, sp_RbVal b, sp_RbVal
 /* A user's or a coerce's `<=>` answer as an Integer or nil: out of line, so
    sp_poly_spaceship keeps the size that lets a sort's comparator inline it
    (the unbox's error arm in its body did not) */
-static SP_NOINLINE SP_COLD sp_oint sp_spaceship_answer(sp_RbVal u) { return sp_unbox_oint(u); }
+static SP_NOINLINE SP_COLD sp_oint sp_spaceship_answer(sp_RbVal u) {
+  /* a Bignum answer counts by its sign, as rb_cmpint reads it */
+  if (u.tag == SP_TAG_BIGINT && u.v.p) { int s = sp_bigint_sign((sp_Bigint *)u.v.p); return sp_oint_of(s < 0 ? -1 : s > 0); }
+  return sp_unbox_oint(u);
+}
 /* The body, inlined where a hot loop compares (a sort's comparator); the
    function below is the one every other caller shares */
 static SP_INLINE sp_oint sp_poly_spaceship_body(sp_RbVal a, sp_RbVal b) {

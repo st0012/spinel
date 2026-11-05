@@ -17058,7 +17058,8 @@ static void emit_user_op_dispatch(Compiler *c, Buf *b, const char *fname, const 
              already allows. A `<=>` that can return nil is typed poly (or has
              no value at all), and `sp_X_cmp(...) == 0` on it is ill-typed C
              -- reachable as soon as the class also defines #coerce. */
-          int cmp_ret_ok = (cm2->ret == TY_INT || cm2->ret == TY_FLOAT);
+          /* a Bignum answer is compared by its sign (sp_bigint_sign) */
+          int cmp_ret_ok = (cm2->ret == TY_INT || cm2->ret == TY_FLOAT || cm2->ret == TY_BIGINT);
           if (cmp_ret_ok && (ty_is_object(cpt) || cpt == TY_POLY)) {
             char cargs[160];
             const char *cguard = NULL;
@@ -17084,8 +17085,10 @@ static void emit_user_op_dispatch(Compiler *c, Buf *b, const char *fname, const 
                          mc_method(c, cm2), cvt ? "*" : "", ccn, cargs);
             else
             buf_printf(b, "        *handled = TRUE; return sp_box_bool((b.tag == SP_TAG_OBJ && b.v.p == a.v.p) || "
-                          "%s(%s(sp_%s *)a.v.p, %s) == 0);\n      }\n",
-                       mc_method(c, cm2), cvt ? "*" : "", ccn, cargs);
+                          "%s%s(%s(sp_%s *)a.v.p, %s)%s == 0);\n      }\n",
+                       cm2->ret == TY_BIGINT ? "sp_bigint_sign(" : "",
+                       mc_method(c, cm2), cvt ? "*" : "", ccn, cargs,
+                       cm2->ret == TY_BIGINT ? ")" : "");
           }
         }
       }
