@@ -20,6 +20,7 @@
    the nil guards and is_a? guards use. */
 #include "analyze_internal.h"
 #include "builtin_names.h"
+#include "repr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,8 +43,13 @@ typedef struct {
   int exit_blk;
   /* loop stack */
   int lp_head[64], lp_body[64], lp_exit[64], nlp;
-  /* begin stack: entry block of each enclosing begin with a rescue */
-  int bg_entry[64], nbg;
+  int lp_endepth[64];
+  /* begin stack: entry block of each begin whose rescue arms are being
+     lowered (retry re-enters it), and the ensure depth inside it */
+  int bg_entry[64], bg_endepth[64], nbg;
+  /* ensure stack: a jump out of a protected body runs the ensure first,
+     then goes on to its target (routed through every ensure it leaves) */
+  int en_block[64], en_nt[64], en_target[64][32], en_tdepth[64][32], nen;
   int protect;       /* >0 inside a body a rescue or ensure guards */
   char *captured;    /* per local index: a closure writes it */
   int want_types;
@@ -104,6 +110,9 @@ static int cfg_fall(CfgB *g) {
   return nb;
 }
 static void cfg_emit(CfgB *g, int kind, int node) {
+  /* inside a protected body every write starts a new block, so the state
+     before it is a block exit an exception edge carries to the rescue */
+  if (g->protect > 0 && kind != EV_READ) cfg_fall(g);
   if (g->cur < 0) g->cur = cfg_new_block(g);   /* dead code: a block no edge reaches */
   CBlock *bl = &g->b[g->cur];
   if (bl->nev >= bl->cev) {
@@ -113,9 +122,6 @@ static void cfg_emit(CfgB *g, int kind, int node) {
     if (!bl->ev_kind || !bl->ev_node) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   }
   bl->ev_kind[bl->nev] = kind; bl->ev_node[bl->nev] = node; bl->nev++;
-  /* inside a protected body every write starts a new block, so the state
-     after it is a block entry an exception edge can carry to the rescue */
-  if (g->protect > 0 && kind != EV_READ) cfg_fall(g);
 }
 static int cfg_local_index(CfgB *g, const char *nm) {
   if (!nm) return -1;
@@ -157,6 +163,19 @@ static void cfg_jump_to(CfgB *g, int target) {
   if (g->cur >= 0) cfg_add_edge(g, g->cur, target);
   g->cur = -1;
 }
+/* a jump to `target` that leaves every ensure above depth `depth`: it goes
+   to the innermost one, which continues it after its body */
+static void cfg_jump_out(CfgB *g, int target, int depth) {
+  if (g->nen > depth && g->nen <= 64) {
+    int f = g->nen - 1;
+    if (g->cur >= 0) cfg_add_edge(g, g->cur, g->en_block[f]);
+    if (g->en_nt[f] < 32) { g->en_target[f][g->en_nt[f]] = target; g->en_tdepth[f][g->en_nt[f]] = depth; g->en_nt[f]++; }
+    else cfg_add_edge(g, g->en_block[f], target);   /* over the limit: a direct edge, still a path */
+    g->cur = -1;
+    return;
+  }
+  cfg_jump_to(g, target);
+}
 /* a two-arm conditional: `then` and `els` (either may be -1) meet after */
 static void cfg_lower_arms(CfgB *g, int then, int els, int then_binds) {
   int before = g->cur;
@@ -177,7 +196,7 @@ static void cfg_lower_loop(CfgB *g, int n, int post) {
   int body = nt_ref(nt, n, "statements");
   int head = cfg_new_block(g), bodyb = cfg_new_block(g), exitb = cfg_new_block(g);
   if (post) cfg_jump_to(g, bodyb); else cfg_jump_to(g, head);
-  if (g->nlp < 64) { g->lp_head[g->nlp] = head; g->lp_body[g->nlp] = bodyb; g->lp_exit[g->nlp] = exitb; }
+  if (g->nlp < 64) { g->lp_head[g->nlp] = head; g->lp_body[g->nlp] = bodyb; g->lp_exit[g->nlp] = exitb; g->lp_endepth[g->nlp] = g->nen; }
   g->nlp++;
   g->cur = head;
   cfg_lower(g, pred);
@@ -193,25 +212,34 @@ static void cfg_lower_begin(CfgB *g, int body, int rescue, int els, int ensure) 
   int guarded = rescue >= 0 || ensure >= 0;
   int entry = cfg_fall(g);
   int first = g->nb;              /* blocks made from here on are protected */
+  int en = -1;
+  if (ensure >= 0) {
+    en = cfg_new_block(g);
+    if (g->nen < 64) { g->en_block[g->nen] = en; g->en_nt[g->nen] = 0; }
+    g->nen++;
+  }
   if (guarded) g->protect++;
-  if (g->nbg < 64) g->bg_entry[g->nbg] = entry;
-  g->nbg++;
   cfg_lower_list(g, body);
-  g->nbg--;
-  if (guarded) g->protect--;
   int last = g->nb;
   int after_body = g->cur;
   int join = cfg_new_block(g);
+  /* an exception in a rescue or else arm reaches the ensure, not the
+     rescue arms, so the arms stay protected only while an ensure exists */
+  if (ensure < 0 && guarded) g->protect--;
   /* the else arm runs after a body that raised nothing */
   g->cur = after_body;
   if (els >= 0) { cfg_fall(g); cfg_lower(g, els); }
   int normal_exit = g->cur;
-  /* rescue arms: any protected block (its entry state) can reach each one */
+  /* rescue arms: any protected block of the body can reach each one, with
+     the state at its exit (a write starts a new block, so the state before
+     and after every write is one of them) */
   int rexits[64]; int nrex = 0;
+  if (g->nbg < 64) { g->bg_entry[g->nbg] = entry; g->bg_endepth[g->nbg] = g->nen; }
+  g->nbg++;
   for (int r = rescue; r >= 0; r = nt_ref(nt, r, "subsequent")) {
     int rb = cfg_new_block(g);
     cfg_add_edge(g, entry, rb);
-    for (int k = first; k < last; k++) cfg_add_edge(g, k, rb);
+    for (int k = first; k < last; k++) if (k != en) cfg_add_edge(g, k, rb);
     g->cur = rb;
     int ref = nt_ref(nt, r, "reference");
     if (ref >= 0) {
@@ -222,16 +250,23 @@ static void cfg_lower_begin(CfgB *g, int body, int rescue, int els, int ensure) 
     if (nrex < 64) rexits[nrex++] = g->cur;
     else cfg_jump_to(g, join);
   }
+  g->nbg--;
   if (ensure >= 0) {
-    int en = cfg_new_block(g);
-    /* reached from the normal exit, every rescue exit, and any protected or
-       rescue block on the exception path */
+    if (guarded) g->protect--;
+    g->nen--;
+    /* reached from the normal exit, every rescue exit, and any protected,
+       else or rescue block on the exception path */
     if (normal_exit >= 0) cfg_add_edge(g, normal_exit, en);
     for (int k = 0; k < nrex; k++) if (rexits[k] >= 0) cfg_add_edge(g, rexits[k], en);
     cfg_add_edge(g, entry, en);
     for (int k = first; k < g->nb; k++) if (k != en && k != join) cfg_add_edge(g, k, en);
     g->cur = en;
     cfg_lower_list(g, nt_ref(nt, ensure, "statements"));
+    int ex = g->cur;
+    /* the jumps that left through this ensure go on to their targets */
+    int f = g->nen;
+    if (f < 64) for (int t = 0; t < g->en_nt[f]; t++) { g->cur = ex; cfg_jump_out(g, g->en_target[f][t], g->en_tdepth[f][t]); }
+    g->cur = ex;
     cfg_jump_to(g, join);
   } else {
     if (normal_exit >= 0) cfg_add_edge(g, normal_exit, join);
@@ -377,7 +412,7 @@ static void cfg_lower(CfgB *g, int n) {
     int head = cfg_new_block(g), bodyb = cfg_new_block(g), exitb = cfg_new_block(g);
     cfg_jump_to(g, head);
     cfg_add_edge(g, head, bodyb); cfg_add_edge(g, head, exitb);
-    if (g->nlp < 64) { g->lp_head[g->nlp] = head; g->lp_body[g->nlp] = bodyb; g->lp_exit[g->nlp] = exitb; }
+    if (g->nlp < 64) { g->lp_head[g->nlp] = head; g->lp_body[g->nlp] = bodyb; g->lp_exit[g->nlp] = exitb; g->lp_endepth[g->nlp] = g->nen; }
     g->nlp++;
     g->cur = bodyb;
     cfg_lower(g, nt_ref(nt, n, "index"));
@@ -412,28 +447,35 @@ static void cfg_lower(CfgB *g, int n) {
   }
   case NK_ReturnNode:
     cfg_lower(g, nt_ref(nt, n, "arguments"));
-    cfg_jump_to(g, g->exit_blk);
+    cfg_jump_out(g, g->exit_blk, 0);
     return;
-  case NK_BreakNode:
-    cfg_lower(g, nt_ref(nt, n, "arguments"));
-    cfg_jump_to(g, g->nlp > 0 && g->nlp <= 64 ? g->lp_exit[g->nlp - 1] : g->exit_blk);
+  case NK_BreakNode: case NK_NextNode: case NK_RedoNode: {
+    if (k != NK_RedoNode) cfg_lower(g, nt_ref(nt, n, "arguments"));
+    int in_loop = g->nlp > 0 && g->nlp <= 64;
+    int t = !in_loop ? g->exit_blk : k == NK_BreakNode ? g->lp_exit[g->nlp - 1]
+          : k == NK_NextNode ? g->lp_head[g->nlp - 1] : g->lp_body[g->nlp - 1];
+    cfg_jump_out(g, t, in_loop ? g->lp_endepth[g->nlp - 1] : 0);
     return;
-  case NK_NextNode:
-    cfg_lower(g, nt_ref(nt, n, "arguments"));
-    cfg_jump_to(g, g->nlp > 0 && g->nlp <= 64 ? g->lp_head[g->nlp - 1] : g->exit_blk);
-    return;
-  case NK_RedoNode:
-    cfg_jump_to(g, g->nlp > 0 && g->nlp <= 64 ? g->lp_body[g->nlp - 1] : g->exit_blk);
-    return;
+  }
   case NK_RetryNode:
-    cfg_jump_to(g, g->nbg > 0 && g->nbg <= 64 ? g->bg_entry[g->nbg - 1] : g->exit_blk);
+    if (g->nbg > 0 && g->nbg <= 64) cfg_jump_out(g, g->bg_entry[g->nbg - 1], g->bg_endepth[g->nbg - 1]);
+    else cfg_jump_out(g, g->exit_blk, 0);
     return;
   case NK_CallNode: {
     cfg_lower(g, nt_ref(nt, n, "receiver"));
-    cfg_lower(g, nt_ref(nt, n, "arguments"));
-    /* the block is its own scope; a bare raise/exit never returns */
-    const char *cn = nt_str(nt, n, "name");
-    if (cn && nt_ref(nt, n, "receiver") < 0 && is_diverging_call(cn)) cfg_jump_to(g, g->exit_blk);
+    if (nt_safe_nav(nt, n)) {
+      /* `a&.m(x = v)`: the arguments run only when a is not nil */
+      int before = g->cur;
+      int join = cfg_new_block(g);
+      cfg_fall(g);
+      cfg_lower(g, nt_ref(nt, n, "arguments"));
+      cfg_jump_to(g, join);
+      if (before >= 0) cfg_add_edge(g, before, join);
+      g->cur = join;
+    } else cfg_lower(g, nt_ref(nt, n, "arguments"));
+    /* the block is its own scope; a bare raise/exit that reaches Kernel's
+       never returns (a method of the program with the name does) */
+    if (an_call_diverges(g->c, n)) cfg_jump_out(g, g->exit_blk, 0);
     return;
   }
   default:
@@ -461,9 +503,13 @@ static void cfg_mark_captured(CfgB *g, int n, int in_closure, int depth) {
 }
 
 /* ---- the dataflow ---- */
+/* the value is laid out as a plain Integer or Float (no nil beside it, no
+   box): the representation layer's answer, which codegen also follows */
 static int cfg_narrowable(Compiler *c, int value, TyKind t) {
-  if (t == TY_INT || t == TY_FLOAT) return !nullable_int_value(c, value);
-  return 0;
+  if (t != TY_INT && t != TY_FLOAT) return 0;
+  if (nullable_int_value(c, value)) return 0;
+  Repr r = repr_of(c, value);
+  return r.kind == RK_SCALAR && r.as_ty == t;
 }
 static unsigned char cfg_write_kind(CfgB *g, int kind, int node) {
   if (!g->want_types) return TY_BOT;
