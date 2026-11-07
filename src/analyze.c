@@ -56255,8 +56255,13 @@ static void an_phase_reconcile_check(Compiler *c) {
       AN_STEP_V("cfg_narrow_reads", cfg_n = cfg_narrow_reads(c));
       if (!cfg_n) break;
       cfg_any = 1;
+      /* the type memo holds the reads as boxed: drop it before the consumers
+         are typed again */
+      infer_memo_boundary();
       AN_STEP_V("infer_write_types", infer_write_types(c));
       for (int iter = 0; iter < 8; iter++) if (!infer_return_types(c)) break;
+      infer_memo_boundary();
+      for (int id = 0; id < c->nt->count; id++) infer_type(c, id);
     }
     if (cfg_any) {
       AN_STEP_V("mark_nullable_int_locals", mark_nullable_int_locals(c));
