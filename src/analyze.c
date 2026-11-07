@@ -56264,6 +56264,17 @@ static void an_phase_reconcile_check(Compiler *c) {
       for (int id = 0; id < c->nt->count; id++) infer_type(c, id);
     }
     if (cfg_any) {
+      /* the write typing above resets a slot that only ever saw nil to
+         TY_NIL again: declare it boxed as the loop at the top of this phase
+         did */
+      for (int s = 0; s < c->nscopes; s++)
+        for (int i = 0; i < c->scopes[s].nlocals; i++) {
+          LocalVar *blv = &c->scopes[s].locals[i];
+          if (!blv->is_param && blv->type == TY_UNKNOWN) lv_set_type(blv, TY_POLY);
+          if (blv->type == TY_NIL && !blv->rbs_seeded) { lv_set_type(blv, TY_POLY); blv->nil_only = 1; }
+        }
+      infer_memo_boundary();
+      for (int id = 0; id < c->nt->count; id++) infer_type(c, id);
       AN_STEP_V("mark_nullable_int_locals", mark_nullable_int_locals(c));
       sync_captured_nullable(c);
     }
