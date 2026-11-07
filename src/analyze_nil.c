@@ -1879,6 +1879,7 @@ void an_nil_facts(Compiler *c) {
     f.dp.done = calloc((size_t)nt->count + 1, 1);
     if (!f.dp.pos || !f.dp.done) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     for (int k = 0; k < nt->count; k++) f.dp.pos[k] = -1;
+    cfg_facts_ensure(c);
     for (int q = 0; q < 3; q++)
       NT_FOREACH_KIND(nt, rk[q], r) {
         const char *nm = nt_str(nt, r, "name");

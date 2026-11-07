@@ -111,6 +111,10 @@ const int *comp_parent_map(Compiler *c);
 typedef struct { int *pos; char *done; } DUPos;
 int *du_parent_map(const NodeTable *nt);
 int du_read_maybe_unset(const NodeTable *nt, const int *par, DUPos *dp, int rd, const char *nm);
+/* analyze_cfg.c: a per-method control-flow graph and its dataflow facts */
+void cfg_facts_ensure(Compiler *c);
+int cfg_read_unset(int node);
+int cfg_narrow_reads(Compiler *c);
 void du_memo_free(void);
 /* The edges an_value_dropped (and cow_user_block_value, which asks of the
    block it ends at) climbs: where a value is passed on to the statement or

@@ -41278,6 +41278,9 @@ static int du_stmt_index(const NodeTable *nt, const int *par, DUPos *dp, int p, 
 }
 int du_read_maybe_unset(const NodeTable *nt, const int *par, DUPos *dp, int rd, const char *nm) {
   int cur = rd, below = -1;
+  /* the control-flow graph's answer first (analyze_cfg.c): a write on every
+     path to the read, loops and jumps included */
+  if (cfg_read_unset(rd) == 0) return 0;
   for (int guard = 0; guard < 4096; guard++) {
     int p = par[cur];
     if (p < 0) return 1;
@@ -42304,6 +42307,7 @@ static void mark_nullable_int_locals(Compiler *c) {
        start was truthy and counted */
     static const NodeKind rk[] = { NK_LocalVariableReadNode, NK_LocalVariableAndWriteNode,
                                    NK_LocalVariableOperatorWriteNode };
+    cfg_facts_ensure(c);
     for (int q = 0; q < 3; q++)
     for (int r = comp_kind_first(c, rk[q]); r >= 0; r = comp_kind_next(c, r)) {
       if (nt_kind(nt, r) != rk[q]) continue;
@@ -53067,6 +53071,18 @@ static void an_phase_post_fixpoint(Compiler *c) {
   /* `rescue K => e` where a second arm binds the same name: reads inside an
      arm take that arm's class (#4343). */
   narrow_rescue_arm_reads(c);
+  /* a read of a poly local whose every reaching write stored one unboxable
+     kind (analyze_cfg.c): the same read-site unbox */
+  /* a narrowed read retypes what it feeds (`y = x * 2`), so the write types
+     and the facts take a few turns: each pass narrows reads the previous
+     one's retyping made unboxable, until none is left */
+  for (int cfg_iter = 0; cfg_iter < 4; cfg_iter++) {
+    int cfg_n = 0;
+    AN_STEP_V("cfg_narrow_reads", cfg_n = cfg_narrow_reads(c));
+    if (!cfg_n) break;
+    AN_STEP_V("infer_write_types", infer_write_types(c));
+    for (int iter = 0; iter < 8; iter++) if (!infer_return_types(c)) break;
+  }
   /* Post-backstop: re-run write type inference so multi-write locals whose
      RHS chains through a now-typed ivar (e.g. @h[bank][idx] where @h was
      just promoted from UNKNOWN to POLY) get their types resolved. */
