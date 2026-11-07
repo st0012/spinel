@@ -21,6 +21,7 @@
 #include "analyze_internal.h"
 #include "builtin_names.h"
 #include "repr.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@ typedef struct {
   int *ev_kind, *ev_node; int nev, cev;
   int *succ; int nsucc, csucc;
   int reached;
+  int *ev_def;       /* SSA mode: the definition a write event makes */
 } CBlock;
 
 typedef struct {
@@ -53,6 +55,10 @@ typedef struct {
   int protect;       /* >0 inside a body a rescue or ensure guards */
   char *captured;    /* per local index: a closure writes it */
   int want_types;
+  /* SSA mode (ssa_rename_locals): locals are known by name, before the
+     scope's table exists, and no call is taken to diverge */
+  int ssa;
+  const char **sn; int nsn;
 } CfgB;
 
 #define TY_TOP 0
@@ -125,6 +131,10 @@ static void cfg_emit(CfgB *g, int kind, int node) {
 }
 static int cfg_local_index(CfgB *g, const char *nm) {
   if (!nm) return -1;
+  if (g->ssa) {
+    for (int i = 0; i < g->nsn; i++) if (sp_streq(g->sn[i], nm)) return i;
+    return -1;
+  }
   LocalVar *lv = scope_local(g->s, nm);
   if (!lv) return -1;
   return (int)(lv - g->s->locals);
@@ -475,7 +485,7 @@ static void cfg_lower(CfgB *g, int n) {
     } else cfg_lower(g, nt_ref(nt, n, "arguments"));
     /* the block is its own scope; a bare raise/exit that reaches Kernel's
        never returns (a method of the program with the name does) */
-    if (an_call_diverges(g->c, n)) cfg_jump_out(g, g->exit_blk, 0);
+    if (!g->ssa && an_call_diverges(g->c, n)) cfg_jump_out(g, g->exit_blk, 0);
     return;
   }
   default:
@@ -622,7 +632,7 @@ static void cfg_build_scope(Compiler *c, Scope *s, int si, int want_types) {
   cfg_jump_to(&g, g.exit_blk);
   st_blocks += g.nb; st_methods++;
   cfg_solve(&g);
-  for (int i = 0; i < g.nb; i++) { free(g.b[i].ev_kind); free(g.b[i].ev_node); free(g.b[i].succ); }
+  for (int i = 0; i < g.nb; i++) { free(g.b[i].ev_kind); free(g.b[i].ev_node); free(g.b[i].succ); free(g.b[i].ev_def); }
   free(g.b); free(g.captured);
 }
 
@@ -727,4 +737,404 @@ int cfg_narrow_reads(Compiler *c) {
   free(par);
   if (cfg_log()) fprintf(stderr, "spinel-cfg: narrowed=%d\n", st_narrowed);
   return st_narrowed;
+}
+
+/* ---- SSA: one name per write, and the names that must share a slot ----
+
+   Static single assignment form gives every write of a local its own name
+   (x1, x2, ...) and puts a phi where two names meet at a join:
+
+     x1 = 0
+     while ...                 x2 = phi(x1, x3)   (the loop head)
+       x3 = x2 + i
+     y1 = x2 * 2
+     x4 = "sum=#{y1}"
+
+   Spinel types a local once for its whole life, so `x` above is poly. In
+   SSA each name has one type: x1, x2, x3 are Integers and x4 is a String.
+
+   Out of SSA, the names a phi joins must share one C slot (the phi is a
+   copy that is free only when both sides are the same slot). The groups
+   this leaves are the local's webs: here {x1, x2, x3} and {x4}. A web is
+   the set of writes some read can see, closed over shared reads, which is
+   what this pass computes, with reaching definitions on the CFG above:
+   every read joins the writes that reach it into one web.
+
+   Each web after the first gets a new name in the tree (`x__ssa1`), before
+   the scope's locals are registered, so the rest of Spinel sees two locals
+   and types each one on its own. Left alone: a local a closure, a pattern,
+   a `defined?` or a regexp capture refers to (the graph does not model
+   those reads), and every local of a method that reads its frame by name
+   (binding, eval, local_variables, a bare `super`). */
+
+static int ssa_disabled(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("SP_NO_SSA") != NULL || cfg_disabled();
+  return v;
+}
+static int ssa_log(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("SP_SSA_LOG") != NULL;
+  return v;
+}
+
+typedef struct {
+  const char **nm; int n, cap;
+  char *bad;          /* left alone: the graph cannot see every use */
+  int method_bad;
+} SsaNames;
+
+static int ssa_name_add(SsaNames *t, const char *nm) {
+  for (int i = 0; i < t->n; i++) if (sp_streq(t->nm[i], nm)) return i;
+  if (t->n >= t->cap) {
+    t->cap = t->cap ? t->cap * 2 : 16;
+    t->nm = realloc(t->nm, sizeof(char *) * (size_t)t->cap);
+    t->bad = realloc(t->bad, (size_t)t->cap);
+    if (!t->nm || !t->bad) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  /* a copy: renaming a node frees the string its name was read from */
+  t->nm[t->n] = strdup(nm); t->bad[t->n] = 0;
+  if (!t->nm[t->n]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  return t->n++;
+}
+static int ssa_local_node(NodeKind k) {
+  return k == NK_LocalVariableReadNode || k == NK_LocalVariableWriteNode ||
+         k == NK_LocalVariableTargetNode || k == NK_LocalVariableOperatorWriteNode ||
+         k == NK_LocalVariableOrWriteNode || k == NK_LocalVariableAndWriteNode;
+}
+/* a name that reads the method's frame by name */
+static int ssa_frame_name(const char *nm) {
+  static const char *const names[] = { "binding", "local_variables", "eval", "instance_eval",
+    "class_eval", "module_eval", "local_variable_get", "local_variable_set",
+    "local_variable_defined?", NULL };
+  if (!nm) return 0;
+  for (int i = 0; names[i]; i++) if (sp_streq(nm, names[i])) return 1;
+  return 0;
+}
+/* every local node of the body (not a nested def or class); `opaque` is a
+   subtree whose uses the graph does not model */
+static void ssa_collect(Compiler *c, Scope *s, int n, SsaNames *t, int in_closure, int opaque, int depth) {
+  if (n < 0) return;
+  if (depth > 2000) { t->method_bad = 1; return; }
+  const NodeTable *nt = c->nt;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode) return;
+  if (k == NK_BlockNode || k == NK_LambdaNode) in_closure = 1;
+  if (k == NK_DefinedNode || k == NK_MatchWriteNode) opaque = 1;
+  if (k == NK_ForwardingSuperNode) t->method_bad = 1;   /* passes the parameters by name */
+  if (k == NK_CallNode && ssa_frame_name(nt_str(nt, n, "name"))) t->method_bad = 1;
+  if (k == NK_SymbolNode && ssa_frame_name(nt_str(nt, n, "value"))) t->method_bad = 1;
+  if (ssa_local_node(k)) {
+    const char *nm = nt_str(nt, n, "name");
+    if (nm) {
+      int i = ssa_name_add(t, nm);
+      if (in_closure || opaque || strstr(nm, "__") || comp_scope_of(c, n) != s) t->bad[i] = 1;
+    }
+  }
+  /* a pattern binds and reads (`^x`) in ways the graph keeps no events for */
+  int pat = (k == NK_InNode || k == NK_MatchRequiredNode || k == NK_MatchPredicateNode)
+            ? nt_ref(nt, n, "pattern") : -1;
+  for (int i = 0; i < nt_num_refs(nt, n); i++) {
+    int ch = nt_ref_at(nt, n, i);
+    ssa_collect(c, s, ch, t, in_closure, opaque || (ch >= 0 && ch == pat), depth + 1);
+  }
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int q = 0; q < an; q++) ssa_collect(c, s, av[q], t, in_closure, opaque, depth + 1);
+  }
+}
+
+/* union-find over definitions */
+static int ssa_find(int *uf, int d) {
+  while (uf[d] != d) { uf[d] = uf[uf[d]]; d = uf[d]; }
+  return d;
+}
+static void ssa_union(int *uf, int a, int b) {
+  a = ssa_find(uf, a); b = ssa_find(uf, b);
+  if (a != b) { if (a < b) uf[b] = a; else uf[a] = b; }
+}
+
+static int *g_ssa_rd;      /* per node: a definition its read sees, or -1 */
+static int g_ssa_rd_cap;
+static int st_ssa_methods, st_ssa_split, st_ssa_renamed, st_ssa_phis;
+
+static int ssa_line(Compiler *c, int node) {
+  return node >= 0 ? (int)nt_int(c->nt, node, "node_line", 0) : 0;
+}
+/* a read: it joins every definition of its name that reaches it */
+static void ssa_read(CfgB *g, int node, int li, const uint64_t *cur, const int *dl,
+                     const int *dl_off, int *uf, const int *def_node) {
+  int rep = -1, n = 0;
+  for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+    int dd = dl[q];
+    if (!((cur[dd / 64] >> (dd % 64)) & 1)) continue;
+    if (rep < 0) rep = dd; else ssa_union(uf, rep, dd);
+    n++;
+  }
+  if (node < g_ssa_rd_cap) g_ssa_rd[node] = rep;
+  if (n >= 2) {
+    st_ssa_phis++;
+    if (ssa_log()) {
+      fprintf(stderr, "spinel-ssa:   line %d reads `%s` through a phi of", ssa_line(g->c, node), g->sn[li]);
+      for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+        int dd = dl[q];
+        if (!((cur[dd / 64] >> (dd % 64)) & 1)) continue;
+        if (def_node[dd] < 0) fprintf(stderr, " entry");
+        else fprintf(stderr, " line-%d", ssa_line(g->c, def_node[dd]));
+      }
+      fprintf(stderr, "\n");
+    }
+  }
+}
+
+static void ssa_method(Compiler *c, Scope *s) {
+  const NodeTable *nt = c->nt;
+  int body = s->body >= 0 ? s->body : nt_ref(nt, s->def_node, "body");
+  if (body < 0) return;
+  SsaNames t; memset(&t, 0, sizeof t);
+  ssa_collect(c, s, body, &t, 0, 0, 0);
+  if (t.method_bad || t.n == 0) { free(t.nm); free(t.bad); return; }
+  /* a parameter's entry definition is the argument, any other's is nil:
+     either way the web it is in keeps the name */
+  CfgB g; memset(&g, 0, sizeof g);
+  g.c = c; g.nt = nt; g.s = s; g.si = s->idx; g.ssa = 1;
+  g.sn = t.nm; g.nsn = t.n;
+  g.cur = cfg_new_block(&g);
+  g.exit_blk = cfg_new_block(&g);
+  cfg_lower(&g, body);
+  cfg_jump_to(&g, g.exit_blk);
+  st_ssa_methods++;
+
+  int nn = t.n;
+  /* definitions: one entry definition per name (the argument, or nil
+     before any write), then one per write event */
+  int ndef = nn;
+  for (int b = 0; b < g.nb; b++)
+    for (int e = 0; e < g.b[b].nev; e++) if (g.b[b].ev_kind[e] != EV_READ) ndef++;
+  int *def_name = malloc(sizeof(int) * (size_t)(ndef + 1));
+  int *def_node = malloc(sizeof(int) * (size_t)(ndef + 1));
+  int *uf = malloc(sizeof(int) * (size_t)(ndef + 1));
+  char *has_read = calloc((size_t)ndef + 1, 1);
+  if (!def_name || !def_node || !uf || !has_read) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i < nn; i++) { def_name[i] = i; def_node[i] = -1; }
+  int d = nn;
+  for (int b = 0; b < g.nb; b++) {
+    CBlock *bl = &g.b[b];
+    bl->ev_def = malloc(sizeof(int) * (size_t)(bl->nev + 1));
+    if (!bl->ev_def) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int e = 0; e < bl->nev; e++) {
+      bl->ev_def[e] = -1;
+      if (bl->ev_kind[e] == EV_READ) continue;
+      int li = cfg_local_index(&g, nt_str(nt, bl->ev_node[e], "name"));
+      def_name[d] = li; def_node[d] = bl->ev_node[e];
+      bl->ev_def[e] = d++;
+    }
+  }
+  for (int i = 0; i < ndef; i++) uf[i] = i;
+  /* each name's definitions */
+  int *dl_off = calloc((size_t)nn + 1, sizeof(int)), *dl = malloc(sizeof(int) * (size_t)(ndef + 1));
+  if (!dl_off || !dl) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i < ndef; i++) if (def_name[i] >= 0) dl_off[def_name[i] + 1]++;
+  for (int i = 0; i < nn; i++) dl_off[i + 1] += dl_off[i];
+  { int *fill = malloc(sizeof(int) * (size_t)(nn + 1));
+    if (!fill) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    memcpy(fill, dl_off, sizeof(int) * (size_t)nn);
+    for (int i = 0; i < ndef; i++) if (def_name[i] >= 0) dl[fill[def_name[i]]++] = i;
+    free(fill); }
+
+  /* reaching definitions: a bit per definition, per block entry */
+  int W = (ndef + 63) / 64, nb = g.nb;
+  if ((size_t)nb * (size_t)W > ((size_t)1 << 22)) goto done;   /* a huge method: left as it is */
+  {
+    uint64_t *in = calloc((size_t)nb * (size_t)W + 1, sizeof(uint64_t));
+    uint64_t *cur = malloc(sizeof(uint64_t) * ((size_t)W + 1));
+    char *inq = calloc((size_t)nb + 1, 1), *reached = calloc((size_t)nb + 1, 1);
+    int *queue = malloc(sizeof(int) * ((size_t)nb + 1));
+    if (!in || !cur || !inq || !reached || !queue) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < nn; i++) in[i / 64] |= (uint64_t)1 << (i % 64);
+    /* the queue is a ring: a block is in it at most once */
+    int qh = 0, qn = 0;
+    queue[0] = 0; qn = 1; inq[0] = 1; reached[0] = 1;
+#define SSA_TRANSFER(bi, rec) do { CBlock *_bl = &g.b[bi]; \
+      for (int _e = 0; _e < _bl->nev; _e++) { \
+        int _li = cfg_local_index(&g, nt_str(nt, _bl->ev_node[_e], "name")); \
+        if (_li < 0) continue; \
+        if (_bl->ev_kind[_e] == EV_READ) { if (rec) ssa_read(&g, _bl->ev_node[_e], _li, cur, dl, dl_off, uf, def_node); continue; } \
+        for (int _q = dl_off[_li]; _q < dl_off[_li + 1]; _q++) cur[dl[_q] / 64] &= ~((uint64_t)1 << (dl[_q] % 64)); \
+        int _dd = _bl->ev_def[_e]; cur[_dd / 64] |= (uint64_t)1 << (_dd % 64); \
+      } } while (0)
+    while (qn > 0) {
+      int bi = queue[qh]; qh = (qh + 1) % nb; qn--; inq[bi] = 0;
+      memcpy(cur, in + (size_t)bi * W, sizeof(uint64_t) * (size_t)W);
+      SSA_TRANSFER(bi, 0);
+      CBlock *bl = &g.b[bi];
+      for (int k = 0; k < bl->nsucc; k++) {
+        int sb = bl->succ[k];
+        uint64_t *si = in + (size_t)sb * W;
+        int changed = !reached[sb];
+        reached[sb] = 1;
+        for (int w = 0; w < W; w++) { uint64_t nv = si[w] | cur[w]; if (nv != si[w]) { si[w] = nv; changed = 1; } }
+        if (changed && !inq[sb]) { queue[(qh + qn) % nb] = sb; qn++; inq[sb] = 1; }
+      }
+    }
+    /* the final pass: every read joins the definitions it sees */
+    for (int bi = 0; bi < nb; bi++) {
+      if (!reached[bi]) continue;
+      memcpy(cur, in + (size_t)bi * W, sizeof(uint64_t) * (size_t)W);
+      SSA_TRANSFER(bi, 1);
+    }
+#undef SSA_TRANSFER
+    free(in); free(cur); free(inq); free(reached); free(queue);
+  }
+  /* `x += 1`, `x ||= v`: one node reads and writes, so one name */
+  for (int b = 0; b < g.nb; b++) {
+    CBlock *bl = &g.b[b];
+    for (int e = 0; e < bl->nev; e++) {
+      int dd = bl->ev_def[e], node = bl->ev_node[e];
+      if (dd < 0) continue;
+      NodeKind nk = nt_kind(nt, node);
+      if (nk != NK_LocalVariableOperatorWriteNode && nk != NK_LocalVariableOrWriteNode &&
+          nk != NK_LocalVariableAndWriteNode) continue;
+      if (g_ssa_rd[node] >= 0) ssa_union(uf, dd, g_ssa_rd[node]);
+    }
+  }
+  for (int b = 0; b < g.nb; b++)
+    for (int e = 0; e < g.b[b].nev; e++)
+      if (g.b[b].ev_kind[e] == EV_READ && g_ssa_rd[g.b[b].ev_node[e]] >= 0)
+        has_read[ssa_find(uf, g_ssa_rd[g.b[b].ev_node[e]])] = 1;
+
+  /* the webs of each name, and their names */
+  {
+    char **web_name = calloc((size_t)ndef + 1, sizeof(char *));
+    char *keeps = calloc((size_t)ndef + 1, 1);
+    if (!web_name || !keeps) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    int renamed_any = 0;
+    for (int li = 0; li < nn; li++) {
+      if (t.bad[li]) continue;
+      int roots = 0, first_root = -1;
+      for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+        int r = ssa_find(uf, dl[q]);
+        int seen = 0;
+        for (int q2 = dl_off[li]; q2 < q; q2++) if (ssa_find(uf, dl[q2]) == r) { seen = 1; break; }
+        if (!seen) roots++;
+      }
+      if (roots < 2) continue;
+      /* the entry definition's web keeps the name (a parameter is that
+         name); when no read sees it, the first write's web joins it */
+      int r0 = ssa_find(uf, li);
+      keeps[r0] = 1;
+      if (!has_read[r0]) {
+        int best = -1;
+        for (int q = dl_off[li]; q < dl_off[li + 1]; q++)
+          if (def_node[dl[q]] >= 0 && (best < 0 || def_node[dl[q]] < def_node[best])) best = dl[q];
+        if (best >= 0) { first_root = ssa_find(uf, best); keeps[first_root] = 1; }
+      }
+      int k = 0;
+      for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+        int r = ssa_find(uf, dl[q]);
+        if (keeps[r] || web_name[r]) continue;
+        size_t ln = strlen(t.nm[li]) + 24;
+        char *nmb = malloc(ln);
+        if (!nmb) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        for (;;) {
+          snprintf(nmb, ln, "%s__ssa%d", t.nm[li], ++k);
+          int clash = 0;
+          for (int i = 0; i < nn; i++) if (sp_streq(t.nm[i], nmb)) { clash = 1; break; }
+          if (!clash) break;
+        }
+        web_name[r] = nmb;
+      }
+      if (!k) continue;   /* every web keeps the name */
+      st_ssa_split++;
+      renamed_any = 1;
+      if (ssa_log()) {
+        const char *cn = s->class_id >= 0 && s->class_id < c->nclasses ? c->classes[s->class_id].name : NULL;
+        fprintf(stderr, "spinel-ssa: %s%s%s: `%s` splits into %d slots:", cn ? cn : "", cn ? "#" : "", s->name ? s->name : "?", t.nm[li], k + 1);
+        int printed_keep = 0;
+        for (int pass = 0; pass < 2; pass++)
+          for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+            int r = ssa_find(uf, dl[q]);
+            if (pass == 0 && !keeps[r]) continue;
+            if (pass == 1 && keeps[r]) continue;
+            int dup = 0;
+            for (int q2 = dl_off[li]; q2 < q; q2++) if (ssa_find(uf, dl[q2]) == r) { dup = 1; break; }
+            if (dup) continue;
+            fprintf(stderr, " %s%s(", pass == 0 && printed_keep ? "+" : "", keeps[r] ? t.nm[li] : web_name[r]);
+            int any = 0;
+            for (int q2 = dl_off[li]; q2 < dl_off[li + 1]; q2++)
+              if (ssa_find(uf, dl[q2]) == r) {
+                fprintf(stderr, "%s%s", any ? "," : "", def_node[dl[q2]] < 0 ? "entry" : "");
+                if (def_node[dl[q2]] >= 0) fprintf(stderr, "line %d", ssa_line(c, def_node[dl[q2]]));
+                any = 1;
+              }
+            fprintf(stderr, ")");
+            if (pass == 0) printed_keep = 1;
+          }
+        fprintf(stderr, "\n");
+      }
+    }
+    /* rename the tree */
+    if (renamed_any) {
+      for (int b = 0; b < g.nb; b++) {
+        CBlock *bl = &g.b[b];
+        for (int e = 0; e < bl->nev; e++) {
+          int node = bl->ev_node[e];
+          int li = cfg_local_index(&g, nt_str(nt, node, "name"));
+          if (li < 0 || t.bad[li]) continue;
+          int dd = bl->ev_def[e] >= 0 ? bl->ev_def[e] : g_ssa_rd[node];
+          if (dd < 0) continue;
+          char *nmn = web_name[ssa_find(uf, dd)];
+          if (!nmn || sp_streq(nt_str(nt, node, "name"), nmn)) continue;
+          nt_set_str((NodeTable *)nt, node, "name", nmn);
+          st_ssa_renamed++;
+        }
+      }
+    }
+    /* the def's `locals` list names its slots: the new ones join it */
+    if (renamed_any) {
+      const char *ol = nt_str(nt, s->def_node, "locals");
+      size_t tot = (ol ? strlen(ol) : 0) + 1;
+      for (int i = 0; i < ndef; i++) if (web_name[i]) tot += strlen(web_name[i]) + 1;
+      char *nl = malloc(tot + 1);
+      if (!nl) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      snprintf(nl, tot + 1, "%s", ol ? ol : "");
+      for (int i = 0; i < ndef; i++)
+        if (web_name[i]) { if (nl[0]) strcat(nl, ","); strcat(nl, web_name[i]); }
+      if (ol) nt_set_str((NodeTable *)nt, s->def_node, "locals", nl);
+      free(nl);
+    }
+    for (int i = 0; i < ndef; i++) free(web_name[i]);
+    free(web_name); free(keeps);
+  }
+done:
+  for (int b = 0; b < g.nb; b++) {
+    CBlock *bl = &g.b[b];
+    for (int e = 0; e < bl->nev; e++) if (bl->ev_node[e] < g_ssa_rd_cap) g_ssa_rd[bl->ev_node[e]] = -1;
+    free(bl->ev_kind); free(bl->ev_node); free(bl->succ); free(bl->ev_def);
+  }
+  free(g.b);
+  free(def_name); free(def_node); free(uf); free(has_read); free(dl_off); free(dl);
+  for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
+  free(t.nm); free(t.bad);
+}
+
+int ssa_rename_locals(Compiler *c) {
+  if (ssa_disabled()) return 0;
+  const NodeTable *nt = c->nt;
+  g_ssa_rd_cap = nt->count;
+  g_ssa_rd = malloc(sizeof(int) * ((size_t)g_ssa_rd_cap + 1));
+  if (!g_ssa_rd) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i <= g_ssa_rd_cap; i++) g_ssa_rd[i] = -1;
+  st_ssa_methods = st_ssa_split = st_ssa_renamed = st_ssa_phis = 0;
+  for (int si = 0; si < c->nscopes; si++) {
+    Scope *s = &c->scopes[si];
+    if (s->def_node < 0 || nt_kind(nt, s->def_node) != NK_DefNode || s->cs_synth) continue;
+    /* the prelude's methods look some of their locals up by name */
+    if (nt_int(nt, s->def_node, "node_bi", 0) || nt_int(nt, s->def_node, "node_line", 0) == 0) continue;
+    ssa_method(c, s);
+  }
+  free(g_ssa_rd); g_ssa_rd = NULL; g_ssa_rd_cap = 0;
+  if (ssa_log()) fprintf(stderr, "spinel-ssa: methods=%d phis=%d locals-split=%d nodes-renamed=%d\n",
+                         st_ssa_methods, st_ssa_phis, st_ssa_split, st_ssa_renamed);
+  return st_ssa_renamed;
 }

@@ -50333,6 +50333,9 @@ static void an_phase_desugar_register(Compiler *c) {
   register_structs(c);
   desugar_struct_index_ctor(c);
   register_module_functions(c);
+  /* a local that holds two kinds in turn (`x = 0 ... x = "s"`) becomes one
+     local per web, before the names are registered (analyze_cfg.c) */
+  AN_STEP_V("ssa_rename_locals", ssa_rename_locals(c));
   register_locals(c);
   AN_STEP_V("desugar_block_arg_order", desugar_block_arg_order(c));   /* recv.m(a, &expr): receiver, args, then the block (#4992) */
   register_attr_versions(c);
