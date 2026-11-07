@@ -53073,16 +53073,6 @@ static void an_phase_post_fixpoint(Compiler *c) {
   narrow_rescue_arm_reads(c);
   /* a read of a poly local whose every reaching write stored one unboxable
      kind (analyze_cfg.c): the same read-site unbox */
-  /* a narrowed read retypes what it feeds (`y = x * 2`), so the write types
-     and the facts take a few turns: each pass narrows reads the previous
-     one's retyping made unboxable, until none is left */
-  for (int cfg_iter = 0; cfg_iter < 4; cfg_iter++) {
-    int cfg_n = 0;
-    AN_STEP_V("cfg_narrow_reads", cfg_n = cfg_narrow_reads(c));
-    if (!cfg_n) break;
-    AN_STEP_V("infer_write_types", infer_write_types(c));
-    for (int iter = 0; iter < 8; iter++) if (!infer_return_types(c)) break;
-  }
   /* Post-backstop: re-run write type inference so multi-write locals whose
      RHS chains through a now-typed ivar (e.g. @h[bank][idx] where @h was
      just promoted from UNKNOWN to POLY) get their types resolved. */
@@ -56252,6 +56242,27 @@ static void an_phase_reconcile_check(Compiler *c) {
      not something to emit a reinterpretation for. */
   AN_STEP_V("mark_nullable_int_locals", mark_nullable_int_locals(c));
   sync_captured_nullable(c);
+  /* a read of a poly local whose every reaching write stored one plain
+     Integer or Float (analyze_cfg.c): the read-site unbox the nil guards and
+     is_a? guards use. After the nullable marks, which say whether a write's
+     value can be nil. A narrowed read retypes what it feeds (`y = x * 2`),
+     so the write types and the facts take a few turns, and the nullable
+     marks are taken again for the slots that settled on a scalar. */
+  {
+    int cfg_any = 0;
+    for (int cfg_iter = 0; cfg_iter < 4; cfg_iter++) {
+      int cfg_n = 0;
+      AN_STEP_V("cfg_narrow_reads", cfg_n = cfg_narrow_reads(c));
+      if (!cfg_n) break;
+      cfg_any = 1;
+      AN_STEP_V("infer_write_types", infer_write_types(c));
+      for (int iter = 0; iter < 8; iter++) if (!infer_return_types(c)) break;
+    }
+    if (cfg_any) {
+      AN_STEP_V("mark_nullable_int_locals", mark_nullable_int_locals(c));
+      sync_captured_nullable(c);
+    }
+  }
   AN_STEP_V("widen_nullable_keyed_hash_literals", widen_nullable_keyed_hash_literals(c));
   mark_array_or_nil_slots(c);
   /* A local's array KIND has to agree with what its writes actually build. A
