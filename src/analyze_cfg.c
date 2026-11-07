@@ -251,6 +251,9 @@ static void cfg_lower_begin(CfgB *g, int body, int rescue, int els, int ensure) 
     cfg_add_edge(g, entry, rb);
     for (int k = first; k < last; k++) if (k != en) cfg_add_edge(g, k, rb);
     g->cur = rb;
+    /* the classes the arm names are read when it is tried */
+    { int xn = 0; const int *xs = nt_arr(nt, r, "exceptions", &xn);
+      for (int q = 0; q < xn; q++) cfg_lower(g, xs[q]); }
     int ref = nt_ref(nt, r, "reference");
     if (ref >= 0) {
       if (nt_kind(nt, ref) == NK_LocalVariableTargetNode) cfg_emit(g, EV_WRITE_UNK, ref);
@@ -483,6 +486,9 @@ static void cfg_lower(CfgB *g, int n) {
       if (before >= 0) cfg_add_edge(g, before, join);
       g->cur = join;
     } else cfg_lower(g, nt_ref(nt, n, "arguments"));
+    /* `m(&x)` reads x after the arguments; a block is its own scope */
+    { int blk = nt_ref(nt, n, "block");
+      if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk); }
     /* the block is its own scope; a bare raise/exit that reaches Kernel's
        never returns (a method of the program with the name does) */
     if (!g->ssa && an_call_diverges(g->c, n)) cfg_jump_out(g, g->exit_blk, 0);
@@ -782,6 +788,7 @@ typedef struct {
   const char **nm; int n, cap;
   char *bad;          /* left alone: the graph cannot see every use */
   int method_bad;
+  int *nodes, *node_name, nnodes, cnodes;   /* every local node of the body */
 } SsaNames;
 
 static int ssa_name_add(SsaNames *t, const char *nm) {
@@ -824,11 +831,19 @@ static void ssa_collect(Compiler *c, Scope *s, int n, SsaNames *t, int in_closur
   if (k == NK_ForwardingSuperNode) t->method_bad = 1;   /* passes the parameters by name */
   if (k == NK_CallNode && ssa_frame_name(nt_str(nt, n, "name"))) t->method_bad = 1;
   if (k == NK_SymbolNode && ssa_frame_name(nt_str(nt, n, "value"))) t->method_bad = 1;
+  if (k == NK_StringNode && ssa_frame_name(nt_str(nt, n, "content"))) t->method_bad = 1;   /* send("binding") */
   if (ssa_local_node(k)) {
     const char *nm = nt_str(nt, n, "name");
     if (nm) {
       int i = ssa_name_add(t, nm);
       if (in_closure || opaque || strstr(nm, "__") || comp_scope_of(c, n) != s) t->bad[i] = 1;
+      if (t->nnodes >= t->cnodes) {
+        t->cnodes = t->cnodes ? t->cnodes * 2 : 32;
+        t->nodes = realloc(t->nodes, sizeof(int) * (size_t)t->cnodes);
+        t->node_name = realloc(t->node_name, sizeof(int) * (size_t)t->cnodes);
+        if (!t->nodes || !t->node_name) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      }
+      t->nodes[t->nnodes] = n; t->node_name[t->nnodes] = i; t->nnodes++;
     }
   }
   /* a pattern binds and reads (`^x`) in ways the graph keeps no events for */
@@ -856,6 +871,7 @@ static void ssa_union(int *uf, int a, int b) {
 
 static int *g_ssa_rd;      /* per node: a definition its read sees, or -1 */
 static int g_ssa_rd_cap;
+static char *g_ssa_seen;   /* per node: the graph keeps an event for it */
 static int st_ssa_methods, st_ssa_split, st_ssa_renamed, st_ssa_phis;
 
 static int ssa_line(Compiler *c, int node) {
@@ -893,7 +909,11 @@ static void ssa_method(Compiler *c, Scope *s) {
   if (body < 0) return;
   SsaNames t; memset(&t, 0, sizeof t);
   ssa_collect(c, s, body, &t, 0, 0, 0);
-  if (t.method_bad || t.n == 0) { free(t.nm); free(t.bad); return; }
+  if (t.method_bad || t.n == 0) {
+    for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
+    free(t.nm); free(t.bad); free(t.nodes); free(t.node_name);
+    return;
+  }
   /* a parameter's entry definition is the argument, any other's is nil:
      either way the web it is in keeps the name */
   CfgB g; memset(&g, 0, sizeof g);
@@ -904,6 +924,17 @@ static void ssa_method(Compiler *c, Scope *s) {
   cfg_lower(&g, body);
   cfg_jump_to(&g, g.exit_blk);
   st_ssa_methods++;
+  /* a local node the graph has no event for is a use it cannot place on
+     a path: its name keeps one slot */
+  for (int b = 0; b < g.nb; b++)
+    for (int e = 0; e < g.b[b].nev; e++) if (g.b[b].ev_node[e] < g_ssa_rd_cap) g_ssa_seen[g.b[b].ev_node[e]] = 1;
+  for (int q = 0; q < t.nnodes; q++)
+    if (t.nodes[q] >= g_ssa_rd_cap || !g_ssa_seen[t.nodes[q]]) {
+      if (ssa_log() && !t.bad[t.node_name[q]]) fprintf(stderr, "spinel-ssa:   `%s` at line %d has no place in the graph: one slot\n", t.nm[t.node_name[q]], ssa_line(c, t.nodes[q]));
+      t.bad[t.node_name[q]] = 1;
+    }
+  for (int b = 0; b < g.nb; b++)
+    for (int e = 0; e < g.b[b].nev; e++) if (g.b[b].ev_node[e] < g_ssa_rd_cap) g_ssa_seen[g.b[b].ev_node[e]] = 0;
 
   int nn = t.n;
   /* definitions: one entry definition per name (the argument, or nil
@@ -1115,7 +1146,7 @@ done:
   free(g.b);
   free(def_name); free(def_node); free(uf); free(has_read); free(dl_off); free(dl);
   for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
-  free(t.nm); free(t.bad);
+  free(t.nm); free(t.bad); free(t.nodes); free(t.node_name);
 }
 
 int ssa_rename_locals(Compiler *c) {
@@ -1125,6 +1156,8 @@ int ssa_rename_locals(Compiler *c) {
   g_ssa_rd = malloc(sizeof(int) * ((size_t)g_ssa_rd_cap + 1));
   if (!g_ssa_rd) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int i = 0; i <= g_ssa_rd_cap; i++) g_ssa_rd[i] = -1;
+  g_ssa_seen = calloc((size_t)g_ssa_rd_cap + 1, 1);
+  if (!g_ssa_seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   st_ssa_methods = st_ssa_split = st_ssa_renamed = st_ssa_phis = 0;
   for (int si = 0; si < c->nscopes; si++) {
     Scope *s = &c->scopes[si];
@@ -1134,6 +1167,7 @@ int ssa_rename_locals(Compiler *c) {
     ssa_method(c, s);
   }
   free(g_ssa_rd); g_ssa_rd = NULL; g_ssa_rd_cap = 0;
+  free(g_ssa_seen); g_ssa_seen = NULL;
   if (ssa_log()) fprintf(stderr, "spinel-ssa: methods=%d phis=%d locals-split=%d nodes-renamed=%d\n",
                          st_ssa_methods, st_ssa_phis, st_ssa_split, st_ssa_renamed);
   return st_ssa_renamed;
