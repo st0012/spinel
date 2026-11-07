@@ -18018,6 +18018,7 @@ static char *build_symbol_map_json(Compiler *c) {
     buf_puts(&b, "\",\"ruby\":\"");
     json_escape_into(&b, rb.p ? rb.p : "");
     buf_printf(&b, "\",\"kind\":\"%s\"", kind);
+    if (getenv("SP_SYMMAP_REACH")) buf_printf(&b, ",\"reachable\":%d,\"def_node\":%d", s->reachable, s->def_node);
     int ln = scope_def_line(c, s);
     if (ln > 0) {
       buf_puts(&b, ",\"file\":\"");
