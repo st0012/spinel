@@ -116,6 +116,7 @@ void cfg_facts_ensure(Compiler *c);
 int cfg_read_unset(int node);
 int cfg_narrow_reads(Compiler *c);
 int ssa_rename_locals(Compiler *c);   /* analyze_cfg.c: one slot per web of a local */
+void ssa_check_splits(Compiler *c);   /* analyze_cfg.c: undo a split whose slots are not plain values */
 void du_memo_free(void);
 /* The edges an_value_dropped (and cow_user_block_value, which asks of the
    block it ends at) climbs: where a value is passed on to the statement or

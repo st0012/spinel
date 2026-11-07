@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 enum { EV_READ = 1, EV_WRITE, EV_WRITE_UNK, EV_ANDWRITE, EV_OPWRITE };
 
@@ -789,6 +790,7 @@ typedef struct {
   char *bad;          /* left alone: the graph cannot see every use */
   int method_bad;
   int *nodes, *node_name, nnodes, cnodes;   /* every local node of the body */
+  int *pw, *pr, np, cp;   /* a write and a read of the same local in its value */
 } SsaNames;
 
 static int ssa_name_add(SsaNames *t, const char *nm) {
@@ -818,6 +820,104 @@ static int ssa_frame_name(const char *nm) {
   for (int i = 0; names[i]; i++) if (sp_streq(nm, names[i])) return 1;
   return 0;
 }
+/* the subtree of `n` writes local `nm`, outside `skip` (a nested def or
+   class has locals of its own; a tree too deep to walk counts as a write) */
+static int ssa_writes(const NodeTable *nt, int n, const char *nm, int skip, int depth) {
+  if (n < 0 || n == skip) return 0;
+  if (depth > 2000) return 1;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode) return 0;
+  if (k != NK_LocalVariableReadNode && ssa_local_node(k) && sp_streq(nt_str(nt, n, "name"), nm)) return 1;
+  for (int i = 0; i < nt_num_refs(nt, n); i++)
+    if (ssa_writes(nt, nt_ref_at(nt, n, i), nm, skip, depth + 1)) return 1;
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int q = 0; q < an; q++) if (ssa_writes(nt, av[q], nm, skip, depth + 1)) return 1;
+  }
+  return 0;
+}
+/* A call on a local reads the receiver first and holds it while the
+   arguments run. A store into a typed Array that needs a wider one (an
+   Array of Integers given a String) makes the wider copy and writes it
+   back to the slot of the local it was called on. When an argument writes
+   the same local (`h[i] = (h = h; v)`), the write and the receiver are in
+   two webs: the copy goes back to the receiver's slot, and the reads after
+   the call see the other slot, which holds the old Array. So that local
+   keeps one slot, as on master. `root` is the subtree that runs while the
+   receiver is held: the call itself, or a multiple assignment whose target
+   is the call (`x[0], x = v, w` runs both receivers before any store). */
+static void ssa_recv_held(Compiler *c, SsaNames *t, int root, int n) {
+  const NodeTable *nt = c->nt;
+  int rcv = nt_ref(nt, n, "receiver");
+  if (rcv < 0) return;
+  int rv = nt_paren_single(nt, rcv);
+  if (rv < 0 || nt_kind(nt, rv) != NK_LocalVariableReadNode) return;
+  const char *nm = nt_str(nt, rv, "name");
+  if (nm && ssa_writes(nt, root, nm, rcv, 0)) { int i = ssa_name_add(t, nm); t->bad[i] = 1; }
+}
+/* the targets of a multiple assignment that are calls (`x[0]`, `x.a`) */
+static void ssa_masgn_targets(Compiler *c, SsaNames *t, int root, int n, int depth) {
+  const NodeTable *nt = c->nt;
+  if (n < 0 || depth > 200) return;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_IndexTargetNode || k == NK_CallTargetNode) { ssa_recv_held(c, t, root, n); return; }
+  if (k == NK_SplatNode) { ssa_masgn_targets(c, t, root, nt_ref(nt, n, "expression"), depth + 1); return; }
+  if (k != NK_MultiWriteNode && k != NK_MultiTargetNode) return;
+  static const char *const lists[] = { "lefts", "rights" };
+  for (int i = 0; i < 2; i++) {
+    int an = 0; const int *av = nt_arr(nt, n, lists[i], &an);
+    for (int q = 0; q < an; q++) ssa_masgn_targets(c, t, root, av[q], depth + 1);
+  }
+  ssa_masgn_targets(c, t, root, nt_ref(nt, n, "rest"), depth + 1);
+}
+/* The reads of local `nm` inside `v`, the value write `w` stores. Such a
+   write can store the object the local already held: `x = x.push(3)`,
+   `x = x.itself`, `x = x.to_s` for a String. Spinel follows a value
+   through the writes of a local (to widen an Array where it is built,
+   before a store of another kind reaches it), not through what a method
+   returns. So with the write in a web of its own, a store through the
+   new slot does not reach the Array the old slot got from the caller. The
+   write stays in the web of the writes those reads see (ssa_method). */
+static void ssa_value_reads(const NodeTable *nt, SsaNames *t, int w, int v, const char *nm, int depth) {
+  if (v < 0) return;
+  if (depth > 2000) { t->method_bad = 1; return; }
+  NodeKind k = nt_kind(nt, v);
+  if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode) return;
+  if (k == NK_LocalVariableReadNode && sp_streq(nt_str(nt, v, "name"), nm)) {
+    if (t->np >= t->cp) {
+      t->cp = t->cp ? t->cp * 2 : 16;
+      t->pw = realloc(t->pw, sizeof(int) * (size_t)t->cp);
+      t->pr = realloc(t->pr, sizeof(int) * (size_t)t->cp);
+      if (!t->pw || !t->pr) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    t->pw[t->np] = w; t->pr[t->np] = v; t->np++;
+    return;
+  }
+  for (int i = 0; i < nt_num_refs(nt, v); i++) ssa_value_reads(nt, t, w, nt_ref_at(nt, v, i), nm, depth + 1);
+  for (int i = 0; i < nt_num_arrs(nt, v); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, v, i, &an);
+    for (int q = 0; q < an; q++) ssa_value_reads(nt, t, w, av[q], nm, depth + 1);
+  }
+}
+/* the plain local targets of a multiple assignment or a `for`, each with
+   the value it is given */
+static void ssa_target_reads(const NodeTable *nt, SsaNames *t, int n, int v, int depth) {
+  if (n < 0 || depth > 200) return;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_LocalVariableTargetNode) {
+    const char *nm = nt_str(nt, n, "name");
+    if (nm) ssa_value_reads(nt, t, n, v, nm, 0);
+    return;
+  }
+  if (k == NK_SplatNode) { ssa_target_reads(nt, t, nt_ref(nt, n, "expression"), v, depth + 1); return; }
+  if (k != NK_MultiWriteNode && k != NK_MultiTargetNode) return;
+  static const char *const lists[] = { "lefts", "rights" };
+  for (int i = 0; i < 2; i++) {
+    int an = 0; const int *av = nt_arr(nt, n, lists[i], &an);
+    for (int q = 0; q < an; q++) ssa_target_reads(nt, t, av[q], v, depth + 1);
+  }
+  ssa_target_reads(nt, t, nt_ref(nt, n, "rest"), v, depth + 1);
+}
 /* every local node of the body (not a nested def or class); `opaque` is a
    subtree whose uses the graph does not model */
 static void ssa_collect(Compiler *c, Scope *s, int n, SsaNames *t, int in_closure, int opaque, int depth) {
@@ -832,6 +932,12 @@ static void ssa_collect(Compiler *c, Scope *s, int n, SsaNames *t, int in_closur
   if (k == NK_CallNode && ssa_frame_name(nt_str(nt, n, "name"))) t->method_bad = 1;
   if (k == NK_SymbolNode && ssa_frame_name(nt_str(nt, n, "value"))) t->method_bad = 1;
   if (k == NK_StringNode && ssa_frame_name(nt_str(nt, n, "content"))) t->method_bad = 1;   /* send("binding") */
+  ssa_recv_held(c, t, n, n);
+  if (k == NK_MultiWriteNode) ssa_masgn_targets(c, t, n, n, 0);
+  if (k == NK_LocalVariableWriteNode && nt_str(nt, n, "name"))
+    ssa_value_reads(nt, t, n, nt_ref(nt, n, "value"), nt_str(nt, n, "name"), 0);
+  if (k == NK_MultiWriteNode) ssa_target_reads(nt, t, n, nt_ref(nt, n, "value"), 0);
+  if (k == NK_ForNode) ssa_target_reads(nt, t, nt_ref(nt, n, "index"), nt_ref(nt, n, "collection"), 0);
   if (ssa_local_node(k)) {
     const char *nm = nt_str(nt, n, "name");
     if (nm) {
@@ -870,9 +976,39 @@ static void ssa_union(int *uf, int a, int b) {
 }
 
 static int *g_ssa_rd;      /* per node: a definition its read sees, or -1 */
+static int *g_ssa_wd;      /* per node: the definition its write makes, or -1 */
 static int g_ssa_rd_cap;
 static char *g_ssa_seen;   /* per node: the graph keeps an event for it */
 static int st_ssa_methods, st_ssa_split, st_ssa_renamed, st_ssa_phis;
+
+/* Each split made, so ssa_check_splits can read the types its slots got.
+   A split is kept only when every slot of it is a plain value (Integer,
+   Float, String, Symbol, true/false, nil). An Array or Hash slot is where
+   Spinel's typed containers can refuse an element a poly slot took, so a
+   split that types one is undone: the compile runs again with that local
+   left whole (SP_SSA_VETO). */
+typedef struct { int scope; char *key; char **names; int nnames; } SsaSplit;
+static SsaSplit *g_ssa_splits;
+static int g_nssa_splits, g_cssa_splits;
+char **g_sp_argv;   /* main's argv, to run the compile again */
+
+/* a split's name across runs: the def's line, the method and the local */
+static void ssa_split_key(Compiler *c, Scope *s, const char *nm, char *out, size_t cap) {
+  snprintf(out, cap, "%d:%s:%s", (int)nt_int(c->nt, s->def_node, "node_line", 0), s->name ? s->name : "?", nm);
+}
+static int ssa_vetoed(const char *key) {
+  const char *v = getenv("SP_SSA_VETO");
+  if (!v || !*v) return 0;
+  size_t kl = strlen(key);
+  for (const char *p = v; *p; ) {
+    const char *e = strchr(p, ',');
+    size_t l = e ? (size_t)(e - p) : strlen(p);
+    if (l == kl && strncmp(p, key, kl) == 0) return 1;
+    if (!e) break;
+    p = e + 1;
+  }
+  return 0;
+}
 
 static int ssa_line(Compiler *c, int node) {
   return node >= 0 ? (int)nt_int(c->nt, node, "node_line", 0) : 0;
@@ -911,7 +1047,7 @@ static void ssa_method(Compiler *c, Scope *s) {
   ssa_collect(c, s, body, &t, 0, 0, 0);
   if (t.method_bad || t.n == 0) {
     for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
-    free(t.nm); free(t.bad); free(t.nodes); free(t.node_name);
+    free(t.nm); free(t.bad); free(t.nodes); free(t.node_name); free(t.pw); free(t.pr);
     return;
   }
   /* a parameter's entry definition is the argument, any other's is nil:
@@ -1029,6 +1165,21 @@ static void ssa_method(Compiler *c, Scope *s) {
       if (g_ssa_rd[node] >= 0) ssa_union(uf, dd, g_ssa_rd[node]);
     }
   }
+  /* a write whose value reads the local: the write joins the web of the
+     writes that read sees (ssa_value_reads) */
+  if (t.np > 0) {
+    for (int b = 0; b < g.nb; b++)
+      for (int e = 0; e < g.b[b].nev; e++)
+        if (g.b[b].ev_def[e] >= 0 && g.b[b].ev_node[e] < g_ssa_rd_cap) g_ssa_wd[g.b[b].ev_node[e]] = g.b[b].ev_def[e];
+    for (int q = 0; q < t.np; q++) {
+      int w = t.pw[q] < g_ssa_rd_cap ? g_ssa_wd[t.pw[q]] : -1;
+      int r = t.pr[q] < g_ssa_rd_cap ? g_ssa_rd[t.pr[q]] : -1;
+      if (w >= 0 && r >= 0) ssa_union(uf, w, r);
+    }
+    for (int b = 0; b < g.nb; b++)
+      for (int e = 0; e < g.b[b].nev; e++)
+        if (g.b[b].ev_node[e] < g_ssa_rd_cap) g_ssa_wd[g.b[b].ev_node[e]] = -1;
+  }
   for (int b = 0; b < g.nb; b++)
     for (int e = 0; e < g.b[b].nev; e++)
       if (g.b[b].ev_kind[e] == EV_READ && g_ssa_rd[g.b[b].ev_node[e]] >= 0)
@@ -1042,6 +1193,9 @@ static void ssa_method(Compiler *c, Scope *s) {
     int renamed_any = 0;
     for (int li = 0; li < nn; li++) {
       if (t.bad[li]) continue;
+      char key[512];
+      ssa_split_key(c, s, t.nm[li], key, sizeof key);
+      if (ssa_vetoed(key)) { t.bad[li] = 1; continue; }
       int roots = 0, first_root = -1;
       for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
         int r = ssa_find(uf, dl[q]);
@@ -1078,6 +1232,25 @@ static void ssa_method(Compiler *c, Scope *s) {
       if (!k) continue;   /* every web keeps the name */
       st_ssa_split++;
       renamed_any = 1;
+      if (g_nssa_splits >= g_cssa_splits) {
+        g_cssa_splits = g_cssa_splits ? g_cssa_splits * 2 : 16;
+        g_ssa_splits = realloc(g_ssa_splits, sizeof(SsaSplit) * (size_t)g_cssa_splits);
+        if (!g_ssa_splits) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      }
+      {
+        SsaSplit *sp = &g_ssa_splits[g_nssa_splits++];
+        sp->scope = s->idx; sp->key = strdup(key);
+        sp->names = malloc(sizeof(char *) * (size_t)(k + 2)); sp->nnames = 0;
+        if (!sp->key || !sp->names) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        sp->names[sp->nnames++] = strdup(t.nm[li]);
+        for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+          int r = ssa_find(uf, dl[q]);
+          if (!web_name[r]) continue;
+          int dup = 0;
+          for (int z = 1; z < sp->nnames; z++) if (sp_streq(sp->names[z], web_name[r])) { dup = 1; break; }
+          if (!dup) sp->names[sp->nnames++] = strdup(web_name[r]);
+        }
+      }
       if (ssa_log()) {
         const char *cn = s->class_id >= 0 && s->class_id < c->nclasses ? c->classes[s->class_id].name : NULL;
         fprintf(stderr, "spinel-ssa: %s%s%s: `%s` splits into %d slots:", cn ? cn : "", cn ? "#" : "", s->name ? s->name : "?", t.nm[li], k + 1);
@@ -1146,7 +1319,7 @@ done:
   free(g.b);
   free(def_name); free(def_node); free(uf); free(has_read); free(dl_off); free(dl);
   for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
-  free(t.nm); free(t.bad); free(t.nodes); free(t.node_name);
+  free(t.nm); free(t.bad); free(t.nodes); free(t.node_name); free(t.pw); free(t.pr);
 }
 
 int ssa_rename_locals(Compiler *c) {
@@ -1155,7 +1328,9 @@ int ssa_rename_locals(Compiler *c) {
   g_ssa_rd_cap = nt->count;
   g_ssa_rd = malloc(sizeof(int) * ((size_t)g_ssa_rd_cap + 1));
   if (!g_ssa_rd) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  for (int i = 0; i <= g_ssa_rd_cap; i++) g_ssa_rd[i] = -1;
+  g_ssa_wd = malloc(sizeof(int) * ((size_t)g_ssa_rd_cap + 1));
+  if (!g_ssa_wd) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i <= g_ssa_rd_cap; i++) g_ssa_rd[i] = g_ssa_wd[i] = -1;
   g_ssa_seen = calloc((size_t)g_ssa_rd_cap + 1, 1);
   if (!g_ssa_seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   st_ssa_methods = st_ssa_split = st_ssa_renamed = st_ssa_phis = 0;
@@ -1167,8 +1342,73 @@ int ssa_rename_locals(Compiler *c) {
     ssa_method(c, s);
   }
   free(g_ssa_rd); g_ssa_rd = NULL; g_ssa_rd_cap = 0;
+  free(g_ssa_wd); g_ssa_wd = NULL;
   free(g_ssa_seen); g_ssa_seen = NULL;
   if (ssa_log()) fprintf(stderr, "spinel-ssa: methods=%d phis=%d locals-split=%d nodes-renamed=%d\n",
                          st_ssa_methods, st_ssa_phis, st_ssa_split, st_ssa_renamed);
   return st_ssa_renamed;
+}
+
+/* The types the analysis gave the slots of each split. A split whose
+   slots are all plain values stays. Any other (an Array, a Hash, a poly
+   slot) is undone: the compile runs again from the start with those
+   locals left whole, so what Spinel prints for them is what master prints.
+   Called at the end of the analysis, before any C is written. */
+static int ssa_plain(TyKind t) {
+  return t == TY_NIL || t == TY_INT || t == TY_BIGINT || t == TY_FLOAT || t == TY_STRING ||
+         t == TY_STRBUF || t == TY_SYMBOL || t == TY_BOOL;
+}
+void ssa_check_splits(Compiler *c) {
+  if (g_nssa_splits == 0) return;
+  size_t cap = 256, len = 0;
+  char *veto = malloc(cap);
+  if (!veto) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  veto[0] = 0;
+  const char *old = getenv("SP_SSA_VETO");
+  if (old && *old) {
+    len = strlen(old);
+    while (len + 2 > cap) cap *= 2;
+    veto = realloc(veto, cap);
+    if (!veto) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    memcpy(veto, old, len + 1);
+  }
+  int nveto = 0;
+  for (int i = 0; i < g_nssa_splits; i++) {
+    SsaSplit *sp = &g_ssa_splits[i];
+    Scope *sc = sp->scope >= 0 && sp->scope < c->nscopes ? &c->scopes[sp->scope] : NULL;
+    if (!sc || !sc->reachable) continue;
+    const char *why = NULL;
+    for (int q = 0; q < sp->nnames && !why; q++) {
+      LocalVar *lv = scope_local(sc, sp->names[q]);
+      if (!lv || !ssa_plain(lv->type)) why = sp->names[q];
+    }
+    if (!why) continue;
+    if (ssa_log()) {
+      LocalVar *lv = scope_local(sc, why);
+      fprintf(stderr, "spinel-ssa: %s: slot `%s` is %s, not a plain value: one slot again\n",
+              sp->key, why, lv ? ty_name(lv->type) : "missing");
+    }
+    size_t kl = strlen(sp->key);
+    while (len + kl + 2 > cap) cap *= 2;
+    veto = realloc(veto, cap);
+    if (!veto) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    if (len) veto[len++] = ',';
+    memcpy(veto + len, sp->key, kl + 1); len += kl;
+    nveto++;
+  }
+  if (nveto == 0) { free(veto); return; }
+  /* each round leaves more locals whole; a third round turns SSA off */
+  const char *rs = getenv("SP_SSA_ROUND");
+  int round = rs ? atoi(rs) : 0;
+  char rb[16]; snprintf(rb, sizeof rb, "%d", round + 1);
+  setenv("SP_SSA_ROUND", rb, 1);
+  setenv("SP_SSA_VETO", veto, 1);
+  if (round + 1 >= 3) setenv("SP_NO_SSA", "1", 1);
+  free(veto);
+  if (!g_sp_argv) return;   /* (no argv to run again: keep the splits) */
+  if (ssa_log()) fprintf(stderr, "spinel-ssa: compiling again with %d local(s) left whole\n", nveto);
+  fflush(stdout); fflush(stderr);
+  execv("/proc/self/exe", g_sp_argv);
+  fprintf(stderr, "spinel: cannot run the compile again for SSA\n");
+  exit(1);
 }

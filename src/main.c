@@ -891,7 +891,9 @@ static void miscompile_errors(Str *cmd) {
              "-Werror=implicit-function-declaration ");
 }
 
+extern char **g_sp_argv;   /* analyze_cfg.c: SSA may run the compile again */
 int main(int argc, char **argv) {
+  g_sp_argv = argv;
 #ifdef SP_WORK_COUNT
   atexit(work_report);
 #endif

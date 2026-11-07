@@ -56659,6 +56659,9 @@ void analyze_program(Compiler *c) {
   /* the block bodies codegen types per arm, typed here once (#7483) */
   AN_PHASE("arm_facts", an_arm_facts(c));
   if (elab_check_on(c)) elab_check_visibility(c);
+  /* a local split in two whose slots did not all come out plain values is
+     left whole, by compiling again (analyze_cfg.c) */
+  ssa_check_splits(c);
   sp_timing_end(tm_an, "analysis", "");
 }
 
