@@ -9,8 +9,10 @@
    body is a scope of its own and is not entered: a local a closure writes is
    left out of the facts altogether.
 
-   Two facts per local, kept per block entry and settled by a worklist:
-   - unset: the read may run before any write of the local (OR at a join),
+   On the graph sits an SSA IR (ir_build): a value for each write and for
+   the method's entry, a phi where two values of a local meet, and the one
+   value each read sees. Two facts per value, settled over the phis:
+   - unset: the read may run before any write of the local (OR at a phi),
    - ty:    the one kind every write that reaches the read stored, or
             BOTTOM when two kinds (or nil, or an unknown write) meet.
 
@@ -27,13 +29,16 @@
 #include <string.h>
 #include <unistd.h>
 
-enum { EV_READ = 1, EV_WRITE, EV_WRITE_UNK, EV_ANDWRITE, EV_OPWRITE };
+enum { EV_READ = 1, EV_WRITE, EV_WRITE_UNK, EV_ANDWRITE, EV_OPWRITE, EV_PI };
 
 typedef struct {
   int *ev_kind, *ev_node; int nev, cev;
   int *succ; int nsucc, csucc;
   int reached;
-  int *ev_def;       /* SSA mode: the definition a write event makes */
+  int *ev_val;       /* the IR's value: the one a read sees, the one a write
+                        or a pi makes (ir_build) */
+  int *ev_loc;       /* the local's index (cfg_local_index), or -1 */
+  int *ev_aux;       /* a pi event: its index in CfgB.pis, else -1 */
 } CBlock;
 
 typedef struct {
@@ -116,19 +121,28 @@ static int cfg_fall(CfgB *g) {
   g->cur = nb;
   return nb;
 }
+static int cfg_local_index(CfgB *g, const char *nm);
+static void cfg_push_event(CfgB *g, CBlock *bl, int kind, int node, int loc, int aux) {
+  (void)g;
+  if (bl->nev >= bl->cev) {
+    bl->cev = bl->cev ? bl->cev * 2 : 8;
+    bl->ev_kind = realloc(bl->ev_kind, sizeof(int) * (size_t)bl->cev);
+    bl->ev_node = realloc(bl->ev_node, sizeof(int) * (size_t)bl->cev);
+    bl->ev_loc = realloc(bl->ev_loc, sizeof(int) * (size_t)bl->cev);
+    bl->ev_aux = realloc(bl->ev_aux, sizeof(int) * (size_t)bl->cev);
+    bl->ev_val = realloc(bl->ev_val, sizeof(int) * (size_t)bl->cev);
+    if (!bl->ev_kind || !bl->ev_node || !bl->ev_loc || !bl->ev_aux || !bl->ev_val) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  bl->ev_kind[bl->nev] = kind; bl->ev_node[bl->nev] = node;
+  bl->ev_loc[bl->nev] = loc; bl->ev_aux[bl->nev] = aux; bl->ev_val[bl->nev] = -1;
+  bl->nev++;
+}
 static void cfg_emit(CfgB *g, int kind, int node) {
   /* inside a protected body every write starts a new block, so the state
      before it is a block exit an exception edge carries to the rescue */
   if (g->protect > 0 && kind != EV_READ) cfg_fall(g);
   if (g->cur < 0) g->cur = cfg_new_block(g);   /* dead code: a block no edge reaches */
-  CBlock *bl = &g->b[g->cur];
-  if (bl->nev >= bl->cev) {
-    bl->cev = bl->cev ? bl->cev * 2 : 8;
-    bl->ev_kind = realloc(bl->ev_kind, sizeof(int) * (size_t)bl->cev);
-    bl->ev_node = realloc(bl->ev_node, sizeof(int) * (size_t)bl->cev);
-    if (!bl->ev_kind || !bl->ev_node) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  }
-  bl->ev_kind[bl->nev] = kind; bl->ev_node[bl->nev] = node; bl->nev++;
+  cfg_push_event(g, &g->b[g->cur], kind, node, cfg_local_index(g, nt_str(g->nt, node, "name")), -1);
 }
 static int cfg_local_index(CfgB *g, const char *nm) {
   if (!nm) return -1;
@@ -597,6 +611,291 @@ static void cfg_lower(CfgB *g, int n) {
   }
 }
 
+/* ---- the SSA IR: one value per write, a phi where values meet ----------
+
+   Each write event makes a value, and so does the method's entry, once
+   per local: the argument for a parameter, nil for any other local. A read
+   sees exactly one value. Where paths with different values of a local
+   meet, the block takes a phi: a value with one operand per predecessor.
+   ZJIT's HIR writes the same thing as a block parameter, and each jump
+   passes the operand for it.
+
+   The phis are placed from the reads, on demand (Braun et al.): a read
+   asks for its local's value at its block's entry; a block with one
+   predecessor answers with that block's last write, or asks it in turn; a
+   join block makes a phi and asks each predecessor for an operand. Then a
+   phi whose operands are all one value (or the phi itself) stands for that
+   value and is dropped, until none is left. A phi that no read reaches
+   (through other phis) is dead: the passes skip it. */
+enum { IV_ENTRY = 1, IV_DEF, IV_PHI, IV_PI };
+
+typedef struct {
+  unsigned char kind, live;
+  int local;
+  int node;        /* a DEF: the write's node; a PI: the test's node */
+  int evk;         /* a DEF: the event kind (EV_WRITE ...); a PI: its CfgB.pis index */
+  int block;
+  int src;         /* a PI, and the DEF of `x &&= v`: the value before it */
+  int op0, nop;    /* a PHI: ops[op0 .. op0 + nop), one per predecessor */
+  int repl;        /* a trivial PHI: the value it stands for, else -1 */
+} IrVal;
+
+typedef struct {
+  CfgB *g;
+  int nl, nb;
+  IrVal *v; int nv, cv;
+  int *ops; int nops, cops;
+  /* a local's value at a block's entry, for the pairs asked so far: open
+     addressing over key = block * nl + local */
+  long long *ek; int *ev; int ecap, en;
+  int *pred_off, *preds;
+  char *reached, *phiblk;
+  int *rpo_pos;
+  int *chain;
+  int *pend; int npend, cpend;
+  int nphi, ntrivial;
+} Ir;
+
+static void *ir_xalloc(size_t n) {
+  void *p = calloc(n ? n : 1, 1);
+  if (!p) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  return p;
+}
+static int ir_val_new(Ir *ir, int kind, int local, int node, int evk, int block) {
+  if (ir->nv >= ir->cv) {
+    ir->cv = ir->cv ? ir->cv * 2 : 64;
+    ir->v = realloc(ir->v, sizeof(IrVal) * (size_t)ir->cv);
+    if (!ir->v) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  IrVal *x = &ir->v[ir->nv];
+  memset(x, 0, sizeof *x);
+  x->kind = (unsigned char)kind; x->local = local; x->node = node; x->evk = evk; x->block = block;
+  x->src = -1; x->op0 = -1; x->repl = -1;
+  return ir->nv++;
+}
+static int ir_find(Ir *ir, int x) {
+  if (x < 0) return x;
+  int r = x;
+  while (ir->v[r].repl >= 0) r = ir->v[r].repl;
+  while (ir->v[x].repl >= 0) { int nx = ir->v[x].repl; ir->v[x].repl = r; x = nx; }
+  return r;
+}
+static int ir_eget(Ir *ir, int b, int l) {
+  if (ir->ecap == 0) return -1;
+  long long key = (long long)b * ir->nl + l;
+  unsigned h = (unsigned)((unsigned long long)key * 0x9E3779B97F4A7C15ULL >> 32) & (unsigned)(ir->ecap - 1);
+  while (ir->ek[h] >= 0) { if (ir->ek[h] == key) return ir->ev[h]; h = (h + 1) & (unsigned)(ir->ecap - 1); }
+  return -1;
+}
+static void ir_eset(Ir *ir, int b, int l, int val) {
+  if ((ir->en + 1) * 2 > ir->ecap) {
+    int oc = ir->ecap; long long *ok = ir->ek; int *ov = ir->ev;
+    ir->ecap = oc ? oc * 2 : 256;
+    ir->ek = malloc(sizeof(long long) * (size_t)ir->ecap); ir->ev = malloc(sizeof(int) * (size_t)ir->ecap);
+    if (!ir->ek || !ir->ev) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < ir->ecap; i++) ir->ek[i] = -1;
+    ir->en = 0;
+    for (int i = 0; i < oc; i++) if (ok[i] >= 0) ir_eset(ir, (int)(ok[i] / ir->nl), (int)(ok[i] % ir->nl), ov[i]);
+    free(ok); free(ov);
+  }
+  long long key = (long long)b * ir->nl + l;
+  unsigned h = (unsigned)((unsigned long long)key * 0x9E3779B97F4A7C15ULL >> 32) & (unsigned)(ir->ecap - 1);
+  while (ir->ek[h] >= 0 && ir->ek[h] != key) h = (h + 1) & (unsigned)(ir->ecap - 1);
+  if (ir->ek[h] < 0) { ir->ek[h] = key; ir->en++; }
+  ir->ev[h] = val;
+}
+/* the value a write or a pi in block b leaves for local l, or -1 */
+static int ir_last_write(Ir *ir, int b, int l) {
+  CBlock *bl = &ir->g->b[b];
+  for (int e = bl->nev - 1; e >= 0; e--)
+    if (bl->ev_loc[e] == l && bl->ev_kind[e] != EV_READ) return bl->ev_val[e];
+  return -1;
+}
+/* local l's value at the entry of reached block b */
+static int ir_entry(Ir *ir, int b, int l) {
+  int got = ir_eget(ir, b, l);
+  if (got >= 0) return got;
+  int n = 0, cur = b, val = -1;
+  for (;;) {
+    int e = ir_eget(ir, cur, l);
+    if (e >= 0) { val = e; break; }
+    if (cur == 0) { val = l; break; }                 /* the entry value */
+    if (ir->phiblk[cur]) {
+      val = ir_val_new(ir, IV_PHI, l, -1, 0, cur);
+      ir->nphi++;
+      if (ir->npend >= ir->cpend) {
+        ir->cpend = ir->cpend ? ir->cpend * 2 : 64;
+        ir->pend = realloc(ir->pend, sizeof(int) * (size_t)ir->cpend);
+        if (!ir->pend) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      }
+      ir->pend[ir->npend++] = val;
+      break;
+    }
+    ir->chain[n++] = cur;
+    int p = ir->preds[ir->pred_off[cur]];
+    int w = ir_last_write(ir, p, l);
+    if (w >= 0) { val = w; break; }
+    cur = p;
+    if (n >= ir->nb) break;                            /* a cycle of single predecessors: cannot happen */
+  }
+  ir_eset(ir, cur, l, val);
+  for (int i = 0; i < n; i++) ir_eset(ir, ir->chain[i], l, val);
+  return val;
+}
+static void ir_fill_phis(Ir *ir) {
+  while (ir->npend > 0) {
+    int ph = ir->pend[--ir->npend];
+    int b = ir->v[ph].block, l = ir->v[ph].local;
+    int np = ir->pred_off[b + 1] - ir->pred_off[b];
+    if (ir->nops + np > ir->cops) {
+      while (ir->nops + np > ir->cops) ir->cops = ir->cops ? ir->cops * 2 : 256;
+      ir->ops = realloc(ir->ops, sizeof(int) * (size_t)ir->cops);
+      if (!ir->ops) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    int op0 = ir->nops; ir->nops += np;
+    ir->v[ph].op0 = op0; ir->v[ph].nop = np;
+    for (int k = 0; k < np; k++) {
+      int p = ir->preds[ir->pred_off[b] + k];
+      int w = ir_last_write(ir, p, l);
+      ir->ops[op0 + k] = w >= 0 ? w : ir_entry(ir, p, l);
+    }
+  }
+}
+static void ir_free(Ir *ir) {
+  free(ir->v); free(ir->ops); free(ir->ek); free(ir->ev); free(ir->pred_off); free(ir->preds);
+  free(ir->reached); free(ir->phiblk); free(ir->rpo_pos); free(ir->chain); free(ir->pend);
+  memset(ir, 0, sizeof *ir);
+}
+
+/* Builds the values of graph g, whose events name nl locals. Returns 0
+   when the graph cannot take them (block 0 has a predecessor). */
+static int ir_build(CfgB *g, int nl, Ir *ir) {
+  memset(ir, 0, sizeof *ir);
+  ir->g = g; ir->nl = nl > 0 ? nl : 1; ir->nb = g->nb;
+  int nb = g->nb;
+  ir->reached = ir_xalloc((size_t)nb + 1);
+  ir->phiblk = ir_xalloc((size_t)nb + 1);
+  ir->rpo_pos = malloc(sizeof(int) * ((size_t)nb + 1));
+  ir->chain = malloc(sizeof(int) * ((size_t)nb + 1));
+  int *stack = malloc(sizeof(int) * ((size_t)nb + 1)), *sidx = ir_xalloc(sizeof(int) * ((size_t)nb + 1));
+  int *post = malloc(sizeof(int) * ((size_t)nb + 1));
+  if (!ir->rpo_pos || !ir->chain || !stack || !post) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i < nb; i++) ir->rpo_pos[i] = -1;
+  /* reached blocks, in reverse postorder (an iterative depth-first walk) */
+  int sp = 0, np = 0;
+  stack[sp++] = 0; ir->reached[0] = 1;
+  while (sp > 0) {
+    int b = stack[sp - 1];
+    if (sidx[b] < g->b[b].nsucc) {
+      int s2 = g->b[b].succ[sidx[b]++];
+      if (!ir->reached[s2]) { ir->reached[s2] = 1; stack[sp++] = s2; }
+    } else { post[np++] = b; sp--; }
+  }
+  for (int i = 0; i < np; i++) ir->rpo_pos[post[np - 1 - i]] = i;
+  /* the reached predecessors */
+  ir->pred_off = ir_xalloc(sizeof(int) * ((size_t)nb + 2));
+  for (int b = 0; b < nb; b++) if (ir->reached[b])
+    for (int k = 0; k < g->b[b].nsucc; k++) ir->pred_off[g->b[b].succ[k] + 1]++;
+  for (int b = 0; b < nb; b++) ir->pred_off[b + 1] += ir->pred_off[b];
+  ir->preds = malloc(sizeof(int) * ((size_t)ir->pred_off[nb] + 1));
+  if (!ir->preds) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  { int *fill = ir_xalloc(sizeof(int) * ((size_t)nb + 1));
+    for (int b = 0; b < nb; b++) if (ir->reached[b])
+      for (int k = 0; k < g->b[b].nsucc; k++) { int t = g->b[b].succ[k]; ir->preds[ir->pred_off[t] + fill[t]++] = b; }
+    free(fill); }
+  free(stack); free(sidx); free(post);
+  if (ir->pred_off[1] - ir->pred_off[0] > 0) return 0;
+  for (int b = 1; b < nb; b++) {
+    if (!ir->reached[b]) continue;
+    int n = ir->pred_off[b + 1] - ir->pred_off[b];
+    ir->phiblk[b] = n != 1 || ir->rpo_pos[ir->preds[ir->pred_off[b]]] >= ir->rpo_pos[b];
+  }
+  /* the values: an entry value per local, then a value per write and per
+     pi, in block order (the names a split gives follow this order) */
+  for (int l = 0; l < ir->nl; l++) ir_val_new(ir, IV_ENTRY, l, -1, 0, 0);
+  for (int b = 0; b < nb; b++) {
+    CBlock *bl = &g->b[b];
+    for (int e = 0; e < bl->nev; e++) {
+      bl->ev_val[e] = -1;
+      int l = bl->ev_loc[e];
+      if (l < 0 || l >= ir->nl || bl->ev_kind[e] == EV_READ) continue;
+      if (bl->ev_kind[e] == EV_PI) bl->ev_val[e] = ir_val_new(ir, IV_PI, l, bl->ev_node[e], bl->ev_aux[e], b);
+      else bl->ev_val[e] = ir_val_new(ir, IV_DEF, l, bl->ev_node[e], bl->ev_kind[e], b);
+    }
+  }
+  /* each read's value, and what each pi (and `&&=`) starts from */
+  int *curv = malloc(sizeof(int) * (size_t)ir->nl), *touched = malloc(sizeof(int) * (size_t)ir->nl);
+  if (!curv || !touched) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int l = 0; l < ir->nl; l++) curv[l] = -1;
+  for (int b = 0; b < nb; b++) {
+    if (!ir->reached[b]) continue;
+    CBlock *bl = &g->b[b];
+    int nt2 = 0;
+    for (int e = 0; e < bl->nev; e++) {
+      int l = bl->ev_loc[e];
+      if (l < 0 || l >= ir->nl) continue;
+      int k = bl->ev_kind[e];
+      if (k == EV_READ || k == EV_PI || k == EV_ANDWRITE) {
+        int cv = curv[l] >= 0 ? curv[l] : ir_entry(ir, b, l);
+        if (k == EV_READ) { bl->ev_val[e] = cv; continue; }
+        ir->v[bl->ev_val[e]].src = cv;
+      }
+      if (curv[l] < 0) touched[nt2++] = l;
+      curv[l] = bl->ev_val[e];
+    }
+    for (int i = 0; i < nt2; i++) curv[touched[i]] = -1;
+    ir_fill_phis(ir);
+  }
+  free(curv); free(touched);
+  /* trivial phis stand for their one value */
+  for (int changed = 1; changed; ) {
+    changed = 0;
+    for (int x = 0; x < ir->nv; x++) {
+      IrVal *ph = &ir->v[x];
+      if (ph->kind != IV_PHI || ph->repl >= 0) continue;
+      int same = -1, trivial = 1;
+      for (int k = 0; k < ph->nop; k++) {
+        int o = ir_find(ir, ir->ops[ph->op0 + k]);
+        if (o == x || o == same) continue;
+        if (same >= 0) { trivial = 0; break; }
+        same = o;
+      }
+      if (trivial && same >= 0) { ir->v[x].repl = same; ir->ntrivial++; changed = 1; }
+    }
+  }
+  /* everything names the value a trivial phi stands for */
+  for (int x = 0; x < ir->nv; x++) {
+    IrVal *v = &ir->v[x];
+    if (v->src >= 0) v->src = ir_find(ir, v->src);
+    if (v->kind == IV_PHI) for (int k = 0; k < v->nop; k++) ir->ops[v->op0 + k] = ir_find(ir, ir->ops[v->op0 + k]);
+  }
+  for (int b = 0; b < nb; b++) {
+    CBlock *bl = &g->b[b];
+    for (int e = 0; e < bl->nev; e++) if (bl->ev_kind[e] == EV_READ) bl->ev_val[e] = ir_find(ir, bl->ev_val[e]);
+  }
+  /* live: what a read reaches through phis, pis and `&&=` */
+  { int *wl = malloc(sizeof(int) * ((size_t)ir->nv + 1)); int nw = 0;
+    if (!wl) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int b = 0; b < nb; b++) {
+      CBlock *bl = &g->b[b];
+      for (int e = 0; e < bl->nev; e++) {
+        int x = bl->ev_kind[e] == EV_READ ? bl->ev_val[e] : -1;
+        if (x >= 0 && !ir->v[x].live) { ir->v[x].live = 1; wl[nw++] = x; }
+      }
+    }
+    while (nw > 0) {
+      IrVal *v = &ir->v[wl[--nw]];
+      if (v->src >= 0 && !ir->v[v->src].live) { ir->v[v->src].live = 1; wl[nw++] = v->src; }
+      if (v->kind == IV_PHI && v->repl < 0)
+        for (int k = 0; k < v->nop; k++) {
+          int o = ir->ops[v->op0 + k];
+          if (o >= 0 && !ir->v[o].live) { ir->v[o].live = 1; wl[nw++] = o; }
+        }
+    }
+    free(wl); }
+  return 1;
+}
+
 /* ---- the closures' writes: a local they write keeps no fact ---- */
 static void cfg_mark_captured(CfgB *g, int n, int in_closure, int depth) {
   if (n < 0 || depth > 200) return;
@@ -638,86 +937,62 @@ static unsigned char cfg_write_kind(CfgB *g, int kind, int node) {
   }
   return TY_BOT;
 }
-static void cfg_transfer(CfgB *g, int bi, unsigned char *ty, unsigned char *unset, int record) {
-  CBlock *bl = &g->b[bi];
-  for (int e = 0; e < bl->nev; e++) {
-    int kind = bl->ev_kind[e], node = bl->ev_node[e];
-    int li = cfg_local_index(g, nt_str(g->nt, node, "name"));
-    if (li < 0) continue;
-    if (kind == EV_READ) {
-      if (record && !g->captured[li]) {
-        if (node < fc_cap) {
-          fc_unset[node] = unset[li] ? 1 : 0;
-          fc_ty[node] = (ty[li] != TY_TOP && ty[li] != TY_BOT) ? (unsigned char)(ty[li] - 1) : TY_UNKNOWN;
-          st_reads++;
-        }
-      }
-      continue;
-    }
-    if (kind == EV_ANDWRITE) { ty[li] = TY_BOT; continue; }   /* unset stays */
-    unset[li] = 0;
-    ty[li] = cfg_write_kind(g, kind, node);
-  }
-}
-static void cfg_meet_into(unsigned char *ty, unsigned char *unset, const unsigned char *oty, const unsigned char *ounset, int n, int *changed) {
-  for (int i = 0; i < n; i++) {
-    unsigned char t = ty[i], o = oty[i], r;
-    if (t == TY_TOP) r = o; else if (o == TY_TOP || o == t) r = t; else r = TY_BOT;
-    if (r != t) { ty[i] = r; *changed = 1; }
-    if (ounset[i] && !unset[i]) { unset[i] = 1; *changed = 1; }
-  }
-}
-
+/* The two facts on the IR: a read may run before any write when the entry
+   value of a local (not a parameter's) reaches it, through phis and pis;
+   and the one kind every write that reaches it stored, or BOTTOM. */
 static void cfg_solve(CfgB *g) {
-  int nl = g->s->nlocals, nb = g->nb;
-  size_t sz = (size_t)nl;
-  unsigned char *in_ty = calloc((size_t)nb * sz + 1, 1), *in_un = calloc((size_t)nb * sz + 1, 1);
-  unsigned char *out_ty = calloc((size_t)nb * sz + 1, 1), *out_un = calloc((size_t)nb * sz + 1, 1);
-  char *inq = calloc((size_t)nb + 1, 1);
-  int *queue = malloc(sizeof(int) * ((size_t)nb * 4 + 4));
-  if (!in_ty || !in_un || !out_ty || !out_un || !inq || !queue) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  /* entry: every local is unset and nil; a parameter holds any kind */
-  for (int i = 0; i < nl; i++) {
-    LocalVar *lv = &g->s->locals[i];
-    if (lv->is_param) { in_ty[i] = TY_BOT; in_un[i] = 0; }
-    else { in_ty[i] = (unsigned char)(TY_NIL + 1); in_un[i] = 1; }
+  int nl = g->s->nlocals;
+  Ir ir; memset(&ir, 0, sizeof ir);
+  if (nl <= 0 || !ir_build(g, nl, &ir)) { ir_free(&ir); return; }
+  int nv = ir.nv;
+  unsigned char *ty = ir_xalloc((size_t)nv + 1), *un = ir_xalloc((size_t)nv + 1);
+  for (int x = 0; x < nv; x++) {
+    IrVal *v = &ir.v[x];
+    if (v->kind == IV_ENTRY) {
+      if (g->s->locals[v->local].is_param) { ty[x] = TY_BOT; un[x] = 0; }
+      else { ty[x] = (unsigned char)(TY_NIL + 1); un[x] = 1; }
+    } else if (v->kind == IV_DEF && v->evk != EV_ANDWRITE) {
+      ty[x] = cfg_write_kind(g, v->evk, v->node); un[x] = 0;
+    } else { ty[x] = TY_TOP; un[x] = 0; }
   }
-  g->b[0].reached = 1;
-  int qh = 0, qt = 0;
-  queue[qt++] = 0; inq[0] = 1;
-  int steps = 0;
-  while (qh < qt) {
-    int bi = queue[qh++]; inq[bi] = 0;
-    if (++steps > nb * 64 + 1000) break;   /* a backstop: the meet only lowers, so this does not fire */
-    memcpy(out_ty + (size_t)bi * sz, in_ty + (size_t)bi * sz, sz);
-    memcpy(out_un + (size_t)bi * sz, in_un + (size_t)bi * sz, sz);
-    cfg_transfer(g, bi, out_ty + (size_t)bi * sz, out_un + (size_t)bi * sz, 0);
-    CBlock *bl = &g->b[bi];
-    for (int k = 0; k < bl->nsucc; k++) {
-      int sb = bl->succ[k];
-      int changed = !g->b[sb].reached;
-      g->b[sb].reached = 1;
-      cfg_meet_into(in_ty + (size_t)sb * sz, in_un + (size_t)sb * sz, out_ty + (size_t)bi * sz, out_un + (size_t)bi * sz, nl, &changed);
-      if (changed && !inq[sb]) {
-        if (qt >= nb * 4 + 2) {   /* compact the queue */
-          int w = 0; for (int r = qh; r < qt; r++) queue[w++] = queue[r];
-          qh = 0; qt = w;
+  for (int changed = 1; changed; ) {
+    changed = 0;
+    for (int x = 0; x < nv; x++) {
+      IrVal *v = &ir.v[x];
+      unsigned char t, u;
+      if (v->kind == IV_PI) {
+        if (v->src < 0) continue;
+        t = ty[v->src]; u = un[v->src];
+      } else if (v->kind == IV_DEF && v->evk == EV_ANDWRITE) {   /* `x &&= v`: unset stays */
+        t = TY_BOT; u = v->src >= 0 ? un[v->src] : 0;
+      } else if (v->kind == IV_PHI && v->repl < 0) {
+        t = TY_TOP; u = 0;
+        for (int k = 0; k < v->nop; k++) {
+          int o = ir.ops[v->op0 + k];
+          if (o < 0) continue;
+          unsigned char ot = ty[o];
+          if (t == TY_TOP) t = ot; else if (ot != TY_TOP && ot != t) t = TY_BOT;
+          u |= un[o];
         }
-        queue[qt++] = sb; inq[sb] = 1;
-      }
+      } else continue;
+      if (t != ty[x] || u != un[x]) { ty[x] = t; un[x] = u; changed = 1; }
     }
   }
-  /* the final pass records the facts each read sees */
-  unsigned char *ty = malloc(sz + 1), *un = malloc(sz + 1);
-  if (!ty || !un) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  for (int bi = 0; bi < nb; bi++) {
-    if (!g->b[bi].reached) continue;
-    memcpy(ty, in_ty + (size_t)bi * sz, sz);
-    memcpy(un, in_un + (size_t)bi * sz, sz);
-    cfg_transfer(g, bi, ty, un, 1);
+  /* each read's facts */
+  for (int b = 0; b < g->nb; b++) {
+    if (!ir.reached[b]) continue;
+    CBlock *bl = &g->b[b];
+    for (int e = 0; e < bl->nev; e++) {
+      if (bl->ev_kind[e] != EV_READ) continue;
+      int li = bl->ev_loc[e], node = bl->ev_node[e], x = bl->ev_val[e];
+      if (li < 0 || x < 0 || g->captured[li] || node >= fc_cap) continue;
+      fc_unset[node] = un[x] ? 1 : 0;
+      fc_ty[node] = (ty[x] != TY_TOP && ty[x] != TY_BOT) ? (unsigned char)(ty[x] - 1) : TY_UNKNOWN;
+      st_reads++;
+    }
   }
   free(ty); free(un);
-  free(in_ty); free(in_un); free(out_ty); free(out_un); free(inq); free(queue);
+  ir_free(&ir);
 }
 
 static void cfg_build_scope(Compiler *c, Scope *s, int si, int want_types) {
@@ -735,7 +1010,7 @@ static void cfg_build_scope(Compiler *c, Scope *s, int si, int want_types) {
   cfg_jump_to(&g, g.exit_blk);
   st_blocks += g.nb; st_methods++;
   cfg_solve(&g);
-  for (int i = 0; i < g.nb; i++) { free(g.b[i].ev_kind); free(g.b[i].ev_node); free(g.b[i].succ); free(g.b[i].ev_def); }
+  for (int i = 0; i < g.nb; i++) { free(g.b[i].ev_kind); free(g.b[i].ev_node); free(g.b[i].succ); free(g.b[i].ev_val); free(g.b[i].ev_loc); free(g.b[i].ev_aux); }
   free(g.b); free(g.captured);
 }
 
@@ -1109,32 +1384,6 @@ static int ssa_vetoed(const char *key) {
 static int ssa_line(Compiler *c, int node) {
   return node >= 0 ? (int)nt_int(c->nt, node, "node_line", 0) : 0;
 }
-/* a read: it joins every definition of its name that reaches it */
-static void ssa_read(CfgB *g, int node, int li, const uint64_t *cur, const int *dl,
-                     const int *dl_off, int *uf, const int *def_node) {
-  int rep = -1, n = 0;
-  for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
-    int dd = dl[q];
-    if (!((cur[dd / 64] >> (dd % 64)) & 1)) continue;
-    if (rep < 0) rep = dd; else ssa_union(uf, rep, dd);
-    n++;
-  }
-  if (node < g_ssa_rd_cap) g_ssa_rd[node] = rep;
-  if (n >= 2) {
-    st_ssa_phis++;
-    if (ssa_log()) {
-      fprintf(stderr, "spinel-ssa:   line %d reads `%s` through a phi of", ssa_line(g->c, node), g->sn[li]);
-      for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
-        int dd = dl[q];
-        if (!((cur[dd / 64] >> (dd % 64)) & 1)) continue;
-        if (def_node[dd] < 0) fprintf(stderr, " entry");
-        else fprintf(stderr, " line-%d", ssa_line(g->c, def_node[dd]));
-      }
-      fprintf(stderr, "\n");
-    }
-  }
-}
-
 static void ssa_method(Compiler *c, Scope *s) {
   const NodeTable *nt = c->nt;
   int body = s->body >= 0 ? s->body : nt_ref(nt, s->def_node, "body");
@@ -1169,92 +1418,63 @@ static void ssa_method(Compiler *c, Scope *s) {
     for (int e = 0; e < g.b[b].nev; e++) if (g.b[b].ev_node[e] < g_ssa_rd_cap) g_ssa_seen[g.b[b].ev_node[e]] = 0;
 
   int nn = t.n;
-  /* definitions: one entry definition per name (the argument, or nil
-     before any write), then one per write event */
-  int ndef = nn;
-  for (int b = 0; b < g.nb; b++)
-    for (int e = 0; e < g.b[b].nev; e++) if (g.b[b].ev_kind[e] != EV_READ) ndef++;
-  int *def_name = malloc(sizeof(int) * (size_t)(ndef + 1));
-  int *def_node = malloc(sizeof(int) * (size_t)(ndef + 1));
-  int *uf = malloc(sizeof(int) * (size_t)(ndef + 1));
-  char *has_read = calloc((size_t)ndef + 1, 1);
-  if (!def_name || !def_node || !uf || !has_read) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  for (int i = 0; i < nn; i++) { def_name[i] = i; def_node[i] = -1; }
-  int d = nn;
+  /* the IR's values: one entry value per name (the argument, or nil
+     before any write), one per write, and the phis the reads need */
+  Ir ir; memset(&ir, 0, sizeof ir);
+  int *uf = NULL, *dl_off = NULL, *dl = NULL;
+  char *has_read = NULL;
+  int nvals = 0;
+  { /* a huge method is left as it is (the bound the reaching definitions
+       had: a bit per write, per block) */
+    size_t ndef = (size_t)nn;
+    for (int b = 0; b < g.nb; b++)
+      for (int e = 0; e < g.b[b].nev; e++) if (g.b[b].ev_kind[e] != EV_READ) ndef++;
+    if ((size_t)g.nb * ((ndef + 63) / 64) > ((size_t)1 << 22)) goto done; }
+  if (!ir_build(&g, nn, &ir)) goto done;
+  nvals = ir.nv;
+  uf = malloc(sizeof(int) * ((size_t)nvals + 1));
+  has_read = ir_xalloc((size_t)nvals + 1);
+  if (!uf) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i < nvals; i++) uf[i] = i;
+  /* each name's entry value and writes, in the order the values were made */
+  dl_off = ir_xalloc(sizeof(int) * ((size_t)nn + 2));
+  dl = malloc(sizeof(int) * ((size_t)nvals + 1));
+  if (!dl) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i < nvals; i++)
+    if (ir.v[i].kind == IV_ENTRY || ir.v[i].kind == IV_DEF) dl_off[ir.v[i].local + 1]++;
+  for (int i = 0; i < nn; i++) dl_off[i + 1] += dl_off[i];
+  { int *fill = ir_xalloc(sizeof(int) * ((size_t)nn + 1));
+    for (int i = 0; i < nvals; i++)
+      if (ir.v[i].kind == IV_ENTRY || ir.v[i].kind == IV_DEF) dl[dl_off[ir.v[i].local] + fill[ir.v[i].local]++] = i;
+    free(fill); }
+  /* out of SSA, a phi and its operands share one slot, and so do a pi and
+     the value it narrows: a web is one class of these */
+  for (int i = 0; i < nvals; i++) {
+    IrVal *v = &ir.v[i];
+    if (!v->live) continue;
+    if (v->kind == IV_PHI && v->repl < 0) {
+      st_ssa_phis++;
+      if (ssa_log()) fprintf(stderr, "spinel-ssa:   `%s` meets at a phi of %d values\n", t.nm[v->local], v->nop);
+      for (int k = 0; k < v->nop; k++) if (ir.ops[v->op0 + k] >= 0) ssa_union(uf, i, ir.ops[v->op0 + k]);
+    }
+    if (v->kind == IV_PI && v->src >= 0) ssa_union(uf, i, v->src);
+  }
+  /* the value each read sees and each write makes, by node */
   for (int b = 0; b < g.nb; b++) {
     CBlock *bl = &g.b[b];
-    bl->ev_def = malloc(sizeof(int) * (size_t)(bl->nev + 1));
-    if (!bl->ev_def) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     for (int e = 0; e < bl->nev; e++) {
-      bl->ev_def[e] = -1;
-      if (bl->ev_kind[e] == EV_READ) continue;
-      int li = cfg_local_index(&g, nt_str(nt, bl->ev_node[e], "name"));
-      def_name[d] = li; def_node[d] = bl->ev_node[e];
-      bl->ev_def[e] = d++;
+      int node = bl->ev_node[e];
+      if (node >= g_ssa_rd_cap || bl->ev_loc[e] < 0) continue;
+      if (bl->ev_kind[e] == EV_READ) g_ssa_rd[node] = bl->ev_val[e];
+      else if (bl->ev_kind[e] != EV_PI) g_ssa_wd[node] = bl->ev_val[e];
     }
-  }
-  for (int i = 0; i < ndef; i++) uf[i] = i;
-  /* each name's definitions */
-  int *dl_off = calloc((size_t)nn + 1, sizeof(int)), *dl = malloc(sizeof(int) * (size_t)(ndef + 1));
-  if (!dl_off || !dl) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  for (int i = 0; i < ndef; i++) if (def_name[i] >= 0) dl_off[def_name[i] + 1]++;
-  for (int i = 0; i < nn; i++) dl_off[i + 1] += dl_off[i];
-  { int *fill = malloc(sizeof(int) * (size_t)(nn + 1));
-    if (!fill) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    memcpy(fill, dl_off, sizeof(int) * (size_t)nn);
-    for (int i = 0; i < ndef; i++) if (def_name[i] >= 0) dl[fill[def_name[i]]++] = i;
-    free(fill); }
-
-  /* reaching definitions: a bit per definition, per block entry */
-  int W = (ndef + 63) / 64, nb = g.nb;
-  if ((size_t)nb * (size_t)W > ((size_t)1 << 22)) goto done;   /* a huge method: left as it is */
-  {
-    uint64_t *in = calloc((size_t)nb * (size_t)W + 1, sizeof(uint64_t));
-    uint64_t *cur = malloc(sizeof(uint64_t) * ((size_t)W + 1));
-    char *inq = calloc((size_t)nb + 1, 1), *reached = calloc((size_t)nb + 1, 1);
-    int *queue = malloc(sizeof(int) * ((size_t)nb + 1));
-    if (!in || !cur || !inq || !reached || !queue) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    for (int i = 0; i < nn; i++) in[i / 64] |= (uint64_t)1 << (i % 64);
-    /* the queue is a ring: a block is in it at most once */
-    int qh = 0, qn = 0;
-    queue[0] = 0; qn = 1; inq[0] = 1; reached[0] = 1;
-#define SSA_TRANSFER(bi, rec) do { CBlock *_bl = &g.b[bi]; \
-      for (int _e = 0; _e < _bl->nev; _e++) { \
-        int _li = cfg_local_index(&g, nt_str(nt, _bl->ev_node[_e], "name")); \
-        if (_li < 0) continue; \
-        if (_bl->ev_kind[_e] == EV_READ) { if (rec) ssa_read(&g, _bl->ev_node[_e], _li, cur, dl, dl_off, uf, def_node); continue; } \
-        for (int _q = dl_off[_li]; _q < dl_off[_li + 1]; _q++) cur[dl[_q] / 64] &= ~((uint64_t)1 << (dl[_q] % 64)); \
-        int _dd = _bl->ev_def[_e]; cur[_dd / 64] |= (uint64_t)1 << (_dd % 64); \
-      } } while (0)
-    while (qn > 0) {
-      int bi = queue[qh]; qh = (qh + 1) % nb; qn--; inq[bi] = 0;
-      memcpy(cur, in + (size_t)bi * W, sizeof(uint64_t) * (size_t)W);
-      SSA_TRANSFER(bi, 0);
-      CBlock *bl = &g.b[bi];
-      for (int k = 0; k < bl->nsucc; k++) {
-        int sb = bl->succ[k];
-        uint64_t *si = in + (size_t)sb * W;
-        int changed = !reached[sb];
-        reached[sb] = 1;
-        for (int w = 0; w < W; w++) { uint64_t nv = si[w] | cur[w]; if (nv != si[w]) { si[w] = nv; changed = 1; } }
-        if (changed && !inq[sb]) { queue[(qh + qn) % nb] = sb; qn++; inq[sb] = 1; }
-      }
-    }
-    /* the final pass: every read joins the definitions it sees */
-    for (int bi = 0; bi < nb; bi++) {
-      if (!reached[bi]) continue;
-      memcpy(cur, in + (size_t)bi * W, sizeof(uint64_t) * (size_t)W);
-      SSA_TRANSFER(bi, 1);
-    }
-#undef SSA_TRANSFER
-    free(in); free(cur); free(inq); free(reached); free(queue);
   }
   /* `x += 1`, `x ||= v`: one node reads and writes, so one name */
   for (int b = 0; b < g.nb; b++) {
     CBlock *bl = &g.b[b];
     for (int e = 0; e < bl->nev; e++) {
-      int dd = bl->ev_def[e], node = bl->ev_node[e];
-      if (dd < 0) continue;
+      int dd = bl->ev_kind[e] != EV_READ && bl->ev_kind[e] != EV_PI ? bl->ev_val[e] : -1, node = bl->ev_node[e];
+      if (dd < 0 || node >= g_ssa_rd_cap) continue;
       NodeKind nk = nt_kind(nt, node);
       if (nk != NK_LocalVariableOperatorWriteNode && nk != NK_LocalVariableOrWriteNode &&
           nk != NK_LocalVariableAndWriteNode) continue;
@@ -1262,29 +1482,21 @@ static void ssa_method(Compiler *c, Scope *s) {
     }
   }
   /* a write whose value reads the local: the write joins the web of the
-     writes that read sees (ssa_value_reads) */
-  if (t.np > 0) {
-    for (int b = 0; b < g.nb; b++)
-      for (int e = 0; e < g.b[b].nev; e++)
-        if (g.b[b].ev_def[e] >= 0 && g.b[b].ev_node[e] < g_ssa_rd_cap) g_ssa_wd[g.b[b].ev_node[e]] = g.b[b].ev_def[e];
-    for (int q = 0; q < t.np; q++) {
-      int w = t.pw[q] < g_ssa_rd_cap ? g_ssa_wd[t.pw[q]] : -1;
-      int r = t.pr[q] < g_ssa_rd_cap ? g_ssa_rd[t.pr[q]] : -1;
-      if (w >= 0 && r >= 0) ssa_union(uf, w, r);
-    }
-    for (int b = 0; b < g.nb; b++)
-      for (int e = 0; e < g.b[b].nev; e++)
-        if (g.b[b].ev_node[e] < g_ssa_rd_cap) g_ssa_wd[g.b[b].ev_node[e]] = -1;
+     values that read sees (ssa_value_reads) */
+  for (int q = 0; q < t.np; q++) {
+    int w = t.pw[q] < g_ssa_rd_cap ? g_ssa_wd[t.pw[q]] : -1;
+    int r = t.pr[q] < g_ssa_rd_cap ? g_ssa_rd[t.pr[q]] : -1;
+    if (w >= 0 && r >= 0) ssa_union(uf, w, r);
   }
   for (int b = 0; b < g.nb; b++)
     for (int e = 0; e < g.b[b].nev; e++)
-      if (g.b[b].ev_kind[e] == EV_READ && g_ssa_rd[g.b[b].ev_node[e]] >= 0)
-        has_read[ssa_find(uf, g_ssa_rd[g.b[b].ev_node[e]])] = 1;
+      if (g.b[b].ev_kind[e] == EV_READ && g.b[b].ev_val[e] >= 0)
+        has_read[ssa_find(uf, g.b[b].ev_val[e])] = 1;
 
   /* the webs of each name, and their names */
   {
-    char **web_name = calloc((size_t)ndef + 1, sizeof(char *));
-    char *keeps = calloc((size_t)ndef + 1, 1);
+    char **web_name = calloc((size_t)nvals + 1, sizeof(char *));
+    char *keeps = calloc((size_t)nvals + 1, 1);
     if (!web_name || !keeps) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     int renamed_any = 0;
     for (int li = 0; li < nn; li++) {
@@ -1307,7 +1519,7 @@ static void ssa_method(Compiler *c, Scope *s) {
       if (!has_read[r0]) {
         int best = -1;
         for (int q = dl_off[li]; q < dl_off[li + 1]; q++)
-          if (def_node[dl[q]] >= 0 && (best < 0 || def_node[dl[q]] < def_node[best])) best = dl[q];
+          if (ir.v[dl[q]].node >= 0 && (best < 0 || ir.v[dl[q]].node < ir.v[best].node)) best = dl[q];
         if (best >= 0) { first_root = ssa_find(uf, best); keeps[first_root] = 1; }
       }
       int k = 0;
@@ -1363,8 +1575,8 @@ static void ssa_method(Compiler *c, Scope *s) {
             int any = 0;
             for (int q2 = dl_off[li]; q2 < dl_off[li + 1]; q2++)
               if (ssa_find(uf, dl[q2]) == r) {
-                fprintf(stderr, "%s%s", any ? "," : "", def_node[dl[q2]] < 0 ? "entry" : "");
-                if (def_node[dl[q2]] >= 0) fprintf(stderr, "line %d", ssa_line(c, def_node[dl[q2]]));
+                fprintf(stderr, "%s%s", any ? "," : "", ir.v[dl[q2]].node < 0 ? "entry" : "");
+                if (ir.v[dl[q2]].node >= 0) fprintf(stderr, "line %d", ssa_line(c, ir.v[dl[q2]].node));
                 any = 1;
               }
             fprintf(stderr, ")");
@@ -1379,9 +1591,9 @@ static void ssa_method(Compiler *c, Scope *s) {
         CBlock *bl = &g.b[b];
         for (int e = 0; e < bl->nev; e++) {
           int node = bl->ev_node[e];
-          int li = cfg_local_index(&g, nt_str(nt, node, "name"));
-          if (li < 0 || t.bad[li]) continue;
-          int dd = bl->ev_def[e] >= 0 ? bl->ev_def[e] : g_ssa_rd[node];
+          int li = bl->ev_loc[e];
+          if (li < 0 || t.bad[li] || bl->ev_kind[e] == EV_PI) continue;
+          int dd = bl->ev_val[e];
           if (dd < 0) continue;
           char *nmn = web_name[ssa_find(uf, dd)];
           if (!nmn || sp_streq(nt_str(nt, node, "name"), nmn)) continue;
@@ -1394,26 +1606,27 @@ static void ssa_method(Compiler *c, Scope *s) {
     if (renamed_any) {
       const char *ol = nt_str(nt, s->def_node, "locals");
       size_t tot = (ol ? strlen(ol) : 0) + 1;
-      for (int i = 0; i < ndef; i++) if (web_name[i]) tot += strlen(web_name[i]) + 1;
+      for (int i = 0; i < nvals; i++) if (web_name[i]) tot += strlen(web_name[i]) + 1;
       char *nl = malloc(tot + 1);
       if (!nl) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
       snprintf(nl, tot + 1, "%s", ol ? ol : "");
-      for (int i = 0; i < ndef; i++)
+      for (int i = 0; i < nvals; i++)
         if (web_name[i]) { if (nl[0]) strcat(nl, ","); strcat(nl, web_name[i]); }
       if (ol) nt_set_str((NodeTable *)nt, s->def_node, "locals", nl);
       free(nl);
     }
-    for (int i = 0; i < ndef; i++) free(web_name[i]);
+    for (int i = 0; i < nvals; i++) free(web_name[i]);
     free(web_name); free(keeps);
   }
 done:
   for (int b = 0; b < g.nb; b++) {
     CBlock *bl = &g.b[b];
-    for (int e = 0; e < bl->nev; e++) if (bl->ev_node[e] < g_ssa_rd_cap) g_ssa_rd[bl->ev_node[e]] = -1;
-    free(bl->ev_kind); free(bl->ev_node); free(bl->succ); free(bl->ev_def);
+    for (int e = 0; e < bl->nev; e++) if (bl->ev_node[e] < g_ssa_rd_cap) g_ssa_rd[bl->ev_node[e]] = g_ssa_wd[bl->ev_node[e]] = -1;
+    free(bl->ev_kind); free(bl->ev_node); free(bl->succ); free(bl->ev_val); free(bl->ev_loc); free(bl->ev_aux);
   }
   free(g.b);
-  free(def_name); free(def_node); free(uf); free(has_read); free(dl_off); free(dl);
+  ir_free(&ir);
+  free(uf); free(has_read); free(dl_off); free(dl);
   for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
   free(t.nm); free(t.bad); free(t.nodes); free(t.node_name); free(t.pw); free(t.pr);
 }
