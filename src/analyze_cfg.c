@@ -667,6 +667,43 @@ static int direct_literal_elem(Compiler *c, const int *par, int node) {
   if (pk == NK_AssocNode) { int pp = par[p]; return pp >= 0 && nt_kind(c->nt, pp) == NK_HashNode; }
   return 0;
 }
+/* does the subtree under n write the local nm */
+static int cfg_subtree_writes(const NodeTable *nt, int n, const char *nm) {
+  if (n < 0) return 0;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_LocalVariableWriteNode || k == NK_LocalVariableTargetNode ||
+      k == NK_LocalVariableOperatorWriteNode || k == NK_LocalVariableAndWriteNode ||
+      k == NK_LocalVariableOrWriteNode) {
+    const char *wn = nt_str(nt, n, "name");
+    if (wn && sp_streq(wn, nm)) return 1;
+  }
+  int nr = nt_num_refs(nt, n);
+  for (int i = 0; i < nr; i++) if (cfg_subtree_writes(nt, nt_ref_at(nt, n, i), nm)) return 1;
+  int na = nt_num_arrs(nt, n);
+  for (int i = 0; i < na; i++) {
+    int cnt = 0; const int *ids = nt_arr_at(nt, n, i, &cnt);
+    for (int j = 0; j < cnt; j++) if (cfg_subtree_writes(nt, ids[j], nm)) return 1;
+  }
+  return 0;
+}
+/* A read whose own statement also writes the local (`(i = 1; a)[i] = 9`):
+   the C that codegen prints for the statement orders the two as C
+   arguments, which an unboxed read would reorder. Left boxed. */
+static int cfg_statement_writes(Compiler *c, const int *par, int r, const char *nm) {
+  if (!par) return 0;
+  int n = r;
+  while (par[n] >= 0 && nt_kind(c->nt, par[n]) != NK_StatementsNode) n = par[n];
+  if (n == r) return 0;
+  /* `x = x + 2`: the statement's own store lands after its value is
+     computed, so only the value is looked at */
+  NodeKind k = nt_kind(c->nt, n);
+  if (k == NK_LocalVariableWriteNode || k == NK_LocalVariableOperatorWriteNode ||
+      k == NK_LocalVariableAndWriteNode || k == NK_LocalVariableOrWriteNode) {
+    const char *wn = nt_str(c->nt, n, "name");
+    if (wn && sp_streq(wn, nm)) n = nt_ref(c->nt, n, "value");
+  }
+  return cfg_subtree_writes(c->nt, n, nm);
+}
 int cfg_narrow_reads(Compiler *c) {
   if (cfg_disabled()) return 0;
   cfg_facts_build(c, 1);
@@ -679,6 +716,11 @@ int cfg_narrow_reads(Compiler *c) {
     if (!lv || lv->type != TY_POLY || lv->is_cell || lv->proc_rebinds) continue;
     if (c->nilnarrow[r] != TY_UNKNOWN) continue;
     if (direct_literal_elem(c, par, r)) continue;
+    /* the prelude's methods convert their arguments through #to_int and
+       friends at sites the reachability pass finds by their boxed reads:
+       their reads stay boxed */
+    if (nt_int(c->nt, r, "node_bi", 0) != 0) continue;
+    if (cfg_statement_writes(c, par, r, nm)) continue;
     comp_set_nilnarrow(c, r, (TyKind)fc_ty[r]);
     st_narrowed++;
   }
