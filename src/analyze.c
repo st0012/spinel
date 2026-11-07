@@ -2656,6 +2656,16 @@ int a_proc_create_or_lifted(Compiler *c, int id) {
   return is_proc_create(c, id) || a_block_is_lifted(c, id) ||
          a_is_fiber_or_gen_create(c, id) || is_handler_proc_block(c, id);
 }
+/* The block of call `id` can run after the call returns: the capture
+   marking's `outlives` (mark_proc_captures), and a block the fixpoint
+   marked kept. A lifted iteration block is consumed while its call runs. */
+int an_block_outlives_call(Compiler *c, int id) {
+  if (nt_int(c->nt, id, "blk_kept", 0)) return 1;
+  if (!a_proc_create_or_lifted(c, id) && !a_block_forwarded_to_proc(c, id)) return 0;
+  int fib_create = a_is_fiber_or_gen_create(c, id);
+  return !(a_block_is_lifted(c, id) && !is_proc_create(c, id) && !fib_create &&
+           !is_handler_proc_block(c, id) && !a_block_forwarded_to_proc(c, id));
+}
 
 /* The blocks the load record takes to run at once (ELAB_BLK_ASSUMED: an
    iterator's name, class_eval and kin) whose typed call target makes them
@@ -19360,7 +19370,7 @@ static const char *nng_guard_param(Compiler *c, Scope *s, int st) {
    exact; elsewhere the reads stay boxed, where the boxed dispatch answers
    for both. */
 int class_has_subclass(Compiler *c, int ocid);
-static TyKind isa_narrow_type(Compiler *c, const char *cn, const Scope *s) {
+TyKind isa_narrow_type(Compiler *c, const char *cn, const Scope *s) {
   if (!cn) return TY_UNKNOWN;
   /* A user class with no subclass: is_a?(K) proves the exact class, so the
      read unboxes to K and its calls bind statically. A subclass instance
@@ -19422,7 +19432,7 @@ static const char *isa_guard_local(Compiler *c, int pred, Scope *s, TyKind *out_
    is a new object or a plain value, and a block sees elements, never the
    receiver. (each, each_with_index, each_slice, each_cons, product,
    combination and permutation return the receiver when given a block.) */
-static int isa_array_read_only(const char *nm) {
+int isa_array_read_only(const char *nm) {
   static const char *const R[] = {
     "length", "size", "count", "empty?", "any?", "all?", "none?", "one?",
     "first", "last", "[]", "at", "dig", "fetch", "slice", "take", "drop",
@@ -19560,12 +19570,57 @@ static void isa_mark_guards(Compiler *c, int root, Scope *s) {
   }
 }
 
+/* The IR's pass (analyze_cfg.c, ir_narrow_type_tests) narrows the reads of
+   every method and of the top level from the pis of the program's tests;
+   this walk does the scopes it leaves. SP_IR_COMPARE=1 runs the walk on
+   them too and prints each read it unboxes that the IR's pass does not, or
+   to another type. */
 static void narrow_isa_guards(Compiler *c) {
+  int cmp = getenv("SP_IR_COMPARE") != NULL;
+  int nn = c->nt->count;
+  TyKind *before = NULL, *tree = NULL;
+  if (cmp) {
+    before = malloc(sizeof(TyKind) * ((size_t)nn + 1));
+    tree = malloc(sizeof(TyKind) * ((size_t)nn + 1));
+    if (!before || !tree) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < nn; i++) before[i] = c->nilnarrow[i];
+    for (int mi = 0; mi < c->nscopes; mi++) {
+      Scope *s = &c->scopes[mi];
+      if (s->body < 0 || s->cs_synth) continue;
+      isa_mark_guards(c, s->body, s);
+    }
+    for (int i = 0; i < nn; i++) { tree[i] = c->nilnarrow[i]; comp_set_nilnarrow(c, i, before[i]); }
+  }
+  char *done = ir_narrow_type_tests(c);
+  if (cmp && done) {
+    int nt_only = 0, ir_only = 0, both = 0, differ = 0;
+    for (int i = 0; i < nn; i++) {
+      Scope *s = comp_scope_of(c, i);
+      if (!s || !done[s->idx]) continue;
+      int tm = tree[i] != before[i], im = c->nilnarrow[i] != before[i];
+      if (tm && im && tree[i] != c->nilnarrow[i]) {
+        differ++;
+        fprintf(stderr, "spinel-ir-compare: line %d `%s`: the walk unboxes as %s, the IR as %s\n",
+                (int)nt_int(c->nt, i, "node_line", 0), nt_str(c->nt, i, "name") ? nt_str(c->nt, i, "name") : "?",
+                ty_name(tree[i]), ty_name(c->nilnarrow[i]));
+      } else if (tm && im) both++;
+      else if (tm) {
+        nt_only++;
+        fprintf(stderr, "spinel-ir-compare: line %d `%s` in %s: only the walk unboxes it (as %s)\n",
+                (int)nt_int(c->nt, i, "node_line", 0), nt_str(c->nt, i, "name") ? nt_str(c->nt, i, "name") : "?",
+                s->name ? s->name : "(top)", ty_name(tree[i]));
+      } else if (im) ir_only++;
+    }
+    fprintf(stderr, "spinel-ir-compare: both=%d walk-only=%d ir-only=%d differ=%d\n", both, nt_only, ir_only, differ);
+  }
+  free(before); free(tree);
   for (int mi = 0; mi < c->nscopes; mi++) {
     Scope *s = &c->scopes[mi];
     if (s->body < 0 || s->cs_synth) continue;
+    if (done && done[mi]) continue;
     isa_mark_guards(c, s->body, s);
   }
+  free(done);
 }
 
 /* ---- caller-side narrowing of a nil-guarded poly LOCAL (#1675) ------------

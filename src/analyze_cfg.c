@@ -31,6 +31,14 @@
 
 enum { EV_READ = 1, EV_WRITE, EV_WRITE_UNK, EV_ANDWRITE, EV_OPWRITE, EV_PI };
 
+/* The kinds of value a local can hold at a point, as a set (the type
+   lattice of the narrowing passes). KN_OBJ goes with one class id when
+   all the objects are of one class. */
+enum { KN_NIL = 1 << 0, KN_TRUE = 1 << 1, KN_FALSE = 1 << 2, KN_INT = 1 << 3, KN_BIG = 1 << 4,
+       KN_FLOAT = 1 << 5, KN_STR = 1 << 6, KN_SYM = 1 << 7, KN_ARR = 1 << 8, KN_HASH = 1 << 9,
+       KN_OBJ = 1 << 10, KN_OTHER = 1 << 11 };
+#define KN_ALL 0x0fff
+
 typedef struct {
   int *ev_kind, *ev_node; int nev, cev;
   int *succ; int nsucc, csucc;
@@ -41,11 +49,31 @@ typedef struct {
   int *ev_aux;       /* a pi event: its index in CfgB.pis, else -1 */
 } CBlock;
 
+/* A pi: what an edge out of a type test tells about the local it tests.
+   `if v.is_a?(String)` puts PI_ISA on the true edge and PI_NOTISA on the
+   false one; `if v` puts PI_TRUTHY and PI_FALSY. ZJIT's HIR writes the
+   same thing as a GuardType, with a side exit; here the program's own
+   test is the guard, so no exit is needed. */
+enum { PI_ISA = 1, PI_NOTISA, PI_NIL, PI_NOTNIL, PI_TRUTHY, PI_FALSY };
+typedef struct {
+  int test;              /* the test's node */
+  int op;                /* PI_* */
+  unsigned short mask;   /* PI_ISA/PI_NOTISA: the class's kinds (KN_*) */
+  short cid;             /* a user class: its index, else -1 */
+  char loose;            /* an instance of a subclass passes the test too */
+  const char *cls;       /* the class's name, for the dump */
+} CfgPi;
+
 typedef struct {
   Compiler *c;
   const NodeTable *nt;
   Scope *s;
   int si;
+  /* full mode (the narrowing passes): a pi on each edge out of a type
+     test, conditions lowered as jumps, and the blocks of calls on the
+     graph. `blocks` alone (the SSA rename) puts the blocks there. */
+  int full, blocks;
+  CfgPi *pis; int npis, cpis;
   CBlock *b; int nb, cb;
   int cur;           /* the block events go to; -1 after a jump (dead) */
   int exit_blk;
@@ -122,6 +150,7 @@ static int cfg_fall(CfgB *g) {
   return nb;
 }
 static int cfg_local_index(CfgB *g, const char *nm);
+static int cfg_subtree_writes(const NodeTable *nt, int n, const char *nm);
 static void cfg_push_event(CfgB *g, CBlock *bl, int kind, int node, int loc, int aux) {
   (void)g;
   if (bl->nev >= bl->cev) {
@@ -159,6 +188,283 @@ static int cfg_owned(CfgB *g, int n) {
 }
 
 static void cfg_lower(CfgB *g, int n);
+static void cfg_lower_list(CfgB *g, int stmts);
+static void cfg_jump_to(CfgB *g, int target);
+
+/* ---- full mode: pis, conditions as jumps, blocks on the graph ---- */
+
+int class_has_subclass(Compiler *c, int ocid);
+
+/* a user class inherits from the builtin class `name` (so an is_a? of it
+   passes for an object of that class too) */
+static int cfg_builtin_subclassed(Compiler *c, const char *name) {
+  static Compiler *mc; static int mn = -1, memo[16];
+  static const char *const names[] = { "String", "Symbol", "Integer", "Float", "Array", "Hash",
+                                       "NilClass", "TrueClass", "FalseClass", NULL };
+  int slot = -1;
+  for (int i = 0; names[i]; i++) if (sp_streq(names[i], name)) { slot = i; break; }
+  if (mc != c || mn != c->nclasses) { mc = c; mn = c->nclasses; for (int i = 0; i < 16; i++) memo[i] = -1; }
+  if (slot >= 0 && memo[slot] >= 0) return memo[slot];
+  int r = 0;
+  for (int ci = 0; ci < c->nclasses && !r; ci++)
+    for (int a = ci, d = 0; a >= 0 && d < 64 && !r; a = c->classes[a].parent, d++) {
+      int dn = c->classes[a].def_node;
+      int sup = dn >= 0 && nt_kind(c->nt, dn) == NK_ClassNode ? nt_ref(c->nt, dn, "superclass") : -1;
+      if (sup >= 0 && nt_kind(c->nt, sup) == NK_ConstantReadNode && sp_streq(nt_str(c->nt, sup, "name"), name)) r = 1;
+      if (a != ci && c->classes[a].name && sp_streq(c->classes[a].name, name)) r = 1;
+    }
+  if (slot >= 0) memo[slot] = r;
+  return r;
+}
+/* What `is_a?(name)` passes: the kinds of a builtin value class, or the
+   objects of a user class (not a module). 0 when the test says nothing
+   the lattice can hold. */
+static int cfg_class_kinds(Compiler *c, const char *name, unsigned short *mask, int *cid, char *loose) {
+  *mask = 0; *cid = -1; *loose = 0;
+  if (!name) return 0;
+  static const struct { const char *n; unsigned short m; } B[] = {
+    { "String", KN_STR }, { "Symbol", KN_SYM }, { "Integer", KN_INT | KN_BIG }, { "Float", KN_FLOAT },
+    { "Array", KN_ARR }, { "Hash", KN_HASH }, { "NilClass", KN_NIL }, { "TrueClass", KN_TRUE },
+    { "FalseClass", KN_FALSE }, { NULL, 0 } };
+  for (int i = 0; B[i].n; i++)
+    if (sp_streq(name, B[i].n)) { *mask = B[i].m; *loose = (char)cfg_builtin_subclassed(c, name); return 1; }
+  if (is_builtin_class_name(name) || is_builtin_module_name(name)) return 0;
+  int ci = comp_class_index(c, name);
+  if (ci < 0) return 0;
+  const ClassInfo *k = &c->classes[ci];
+  if (!class_def_is_class(c->nt, k->def_node) || k->is_builtin_const || k->is_native_class || k->ary_root > 0)
+    return 0;
+  *mask = KN_OBJ; *cid = ci; *loose = (char)class_has_subclass(c, ci);
+  return 1;
+}
+static int cfg_new_pi(CfgB *g, int test, int op, unsigned short mask, int cid, char loose, const char *cls) {
+  if (g->npis >= g->cpis) {
+    g->cpis = g->cpis ? g->cpis * 2 : 16;
+    g->pis = realloc(g->pis, sizeof(CfgPi) * (size_t)g->cpis);
+    if (!g->pis) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  CfgPi *p = &g->pis[g->npis];
+  p->test = test; p->op = op; p->mask = mask; p->cid = (short)(cid > 32767 ? -1 : cid); p->loose = loose; p->cls = cls;
+  if (cid > 32767) p->loose = 1;   /* (an id past the field: an object of some class) */
+  return g->npis++;
+}
+/* the edge from -> to, through a fresh block that holds a pi of local li */
+static void cfg_edge_pi(CfgB *g, int from, int to, int li, int pi) {
+  if (from < 0) return;
+  if (li < 0 || pi < 0) { cfg_add_edge(g, from, to); return; }
+  int e = cfg_new_block(g);
+  cfg_add_edge(g, from, e);
+  cfg_push_event(g, &g->b[e], EV_PI, g->pis[pi].test, li, pi);
+  cfg_add_edge(g, e, to);
+}
+/* the pis of `is_a?(K)` (or `K === x`) on its two edges */
+static void cfg_class_pis(CfgB *g, int test, int knode, int exact, int *pt, int *pf) {
+  *pt = *pf = -1;
+  if (knode < 0 || nt_kind(g->nt, knode) != NK_ConstantReadNode) return;
+  const char *cn = nt_str(g->nt, knode, "name");
+  unsigned short mask; int cid; char loose;
+  if (!cfg_class_kinds(g->c, cn, &mask, &cid, &loose)) return;
+  /* a class with a `self.===` of the program's own answers a when as it likes */
+  int ci = comp_class_index(g->c, cn);
+  if (ci >= 0 && class_any_cmethod_eqq(g->c, ci) >= 0) return;
+  *pt = cfg_new_pi(g, test, PI_ISA, mask, cid, loose, cn);
+  if (!exact) *pf = cfg_new_pi(g, test, PI_NOTISA, mask, cid, loose, cn);
+}
+/* the local a condition tests, and the pis of its true and false edges:
+   `x`, `x.nil?`, `x.is_a?(K)`, `x.kind_of?(K)`, `x.instance_of?(K)`,
+   `K === x`. -1 when it tests no local. */
+static int cfg_test_of(CfgB *g, int pred, int *pt, int *pf) {
+  const NodeTable *nt = g->nt;
+  *pt = *pf = -1;
+  if (pred < 0) return -1;
+  NodeKind k = nt_kind(nt, pred);
+  if (k == NK_LocalVariableReadNode) {
+    if (!cfg_owned(g, pred)) return -1;
+    int li = cfg_local_index(g, nt_str(nt, pred, "name"));
+    if (li < 0) return -1;
+    *pt = cfg_new_pi(g, pred, PI_TRUTHY, 0, -1, 0, NULL);
+    *pf = cfg_new_pi(g, pred, PI_FALSY, 0, -1, 0, NULL);
+    return li;
+  }
+  if (k != NK_CallNode || nt_safe_nav(nt, pred)) return -1;
+  { int blk = nt_ref(nt, pred, "block"); if (blk >= 0) return -1; }
+  const char *nm = nt_str(nt, pred, "name");
+  if (!nm) return -1;
+  int recv = nt_ref(nt, pred, "receiver");
+  int args = nt_ref(nt, pred, "arguments");
+  int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+  /* `K === x` */
+  if (sp_streq(nm, "===") && recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode && an == 1 &&
+      nt_kind(nt, av[0]) == NK_LocalVariableReadNode && cfg_owned(g, av[0])) {
+    int li = cfg_local_index(g, nt_str(nt, av[0], "name"));
+    if (li < 0) return -1;
+    cfg_class_pis(g, pred, recv, 0, pt, pf);
+    return *pt >= 0 ? li : -1;
+  }
+  if (recv < 0 || nt_kind(nt, recv) != NK_LocalVariableReadNode || !cfg_owned(g, recv)) return -1;
+  int li = cfg_local_index(g, nt_str(nt, recv, "name"));
+  if (li < 0) return -1;
+  /* a method of the program's own with the name answers as it likes */
+  if (an_user_defines_or_reads(g->c, nm)) return -1;
+  if (sp_streq(nm, "nil?") && an == 0) {
+    *pt = cfg_new_pi(g, pred, PI_NIL, 0, -1, 0, NULL);
+    *pf = cfg_new_pi(g, pred, PI_NOTNIL, 0, -1, 0, NULL);
+    return li;
+  }
+  if ((sp_streq(nm, "is_a?") || sp_streq(nm, "kind_of?") || sp_streq(nm, "instance_of?")) && an == 1) {
+    cfg_class_pis(g, pred, av[0], sp_streq(nm, "instance_of?"), pt, pf);
+    return *pt >= 0 ? li : -1;
+  }
+  return -1;
+}
+/* Lowers condition `pred` as jumps: to tb when it holds, to fb when not.
+   `a && b` tests b only on a's true edge, `a || b` only on its false one,
+   and `!a` swaps the two. Ends with no current block. */
+static void cfg_cond(CfgB *g, int pred, int tb, int fb) {
+  const NodeTable *nt = g->nt;
+  int p = pred >= 0 ? nt_paren_single(nt, pred) : pred;
+  NodeKind k = p >= 0 ? nt_kind(nt, p) : NK_NilNode;
+  if (p >= 0 && (k == NK_AndNode || k == NK_OrNode)) {
+    int mid = cfg_new_block(g);
+    if (k == NK_AndNode) cfg_cond(g, nt_ref(nt, p, "left"), mid, fb);
+    else cfg_cond(g, nt_ref(nt, p, "left"), tb, mid);
+    g->cur = mid;
+    cfg_cond(g, nt_ref(nt, p, "right"), tb, fb);
+    return;
+  }
+  if (p >= 0 && k == NK_CallNode && nt_str(nt, p, "name") && sp_streq(nt_str(nt, p, "name"), "!") &&
+      nt_ref(nt, p, "receiver") >= 0 && nt_ref(nt, p, "arguments") < 0 && nt_ref(nt, p, "block") < 0 &&
+      !an_user_defines_or_reads(g->c, "!")) {
+    cfg_cond(g, nt_ref(nt, p, "receiver"), fb, tb);
+    return;
+  }
+  cfg_lower(g, pred);
+  int from = g->cur;
+  if (from < 0) return;
+  int pt, pf;
+  int li = cfg_test_of(g, p, &pt, &pf);
+  cfg_edge_pi(g, from, tb, li, pt);
+  cfg_edge_pi(g, from, fb, li, pf);
+  g->cur = -1;
+}
+/* A write event of local li (for a name with no node of its own) */
+static void cfg_emit_loc(CfgB *g, int kind, int node, int li) {
+  if (g->protect > 0 && kind != EV_READ) cfg_fall(g);
+  if (g->cur < 0) g->cur = cfg_new_block(g);
+  cfg_push_event(g, &g->b[g->cur], kind, node, li, -1);
+}
+/* Whether the block of call `call` goes on the graph: it runs while the
+   call runs, any number of times, and is done when the call returns. A
+   block that can run later (a proc, a thread, a handler, a block a method
+   keeps) is left off, as a closure. `typed`: the analysis has types, so
+   the capture marking's own test applies; before them (the SSA rename)
+   only the forms that always make a proc are left off, and the rename's
+   final check undoes a split a later-running block reads. */
+int an_block_outlives_call(Compiler *c, int id);
+static int cfg_block_on_graph(Compiler *c, int call, int typed) {
+  const NodeTable *nt = c->nt;
+  NodeKind k = nt_kind(nt, call);
+  if (k != NK_CallNode && k != NK_SuperNode && k != NK_ForwardingSuperNode) return 0;
+  int blk = nt_ref(nt, call, "block");
+  if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode) return 0;
+  if (k == NK_CallNode) {
+    const char *nm = nt_str(nt, call, "name");
+    if (!nm) return 0;
+    if (is_proc_literal(c, call)) return 0;
+    static const char *const later[] = { "at_exit", "trap", "define_method", "define_singleton_method",
+      "instance_eval", "instance_exec", "class_eval", "class_exec", "module_eval", "module_exec",
+      "define_finalizer", "fork", "spawn", "lazy", "to_enum", "enum_for", "set_trace_func", NULL };
+    for (int i = 0; later[i]; i++) if (sp_streq(nm, later[i])) return 0;
+    int recv = nt_ref(nt, call, "receiver");
+    if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode) {
+      const char *rn = nt_str(nt, recv, "name");
+      static const char *const makers[] = { "Thread", "Fiber", "Enumerator", "Hash", "Proc", "Class",
+        "Module", "Struct", "Data", "Ractor", "TracePoint", "Signal", "ObjectSpace", "Process", NULL };
+      for (int i = 0; rn && makers[i]; i++) if (sp_streq(rn, makers[i])) return 0;
+    }
+    /* `x.lazy.map { }` runs its block when the result is read */
+    for (int r = recv, d = 0; r >= 0 && d < 16 && nt_kind(nt, r) == NK_CallNode; r = nt_ref(nt, r, "receiver"), d++)
+      if (nt_str(nt, r, "name") && sp_streq(nt_str(nt, r, "name"), "lazy")) return 0;
+  }
+  if (typed && an_block_outlives_call(c, call)) return 0;
+  return 1;
+}
+/* the names the reads under n read */
+static void cfg_read_names(CfgB *g, int n, int depth, char *seen) {
+  if (n < 0 || depth > 200) return;
+  const NodeTable *nt = g->nt;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode) return;
+  if (k == NK_LocalVariableReadNode) {
+    int li = cfg_local_index(g, nt_str(nt, n, "name"));
+    if (li >= 0 && !seen[li]) { seen[li] = 1; cfg_emit_loc(g, EV_WRITE_UNK, n, li); }
+  }
+  for (int i = 0; i < nt_num_refs(nt, n); i++) cfg_read_names(g, nt_ref_at(nt, n, i), depth + 1, seen);
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int q = 0; q < an; q++) cfg_read_names(g, av[q], depth + 1, seen);
+  }
+}
+/* A closure that can run at any later time (a proc, a lambda, a thread's
+   body), in full mode: a region of its own, entered from where it is made,
+   where each local it reads starts as any value. So only a test inside it
+   narrows a read in it, and its writes (the closure marking leaves those
+   locals out) reach nothing after it. */
+static void cfg_lower_detached(CfgB *g, int n) {
+  const NodeTable *nt = g->nt;
+  int from = g->cur;
+  if (from < 0) return;
+  int entry = cfg_new_block(g), out = cfg_new_block(g);
+  cfg_add_edge(g, from, entry);
+  g->cur = entry;
+  int nl = g->s->nlocals;
+  char *seen = calloc((size_t)nl + 1, 1);
+  if (!seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  cfg_read_names(g, n, 0, seen);
+  free(seen);
+  int again = cfg_fall(g);
+  int sv_nlp = g->nlp, sv_nbg = g->nbg, sv_nen = g->nen, sv_prot = g->protect;
+  g->nbg = 0; g->nen = 0; g->protect = 0;
+  if (g->nlp < 64) { g->lp_head[g->nlp] = again; g->lp_body[g->nlp] = again; g->lp_exit[g->nlp] = out; g->lp_endepth[g->nlp] = 0; }
+  g->nlp++;
+  cfg_lower(g, nt_ref(nt, n, "parameters"));
+  cfg_lower(g, nt_ref(nt, n, "body"));
+  cfg_jump_to(g, out);
+  g->nlp = sv_nlp; g->nbg = sv_nbg; g->nen = sv_nen; g->protect = sv_prot;
+  g->cur = from;
+}
+/* A block on the graph: the call runs it any number of times, from a head
+   block. Each run binds the block's own locals afresh (its parameters, nil
+   for the rest), runs the defaults, then the body; `next` goes back to the
+   head, `break` leaves, `redo` runs the body again on the same values. */
+static void cfg_lower_block(CfgB *g, int blk) {
+  const NodeTable *nt = g->nt;
+  int head = cfg_new_block(g), bodyb = cfg_new_block(g), exitb = cfg_new_block(g);
+  cfg_jump_to(g, head);
+  cfg_add_edge(g, head, bodyb); cfg_add_edge(g, head, exitb);
+  g->cur = bodyb;
+  const char *ls = nt_str(nt, blk, "locals");
+  for (const char *p = ls; p && *p; ) {
+    const char *e = strchr(p, ',');
+    size_t l = e ? (size_t)(e - p) : strlen(p);
+    char nm[256];
+    if (l > 0 && l < sizeof nm) {
+      memcpy(nm, p, l); nm[l] = 0;
+      int li = cfg_local_index(g, nm);
+      if (li >= 0) cfg_emit_loc(g, EV_WRITE_UNK, blk, li);
+    }
+    if (!e) break;
+    p = e + 1;
+  }
+  cfg_lower(g, nt_ref(nt, blk, "parameters"));
+  int again = cfg_fall(g);
+  if (g->nlp < 64) { g->lp_head[g->nlp] = head; g->lp_body[g->nlp] = again; g->lp_exit[g->nlp] = exitb; g->lp_endepth[g->nlp] = g->nen; }
+  g->nlp++;
+  cfg_lower(g, nt_ref(nt, blk, "body"));
+  cfg_jump_to(g, head);
+  g->nlp--;
+  g->cur = exitb;
+}
 
 static void cfg_lower_list(CfgB *g, int stmts) {
   if (stmts < 0) return;
@@ -264,8 +570,13 @@ static void cfg_lower_loop(CfgB *g, int n, int post) {
   if (g->nlp < 64) { g->lp_head[g->nlp] = head; g->lp_body[g->nlp] = bodyb; g->lp_exit[g->nlp] = exitb; g->lp_endepth[g->nlp] = g->nen; }
   g->nlp++;
   g->cur = head;
-  cfg_lower(g, pred);
-  if (g->cur >= 0) { cfg_add_edge(g, g->cur, bodyb); cfg_add_edge(g, g->cur, exitb); }
+  if (g->full) {   /* `while x`, `until x.nil?`: a pi on each edge of the test */
+    if (nt_kind(nt, n) == NK_UntilNode) cfg_cond(g, pred, exitb, bodyb);
+    else cfg_cond(g, pred, bodyb, exitb);
+  } else {
+    cfg_lower(g, pred);
+    if (g->cur >= 0) { cfg_add_edge(g, g->cur, bodyb); cfg_add_edge(g, g->cur, exitb); }
+  }
   g->cur = bodyb;
   cfg_lower_list(g, body);
   cfg_jump_to(g, head);
@@ -370,7 +681,10 @@ static void cfg_lower(CfgB *g, int n) {
   case NK_ParenthesesNode: cfg_lower(g, nt_ref(nt, n, "body")); return;
   /* own scopes: not entered */
   case NK_DefNode: case NK_ClassNode: case NK_ModuleNode: case NK_SingletonClassNode:
-  case NK_BlockNode: case NK_LambdaNode: case NK_DefinedNode:
+  case NK_DefinedNode:
+    return;
+  case NK_BlockNode: case NK_LambdaNode:
+    if (g->full) cfg_lower_detached(g, n);
     return;
   case NK_LocalVariableReadNode:
     if (cfg_owned(g, n)) cfg_emit(g, EV_READ, n);
@@ -389,6 +703,24 @@ static void cfg_lower(CfgB *g, int n) {
     return;
   case NK_LocalVariableOrWriteNode: case NK_LocalVariableAndWriteNode: {
     /* `x ||= v`: v and the write run only on one side of the test */
+    if (g->full && cfg_owned(g, n)) {
+      /* the test is x's truthiness: x keeps its value on one edge, which
+         the pi narrows; the other stores v */
+      cfg_emit(g, EV_READ, n);
+      int li = cfg_local_index(g, nt_str(nt, n, "name"));
+      int from = g->cur;
+      int join = cfg_new_block(g), asg = cfg_new_block(g);
+      int pt = cfg_new_pi(g, n, PI_TRUTHY, 0, -1, 0, NULL), pf = cfg_new_pi(g, n, PI_FALSY, 0, -1, 0, NULL);
+      int orw = k == NK_LocalVariableOrWriteNode;
+      cfg_edge_pi(g, from, orw ? join : asg, li, pt);
+      cfg_edge_pi(g, from, orw ? asg : join, li, pf);
+      g->cur = asg;
+      cfg_lower(g, nt_ref(nt, n, "value"));
+      cfg_emit(g, EV_WRITE, n);
+      cfg_jump_to(g, join);
+      g->cur = join;
+      return;
+    }
     if (cfg_owned(g, n)) cfg_emit(g, EV_READ, n);
     int before = g->cur;
     int join = cfg_new_block(g);
@@ -455,6 +787,21 @@ static void cfg_lower(CfgB *g, int n) {
   }
   case NK_IfNode: case NK_UnlessNode: {
     int pred = nt_ref(nt, n, "predicate");
+    if (g->full && pred >= 0 && nt_kind(nt, nt_paren_single(nt, pred)) != NK_MatchPredicateNode) {
+      /* the condition as jumps, with a pi on each edge out of a test */
+      int then = nt_ref(nt, n, "statements");
+      int els = nt_ref(nt, n, k == NK_IfNode ? "subsequent" : "else_clause");
+      int join = cfg_new_block(g), pos = cfg_new_block(g), neg = cfg_new_block(g);
+      cfg_cond(g, pred, pos, neg);
+      g->cur = pos;
+      if (k == NK_IfNode) cfg_lower_list(g, then); else if (els >= 0) cfg_lower(g, els);
+      cfg_jump_to(g, join);
+      g->cur = neg;
+      if (k == NK_IfNode) { if (els >= 0) cfg_lower(g, els); } else cfg_lower_list(g, then);
+      cfg_jump_to(g, join);
+      g->cur = join;
+      return;
+    }
     cfg_lower(g, pred);
     int binds = -1;
     if (pred >= 0 && nt_kind(nt, pred) == NK_MatchPredicateNode) binds = nt_ref(nt, pred, "pattern");
@@ -466,6 +813,16 @@ static void cfg_lower(CfgB *g, int n) {
   }
   case NK_ElseNode: cfg_lower_list(g, nt_ref(nt, n, "statements")); return;
   case NK_AndNode: case NK_OrNode: {
+    if (g->full) {   /* `x.is_a?(K) && x.m`: the right side runs on one edge of the left's test */
+      int side = cfg_new_block(g), join = cfg_new_block(g);
+      if (k == NK_AndNode) cfg_cond(g, nt_ref(nt, n, "left"), side, join);
+      else cfg_cond(g, nt_ref(nt, n, "left"), join, side);
+      g->cur = side;
+      cfg_lower(g, nt_ref(nt, n, "right"));
+      cfg_jump_to(g, join);
+      g->cur = join;
+      return;
+    }
     cfg_lower(g, nt_ref(nt, n, "left"));
     int before = g->cur;
     int join = cfg_new_block(g);
@@ -477,6 +834,63 @@ static void cfg_lower(CfgB *g, int n) {
     return;
   }
   case NK_CaseNode: case NK_CaseMatchNode: {
+    if (g->full && k == NK_CaseNode) {
+      /* `case v; when String`: each condition is `String === v`, a class
+         test of v, so its two edges take pis. No subject: each condition
+         is a test of its own. */
+      int subj = nt_ref(nt, n, "predicate");
+      cfg_lower(g, subj);
+      int sp = subj >= 0 ? nt_paren_single(nt, subj) : -1;
+      int sl = -1;
+      int wn = 0; const int *w = nt_arr(nt, n, "conditions", &wn);
+      if (sp >= 0 && nt_kind(nt, sp) == NK_LocalVariableReadNode && cfg_owned(g, sp)) {
+        const char *snm = nt_str(nt, sp, "name");
+        sl = cfg_local_index(g, snm);
+        /* (a condition that writes the subject tests the old value) */
+        for (int i = 0; i < wn && sl >= 0; i++) {
+          int cn = 0; const int *cv = nt_arr(nt, w[i], "conditions", &cn);
+          for (int q = 0; q < cn; q++) if (cfg_subtree_writes(nt, cv[q], snm)) { sl = -1; break; }
+        }
+      }
+      int join = cfg_new_block(g);
+      int test = cfg_fall(g);
+      for (int i = 0; i < wn; i++) {
+        int next = cfg_new_block(g), arm = cfg_new_block(g);
+        g->cur = test;
+        int cn = 0; const int *cv = nt_arr(nt, w[i], "conditions", &cn);
+        for (int q = 0; q < cn; q++) {
+          int nx = q + 1 < cn ? cfg_new_block(g) : next;
+          if (subj < 0) cfg_cond(g, cv[q], arm, nx);
+          else {
+            cfg_lower(g, cv[q]);
+            int pt = -1, pf = -1;
+            if (sl >= 0) {
+              NodeKind ck = nt_kind(nt, cv[q]);
+              if (ck == NK_ConstantReadNode) cfg_class_pis(g, cv[q], cv[q], 0, &pt, &pf);
+              else if (ck == NK_NilNode) {
+                pt = cfg_new_pi(g, cv[q], PI_NIL, 0, -1, 0, NULL);
+                pf = cfg_new_pi(g, cv[q], PI_NOTNIL, 0, -1, 0, NULL);
+              }
+            }
+            int from = g->cur;
+            cfg_edge_pi(g, from, arm, sl, pt);
+            cfg_edge_pi(g, from, nx, sl, pf);
+          }
+          g->cur = nx;
+        }
+        if (cn == 0) cfg_jump_to(g, next);
+        g->cur = arm;
+        cfg_lower_list(g, nt_ref(nt, w[i], "statements"));
+        cfg_jump_to(g, join);
+        test = next;
+      }
+      g->cur = test;
+      int els = nt_ref(nt, n, "else_clause");
+      if (els >= 0) cfg_lower(g, els);
+      cfg_jump_to(g, join);
+      g->cur = join;
+      return;
+    }
     cfg_lower(g, nt_ref(nt, n, "predicate"));
     int join = cfg_new_block(g);
     int test = cfg_fall(g);                         /* the first arm's test */
@@ -594,17 +1008,31 @@ static void cfg_lower(CfgB *g, int n) {
     if (nt_safe_nav(nt, n)) { before = g->cur; join = cfg_new_block(g); cfg_fall(g); }
     cfg_lower(g, nt_ref(nt, n, "arguments"));
     { int blk = nt_ref(nt, n, "block");
-      if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk); }
+      if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk);
+      else if (blk >= 0 && g->blocks && cfg_block_on_graph(g->c, n, g->full)) cfg_lower_block(g, blk);
+      else if (blk >= 0 && g->full) cfg_lower_detached(g, blk); }
     if (join >= 0) {
       cfg_jump_to(g, join);
       if (before >= 0) cfg_add_edge(g, before, join);
       g->cur = join;
     }
-    /* the block is its own scope; a bare raise/exit that reaches Kernel's
-       never returns (a method of the program with the name does) */
+    /* the block is its own scope (or, on the graph, runs inside the call);
+       a bare raise/exit that reaches Kernel's never returns (a method of
+       the program with the name does) */
     if (!g->ssa && an_call_diverges(g->c, n)) cfg_jump_out(g, g->exit_blk, 0);
     return;
   }
+  case NK_SuperNode: case NK_ForwardingSuperNode:
+    if (g->blocks) {   /* `super(x) { ... }`: the block runs inside the call */
+      cfg_lower(g, nt_ref(nt, n, "arguments"));
+      int blk = nt_ref(nt, n, "block");
+      if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk);
+      else if (blk >= 0 && cfg_block_on_graph(g->c, n, g->full)) cfg_lower_block(g, blk);
+      else if (blk >= 0 && g->full) cfg_lower_detached(g, blk);
+      return;
+    }
+    cfg_lower_children(g, n);
+    return;
   default:
     cfg_lower_children(g, n);
     return;
@@ -903,9 +1331,31 @@ static void cfg_mark_captured(CfgB *g, int n, int in_closure, int depth) {
   NodeKind k = nt_kind(nt, n);
   if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode) return;
   if (k == NK_BlockNode || k == NK_LambdaNode) in_closure = 1;
-  if (in_closure && comp_is_local_write(k)) {
+  /* (full mode: a write the graph has no event for, as it is not this
+     scope's, keeps no fact either) */
+  if ((in_closure || (g->full && !cfg_owned(g, n))) && comp_is_local_write(k)) {
     int li = cfg_local_index(g, nt_str(nt, n, "name"));
     if (li >= 0) g->captured[li] = 1;
+  }
+  /* a block on the graph is no closure: its writes are events there */
+  if (g->blocks && !in_closure && (k == NK_CallNode || k == NK_SuperNode || k == NK_ForwardingSuperNode)) {
+    int blk = nt_ref(nt, n, "block");
+    if (blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && cfg_block_on_graph(g->c, n, g->full)) {
+      for (int i = 0; i < nt_num_refs(nt, n); i++) {
+        int ch = nt_ref_at(nt, n, i);
+        if (ch != blk) { cfg_mark_captured(g, ch, 0, depth + 1); continue; }
+        for (int j = 0; j < nt_num_refs(nt, blk); j++) cfg_mark_captured(g, nt_ref_at(nt, blk, j), 0, depth + 2);
+        for (int j = 0; j < nt_num_arrs(nt, blk); j++) {
+          int an = 0; const int *av = nt_arr_at(nt, blk, j, &an);
+          for (int q = 0; q < an; q++) cfg_mark_captured(g, av[q], 0, depth + 2);
+        }
+      }
+      for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+        int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+        for (int q = 0; q < an; q++) cfg_mark_captured(g, av[q], 0, depth + 1);
+      }
+      return;
+    }
   }
   for (int i = 0; i < nt_num_refs(nt, n); i++) cfg_mark_captured(g, nt_ref_at(nt, n, i), in_closure, depth + 1);
   for (int i = 0; i < nt_num_arrs(nt, n); i++) {
@@ -1092,8 +1542,20 @@ static int cfg_statement_writes(Compiler *c, const int *par, int r, const char *
   }
   return cfg_subtree_writes(c->nt, n, nm);
 }
-int cfg_narrow_reads(Compiler *c) {
-  if (cfg_disabled()) return 0;
+/* the reads the last full graph gave each pass, kept for SP_IR_DUMP */
+static int ir_off(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("SP_IR_OFF") != NULL || cfg_disabled();
+  return v;
+}
+static int ir_log(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("SP_IR_LOG") != NULL;
+  return v;
+}
+
+/* the classic pass: the facts of the graph without pis (SP_IR_OFF) */
+static int cfg_narrow_reads_classic(Compiler *c) {
   cfg_facts_build(c, 1);
   st_narrowed = 0;
   int *par = an_parent_map(c->nt);
@@ -1114,6 +1576,321 @@ int cfg_narrow_reads(Compiler *c) {
   }
   free(par);
   if (cfg_log()) fprintf(stderr, "spinel-cfg: narrowed=%d\n", st_narrowed);
+  return st_narrowed;
+}
+
+/* ---- type narrowing on the IR -----------------------------------------
+
+   One rule for every read of a local: the kinds of value the read can see
+   (KN_*), worked out over the phis and the pis. When they are one class,
+   the read unboxes to it (c->nilnarrow, codegen's read-site unbox). Two
+   passes use the rule:
+   - after the type fixpoint (ir_narrow_type_tests), from the pis alone:
+     every write and the entry count as any value, so only the program's
+     own tests prove a class. This is what the is_a? guard walk proved, on
+     every shape a test can take (case/when, &&, ||, !, unless, elsif, a
+     guard clause anywhere, a loop condition, a block's own tests);
+   - near the end (cfg_narrow_reads), from the writes too: a write's kinds
+     come from its value's type, so a read whose every write stored a
+     plain Integer or Float unboxes to it. */
+
+typedef struct { unsigned short k; int cid; } Kd;   /* cid: the one class of KN_OBJ, -2 for several */
+
+static Kd kd_meet(Kd a, Kd b) {
+  Kd r; r.k = a.k | b.k;
+  if ((a.k & KN_OBJ) && (b.k & KN_OBJ)) r.cid = a.cid == b.cid ? a.cid : -2;
+  else if (a.k & KN_OBJ) r.cid = a.cid;
+  else if (b.k & KN_OBJ) r.cid = b.cid;
+  else r.cid = -1;
+  return r;
+}
+static Kd kd_refine(Kd a, const CfgPi *p) {
+  Kd r = a;
+  switch (p->op) {
+  case PI_ISA: {
+    unsigned short m = p->mask | (p->loose ? KN_OBJ : 0);
+    r.k = a.k & m;
+    if (r.k & KN_OBJ) r.cid = p->cid >= 0 && !p->loose ? p->cid : (p->cid >= 0 ? -2 : a.cid);
+    break;
+  }
+  case PI_NOTISA:
+    if (p->mask == KN_OBJ) {   /* a user class: only an object known to be of it leaves */
+      if (p->cid >= 0 && !p->loose && a.cid == p->cid) r.k = a.k & ~KN_OBJ;
+    } else r.k = a.k & ~p->mask;
+    break;
+  case PI_NIL: r.k = a.k & KN_NIL; break;
+  case PI_NOTNIL: r.k = a.k & ~KN_NIL; break;
+  case PI_TRUTHY: r.k = a.k & ~(KN_NIL | KN_FALSE); break;
+  case PI_FALSY: r.k = a.k & (KN_NIL | KN_FALSE); break;
+  }
+  if (!(r.k & KN_OBJ)) r.cid = -1;
+  return r;
+}
+/* what a write stores, from its value's type (the late pass) */
+static Kd ir_def_kinds(CfgB *g, int evk, int node) {
+  Kd all = { KN_ALL, -2 };
+  if (evk != EV_WRITE && evk != EV_OPWRITE) return all;
+  Compiler *c = g->c;
+  int v = evk == EV_WRITE ? nt_ref(g->nt, node, "value") : node;
+  if (v < 0) return all;
+  TyKind t = infer_type(c, v);
+  Kd r = { 0, -1 };
+  if (t == TY_INT) r.k = cfg_narrowable(c, v, t) ? KN_INT : (KN_INT | KN_BIG | KN_NIL);
+  else if (t == TY_FLOAT) r.k = cfg_narrowable(c, v, t) ? KN_FLOAT : (KN_FLOAT | KN_NIL);
+  else if (t == TY_NIL) r.k = KN_NIL;
+  else return all;
+  return r;
+}
+/* The kinds of every value of the IR: entries and writes as given, then
+   pis and phis to a fixpoint. `late`: the writes' own kinds, else any. */
+static Kd *ir_solve_kinds(CfgB *g, Ir *ir, int late) {
+  int nv = ir->nv;
+  Kd *K = malloc(sizeof(Kd) * ((size_t)nv + 1));
+  if (!K) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  Kd all = { KN_ALL, -2 }, nil = { KN_NIL, -1 }, none = { 0, -1 };
+  for (int x = 0; x < nv; x++) {
+    IrVal *v = &ir->v[x];
+    if (v->kind == IV_ENTRY) K[x] = late && !g->s->locals[v->local].is_param ? nil : all;
+    else if (v->kind == IV_DEF) K[x] = late ? ir_def_kinds(g, v->evk, v->node) : all;
+    else K[x] = none;
+  }
+  for (int changed = 1, round = 0; changed && round < 1000; round++) {
+    changed = 0;
+    for (int x = 0; x < nv; x++) {
+      IrVal *v = &ir->v[x];
+      Kd r;
+      if (v->kind == IV_PI) {
+        if (v->src < 0) continue;
+        r = kd_refine(K[v->src], &g->pis[v->evk]);
+      } else if (v->kind == IV_PHI && v->repl < 0) {
+        r = none;
+        for (int q = 0; q < v->nop; q++) { int o = ir->ops[v->op0 + q]; if (o >= 0) r = kd_meet(r, K[o]); }
+      } else continue;
+      if (r.k != K[x].k || r.cid != K[x].cid) { K[x] = r; changed = 1; }
+    }
+  }
+  return K;
+}
+/* the full graph of scope s and its IR; 0 when it has none */
+static int ir_scope_build(Compiler *c, Scope *s, CfgB *g, Ir *ir, int late) {
+  memset(g, 0, sizeof *g); memset(ir, 0, sizeof *ir);
+  if (s->body < 0 || s->cs_synth || s->nlocals <= 0) return 0;
+  g->c = c; g->nt = c->nt; g->s = s; g->si = s->idx; g->want_types = late;
+  g->full = 1; g->blocks = 1;
+  g->captured = calloc((size_t)s->nlocals + 1, 1);
+  if (!g->captured) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i < s->nlocals; i++)
+    if (s->locals[i].proc_rebinds || (late && s->locals[i].is_cell)) g->captured[i] = 1;
+  cfg_mark_captured(g, s->body, 0, 0);
+  g->cur = cfg_new_block(g);
+  g->exit_blk = cfg_new_block(g);
+  cfg_lower(g, s->body);
+  cfg_jump_to(g, g->exit_blk);
+  return ir_build(g, s->nlocals, ir);
+}
+static void ir_scope_free(CfgB *g, Ir *ir) {
+  for (int i = 0; i < g->nb; i++) {
+    CBlock *bl = &g->b[i];
+    free(bl->ev_kind); free(bl->ev_node); free(bl->succ); free(bl->ev_val); free(bl->ev_loc); free(bl->ev_aux);
+  }
+  free(g->b); free(g->captured); free(g->pis);
+  ir_free(ir);
+}
+/* the class a read's kinds prove, by name, or NULL */
+static const char *kd_class(Compiler *c, Kd k) {
+  if (k.k == KN_STR) return "String";
+  if (k.k == KN_SYM) return "Symbol";
+  if (k.k == KN_FLOAT) return "Float";
+  if (k.k && !(k.k & ~(KN_INT | KN_BIG))) return "Integer";
+  if (k.k == KN_ARR) return "Array";
+  if (k.k == KN_OBJ && k.cid >= 0 && k.cid < c->nclasses) return c->classes[k.cid].name;
+  return NULL;
+}
+static void kd_print(Compiler *c, Kd k, FILE *f) {
+  static const char *const nm[] = { "nil", "true", "false", "Integer", "Bignum", "Float", "String",
+    "Symbol", "Array", "Hash", "Object", "other" };
+  if (k.k == KN_ALL) { fprintf(f, "any"); return; }
+  if (!k.k) { fprintf(f, "none"); return; }
+  int any = 0;
+  for (int b = 0; b < 12; b++) if (k.k & (1 << b)) {
+    if (b == 10 && k.cid >= 0 && k.cid < c->nclasses) fprintf(f, "%s%s", any ? "|" : "", c->classes[k.cid].name);
+    else fprintf(f, "%s%s", any ? "|" : "", nm[b]);
+    any = 1;
+  }
+}
+static const char *pi_op_name(int op) {
+  switch (op) {
+  case PI_ISA: return "is"; case PI_NOTISA: return "is not"; case PI_NIL: return "is nil";
+  case PI_NOTNIL: return "is not nil"; case PI_TRUTHY: return "truthy"; case PI_FALSY: return "falsy";
+  }
+  return "?";
+}
+/* SP_IR_DUMP=name prints the IR of each method of that name, in the shape
+   ZJIT's HIR dump has: blocks, their phis, and one line per value */
+static void ir_dump(Compiler *c, Scope *s, CfgB *g, Ir *ir, Kd *K, const char *pass) {
+  const char *want = getenv("SP_IR_DUMP");
+  if (!want || !s->name || !sp_streq(want, s->name)) return;
+  FILE *f = stderr;
+  fprintf(f, "fn %s (%s pass):\n", s->name, pass);
+  int *order = malloc(sizeof(int) * ((size_t)g->nb + 1)), no = 0;
+  if (!order) return;
+  for (int b = 0; b < g->nb; b++) if (ir->reached[b]) order[no++] = b;
+  for (int i = 1; i < no; i++) for (int j = i; j > 0 && ir->rpo_pos[order[j]] < ir->rpo_pos[order[j - 1]]; j--) {
+    int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+  }
+  for (int i = 0; i < no; i++) {
+    int b = order[i];
+    CBlock *bl = &g->b[b];
+    int nphi = 0;
+    for (int x = 0; x < ir->nv; x++) if (ir->v[x].kind == IV_PHI && ir->v[x].block == b && ir->v[x].repl < 0 && ir->v[x].live) nphi++;
+    if (!bl->nev && !nphi && b != 0) continue;
+    fprintf(f, "bb%d:", b);
+    int np = ir->pred_off[b + 1] - ir->pred_off[b];
+    if (np) { fprintf(f, "  (from"); for (int q = 0; q < np; q++) fprintf(f, " bb%d", ir->preds[ir->pred_off[b] + q]); fprintf(f, ")"); }
+    fprintf(f, "\n");
+    if (b == 0)
+      for (int x = 0; x < ir->nv; x++) if (ir->v[x].kind == IV_ENTRY && ir->v[x].live) {
+        fprintf(f, "  v%d = Entry %s : ", x, s->locals[ir->v[x].local].name); kd_print(c, K[x], f); fprintf(f, "\n");
+      }
+    for (int x = 0; x < ir->nv; x++) {
+      IrVal *v = &ir->v[x];
+      if (v->kind != IV_PHI || v->block != b || v->repl >= 0 || !v->live) continue;
+      fprintf(f, "  v%d = Phi %s", x, s->locals[v->local].name);
+      for (int q = 0; q < v->nop; q++) fprintf(f, "%s v%d", q ? "," : "", ir->ops[v->op0 + q]);
+      fprintf(f, " : "); kd_print(c, K[x], f); fprintf(f, "\n");
+    }
+    for (int e = 0; e < bl->nev; e++) {
+      int li = bl->ev_loc[e], x = bl->ev_val[e], node = bl->ev_node[e];
+      if (li < 0 || x < 0) continue;
+      int line = node >= 0 ? (int)nt_int(c->nt, node, "node_line", 0) : 0;
+      if (bl->ev_kind[e] == EV_READ) {
+        fprintf(f, "  Read %s = v%d : ", s->locals[li].name, x); kd_print(c, K[x], f);
+        if (node >= 0 && c->nilnarrow[node] != TY_UNKNOWN) fprintf(f, "  -> unboxed as %s", ty_name(c->nilnarrow[node]));
+        fprintf(f, "   (line %d)\n", line);
+      } else if (bl->ev_kind[e] == EV_PI) {
+        const CfgPi *p = &g->pis[bl->ev_aux[e]];
+        fprintf(f, "  v%d = Pi v%d, %s %s %s : ", x, ir->v[x].src, s->locals[li].name, pi_op_name(p->op), p->cls ? p->cls : "");
+        kd_print(c, K[x], f); fprintf(f, "   (line %d)\n", line);
+      } else {
+        fprintf(f, "  v%d = Write %s : ", x, s->locals[li].name); kd_print(c, K[x], f); fprintf(f, "   (line %d)\n", line);
+      }
+    }
+    int ns = bl->nsucc;
+    if (ns) { fprintf(f, "  -> "); for (int q = 0; q < ns; q++) fprintf(f, "%sbb%d", q ? ", " : "", bl->succ[q]); fprintf(f, "\n"); }
+  }
+  free(order);
+}
+
+/* (analyze.c) the is_a? guard walk's class rule and its Array rule */
+TyKind isa_narrow_type(Compiler *c, const char *cn, const Scope *s);
+int isa_array_read_only(const char *nm);
+
+static int st_ir_scopes, st_ir_reads, st_ir_narrowed, st_ir_pis;
+
+/* the reads of scope s whose kinds prove a class the tree's guard walk
+   would unbox to: the early pass */
+static void ir_narrow_scope_early(Compiler *c, Scope *s, CfgB *g, Ir *ir, const int *par) {
+  Kd *K = ir_solve_kinds(g, ir, 0);
+  st_ir_pis += g->npis;
+  for (int b = 0; b < g->nb; b++) {
+    if (!ir->reached[b]) continue;
+    CBlock *bl = &g->b[b];
+    for (int e = 0; e < bl->nev; e++) {
+      if (bl->ev_kind[e] != EV_READ) continue;
+      int li = bl->ev_loc[e], r = bl->ev_node[e], x = bl->ev_val[e];
+      if (li < 0 || x < 0 || r < 0 || r >= c->nt->count || g->captured[li]) continue;
+      if (nt_kind(c->nt, r) != NK_LocalVariableReadNode) continue;
+      st_ir_reads++;
+      const char *cn = kd_class(c, K[x]);
+      if (!cn) continue;
+      LocalVar *lv = &s->locals[li];
+      if (lv->type != TY_POLY) continue;
+      TyKind t = isa_narrow_type(c, cn, s);
+      if (t == TY_UNKNOWN) continue;
+      int p = par ? par[r] : -1;
+      if (t == TY_POLY_ARRAY) {
+        /* a copy: only as the receiver of a method that reads it */
+        if (p < 0 || nt_kind(c->nt, p) != NK_CallNode || nt_ref(c->nt, p, "receiver") != r ||
+            !isa_array_read_only(nt_str(c->nt, p, "name"))) continue;
+      } else if (p >= 0 && (nt_kind(c->nt, p) == NK_ArrayNode || nt_kind(c->nt, p) == NK_HashNode)) continue;
+      if (cfg_statement_writes(c, par, r, lv->name)) continue;
+      if (c->nilnarrow[r] != t) { comp_set_nilnarrow(c, r, t); st_ir_narrowed++; }
+    }
+  }
+  ir_dump(c, s, g, ir, K, "early");
+  free(K);
+}
+
+/* The early pass: in place of the is_a? guard walk, for every method and
+   the top level. Answers the scopes it did (the walk does the rest), or
+   NULL when it is off. */
+char *ir_narrow_type_tests(Compiler *c) {
+  if (ir_off()) return NULL;
+  char *done = calloc((size_t)c->nscopes + 1, 1);
+  if (!done) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  int *par = an_parent_map(c->nt);
+  st_ir_scopes = st_ir_reads = st_ir_narrowed = st_ir_pis = 0;
+  for (int si = 0; si < c->nscopes; si++) {
+    Scope *s = &c->scopes[si];
+    if (si != 0 && (s->def_node < 0 || nt_kind(c->nt, s->def_node) != NK_DefNode)) continue;
+    if (s->body < 0 || s->cs_synth) continue;
+    CfgB g; Ir ir;
+    if (s->nlocals <= 0) { done[si] = 1; continue; }
+    if (!ir_scope_build(c, s, &g, &ir, 0)) { ir_scope_free(&g, &ir); continue; }
+    ir_narrow_scope_early(c, s, &g, &ir, par);
+    ir_scope_free(&g, &ir);
+    done[si] = 1;
+    st_ir_scopes++;
+  }
+  free(par);
+  if (ir_log()) fprintf(stderr, "spinel-ir: early: scopes=%d pis=%d reads=%d narrowed=%d\n",
+                        st_ir_scopes, st_ir_pis, st_ir_reads, st_ir_narrowed);
+  return done;
+}
+
+/* The late pass: a read of a poly local whose every write that reaches it
+   stored one plain Integer or Float (or nil, where a test took the nil
+   out) unboxes to it. */
+int cfg_narrow_reads(Compiler *c) {
+  if (cfg_disabled()) return 0;
+  if (ir_off()) return cfg_narrow_reads_classic(c);
+  st_narrowed = 0;
+  int *par = an_parent_map(c->nt);
+  for (int si = 0; si < c->nscopes; si++) {
+    Scope *s = &c->scopes[si];
+    if (si != 0 && (s->def_node < 0 || nt_kind(c->nt, s->def_node) != NK_DefNode)) continue;
+    CfgB g; Ir ir;
+    if (!ir_scope_build(c, s, &g, &ir, 1)) { ir_scope_free(&g, &ir); continue; }
+    Kd *K = ir_solve_kinds(&g, &ir, 1);
+    for (int b = 0; b < g.nb; b++) {
+      if (!ir.reached[b]) continue;
+      CBlock *bl = &g.b[b];
+      for (int e = 0; e < bl->nev; e++) {
+        if (bl->ev_kind[e] != EV_READ) continue;
+        int li = bl->ev_loc[e], r = bl->ev_node[e], x = bl->ev_val[e];
+        if (li < 0 || x < 0 || r < 0 || r >= c->nt->count || g.captured[li]) continue;
+        if (nt_kind(c->nt, r) != NK_LocalVariableReadNode) continue;
+        TyKind t = K[x].k == KN_INT ? TY_INT : K[x].k == KN_FLOAT ? TY_FLOAT : TY_UNKNOWN;
+        if (t == TY_UNKNOWN) continue;
+        LocalVar *lv = &s->locals[li];
+        if (lv->type != TY_POLY || lv->is_cell || lv->proc_rebinds) continue;
+        if (c->nilnarrow[r] != TY_UNKNOWN) continue;
+        if (direct_literal_elem(c, par, r)) continue;
+        /* the prelude's methods convert their arguments through #to_int and
+           friends at sites the reachability pass finds by their boxed reads:
+           their reads stay boxed */
+        if (nt_int(c->nt, r, "node_bi", 0) != 0) continue;
+        if (cfg_statement_writes(c, par, r, lv->name)) continue;
+        comp_set_nilnarrow(c, r, t);
+        st_narrowed++;
+      }
+    }
+    ir_dump(c, s, &g, &ir, K, "late");
+    free(K);
+    ir_scope_free(&g, &ir);
+  }
+  free(par);
+  if (cfg_log() || ir_log()) fprintf(stderr, "spinel-ir: late: narrowed=%d\n", st_narrowed);
   return st_narrowed;
 }
 
@@ -1291,13 +2068,39 @@ static void ssa_target_reads(const NodeTable *nt, SsaNames *t, int n, int v, int
 }
 /* every local node of the body (not a nested def or class); `opaque` is a
    subtree whose uses the graph does not model */
+static int ssa_blocks_off(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("SP_NO_SSA_BLOCKS") != NULL || ir_off();
+  return v;
+}
+static void ssa_collect_in(Compiler *c, Scope *s, int n, SsaNames *t, int in_closure, int opaque, int depth, int blk_on);
 static void ssa_collect(Compiler *c, Scope *s, int n, SsaNames *t, int in_closure, int opaque, int depth) {
+  ssa_collect_in(c, s, n, t, in_closure, opaque, depth, 0);
+}
+/* blk_on: n is a block the graph runs inside its call. Its own locals
+   (the parameters, and a local first written in it) keep one slot. */
+static void ssa_collect_in(Compiler *c, Scope *s, int n, SsaNames *t, int in_closure, int opaque, int depth, int blk_on) {
   if (n < 0) return;
   if (depth > 2000) { t->method_bad = 1; return; }
   const NodeTable *nt = c->nt;
   NodeKind k = nt_kind(nt, n);
   if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode) return;
-  if (k == NK_BlockNode || k == NK_LambdaNode) in_closure = 1;
+  if ((k == NK_BlockNode && !blk_on) || k == NK_LambdaNode) in_closure = 1;
+  if (k == NK_BlockNode && blk_on) {
+    const char *ls = nt_str(nt, n, "locals");
+    for (const char *p = ls; p && *p; ) {
+      const char *e = strchr(p, ',');
+      size_t l = e ? (size_t)(e - p) : strlen(p);
+      char nm[256];
+      if (l > 0 && l < sizeof nm) { memcpy(nm, p, l); nm[l] = 0; int ix = ssa_name_add(t, nm); t->bad[ix] = 1; }
+      if (!e) break;
+      p = e + 1;
+    }
+  }
+  int gblk = -1;
+  if (!in_closure && !ssa_blocks_off() && (k == NK_CallNode || k == NK_SuperNode || k == NK_ForwardingSuperNode) &&
+      cfg_block_on_graph(c, n, 0))
+    gblk = nt_ref(nt, n, "block");
   if (k == NK_DefinedNode || k == NK_MatchWriteNode) opaque = 1;
   if (k == NK_ForwardingSuperNode) t->method_bad = 1;   /* passes the parameters by name */
   if (k == NK_CallNode && ssa_frame_name(nt_str(nt, n, "name"))) t->method_bad = 1;
@@ -1328,11 +2131,11 @@ static void ssa_collect(Compiler *c, Scope *s, int n, SsaNames *t, int in_closur
             ? nt_ref(nt, n, "pattern") : -1;
   for (int i = 0; i < nt_num_refs(nt, n); i++) {
     int ch = nt_ref_at(nt, n, i);
-    ssa_collect(c, s, ch, t, in_closure, opaque || (ch >= 0 && ch == pat), depth + 1);
+    ssa_collect_in(c, s, ch, t, in_closure, opaque || (ch >= 0 && ch == pat), depth + 1, ch >= 0 && ch == gblk);
   }
   for (int i = 0; i < nt_num_arrs(nt, n); i++) {
     int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
-    for (int q = 0; q < an; q++) ssa_collect(c, s, av[q], t, in_closure, opaque, depth + 1);
+    for (int q = 0; q < an; q++) ssa_collect_in(c, s, av[q], t, in_closure, opaque, depth + 1, 0);
   }
 }
 
@@ -1399,6 +2202,7 @@ static void ssa_method(Compiler *c, Scope *s) {
      either way the web it is in keeps the name */
   CfgB g; memset(&g, 0, sizeof g);
   g.c = c; g.nt = nt; g.s = s; g.si = s->idx; g.ssa = 1;
+  g.blocks = !ssa_blocks_off();
   g.sn = t.nm; g.nsn = t.n;
   g.cur = cfg_new_block(&g);
   g.exit_blk = cfg_new_block(&g);
@@ -1592,7 +2396,7 @@ static void ssa_method(Compiler *c, Scope *s) {
         for (int e = 0; e < bl->nev; e++) {
           int node = bl->ev_node[e];
           int li = bl->ev_loc[e];
-          if (li < 0 || t.bad[li] || bl->ev_kind[e] == EV_PI) continue;
+          if (li < 0 || t.bad[li] || bl->ev_kind[e] == EV_PI || !ssa_local_node(nt_kind(nt, node))) continue;
           int dd = bl->ev_val[e];
           if (dd < 0) continue;
           char *nmn = web_name[ssa_find(uf, dd)];
@@ -1667,8 +2471,52 @@ static int ssa_plain(TyKind t) {
   return t == TY_NIL || t == TY_INT || t == TY_BIGINT || t == TY_FLOAT || t == TY_STRING ||
          t == TY_STRBUF || t == TY_SYMBOL || t == TY_BOOL;
 }
+/* the nodes inside a block that can run after its call returns */
+static void ssa_mark_tree(const NodeTable *nt, int n, char *m, int depth) {
+  if (n < 0 || depth > 2000 || m[n]) return;
+  m[n] = 1;
+  for (int i = 0; i < nt_num_refs(nt, n); i++) ssa_mark_tree(nt, nt_ref_at(nt, n, i), m, depth + 1);
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int q = 0; q < an; q++) ssa_mark_tree(nt, av[q], m, depth + 1);
+  }
+}
+static char *ssa_later_nodes(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  char *m = calloc((size_t)nt->count + 1, 1);
+  if (!m) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  static const NodeKind kinds[3] = { NK_CallNode, NK_SuperNode, NK_ForwardingSuperNode };
+  for (int q = 0; q < 3; q++)
+    NT_FOREACH_KIND(nt, kinds[q], id) {
+      int blk = nt_ref(nt, id, "block");
+      if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode || m[blk]) continue;
+      if (an_block_outlives_call(c, id)) ssa_mark_tree(nt, blk, m, 0);
+    }
+  return m;
+}
 void ssa_check_splits(Compiler *c) {
   if (g_nssa_splits == 0) return;
+  /* a split read or written inside a block that can run after its call
+     (the graph ran it inside the call), or of a slot a proc shares */
+  char *later_bad = calloc((size_t)g_nssa_splits + 1, 1);
+  if (!later_bad) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  if (!ssa_blocks_off()) {
+    char *later = ssa_later_nodes(c);
+    static const NodeKind lk[6] = { NK_LocalVariableReadNode, NK_LocalVariableWriteNode, NK_LocalVariableTargetNode,
+      NK_LocalVariableOperatorWriteNode, NK_LocalVariableOrWriteNode, NK_LocalVariableAndWriteNode };
+    for (int q = 0; q < 6; q++)
+      NT_FOREACH_KIND(c->nt, lk[q], id) {
+        if (!later[id]) continue;
+        const char *nm = nt_str(c->nt, id, "name");
+        if (!nm) continue;
+        for (int i = 0; i < g_nssa_splits; i++) {
+          SsaSplit *sp = &g_ssa_splits[i];
+          if (later_bad[i] || c->nscope[id] != sp->scope) continue;
+          for (int z = 0; z < sp->nnames; z++) if (sp_streq(sp->names[z], nm)) { later_bad[i] = 1; break; }
+        }
+      }
+    free(later);
+  }
   size_t cap = 256, len = 0;
   char *veto = malloc(cap);
   if (!veto) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
@@ -1686,16 +2534,19 @@ void ssa_check_splits(Compiler *c) {
     SsaSplit *sp = &g_ssa_splits[i];
     Scope *sc = sp->scope >= 0 && sp->scope < c->nscopes ? &c->scopes[sp->scope] : NULL;
     if (!sc || !sc->reachable) continue;
-    const char *why = NULL;
+    const char *why = NULL, *later = NULL;
     for (int q = 0; q < sp->nnames && !why; q++) {
       LocalVar *lv = scope_local(sc, sp->names[q]);
       if (!lv || !ssa_plain(lv->type)) why = sp->names[q];
+      else if (lv->is_cell || lv->proc_rebinds || lv->cell_outlives) { why = sp->names[q]; later = "a proc shares it"; }
     }
+    if (!why && later_bad[i]) { why = sp->names[0]; later = "a block that can run after its call uses it"; }
     if (!why) continue;
     if (ssa_log()) {
       LocalVar *lv = scope_local(sc, why);
-      fprintf(stderr, "spinel-ssa: %s: slot `%s` is %s, not a plain value: one slot again\n",
-              sp->key, why, lv ? ty_name(lv->type) : "missing");
+      if (later) fprintf(stderr, "spinel-ssa: %s: %s: one slot again\n", sp->key, later);
+      else fprintf(stderr, "spinel-ssa: %s: slot `%s` is %s, not a plain value: one slot again\n",
+                   sp->key, why, lv ? ty_name(lv->type) : "missing");
     }
     size_t kl = strlen(sp->key);
     while (len + kl + 2 > cap) cap *= 2;
@@ -1705,6 +2556,7 @@ void ssa_check_splits(Compiler *c) {
     memcpy(veto + len, sp->key, kl + 1); len += kl;
     nveto++;
   }
+  free(later_bad);
   if (nveto == 0) { free(veto); return; }
   /* each round leaves more locals whole; a third round turns SSA off */
   const char *rs = getenv("SP_SSA_ROUND");
