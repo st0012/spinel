@@ -25496,6 +25496,45 @@ static int operand_hoists_effect(Compiler *c, int node) {
   return 0;
 }
 
+/* Does this subtree read anything a store can change: a local, an instance,
+   class or global variable, or a value through a call (a field, an
+   element)? Literals, self and constants are all it may hold otherwise. */
+static int subtree_reads_slot(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  if (id < 0) return 0;
+  NodeKind k = nt_kind(nt, id);
+  if (k == NK_LocalVariableReadNode || k == NK_InstanceVariableReadNode ||
+      k == NK_ClassVariableReadNode || k == NK_GlobalVariableReadNode)
+    return 1;
+  if (k == NK_CallNode && !call_is_scalar_op(c, id)) return 1;
+  int nr = nt_num_refs(nt, id);
+  for (int i = 0; i < nr; i++)
+    if (subtree_reads_slot(c, nt_ref_at(nt, id, i))) return 1;
+  int na = nt_num_arrs(nt, id);
+  for (int i = 0; i < na; i++) {
+    int n = 0;
+    const int *ids = nt_arr_at(nt, id, i, &n);
+    for (int j = 0; j < n; j++)
+      if (subtree_reads_slot(c, ids[j])) return 1;
+  }
+  return 0;
+}
+/* Does what operand `node` hoists read a slot (subtree_reads_slot): its
+   receiver or an argument, below the operand's own call? A hoisted read
+   runs ahead of every operand, so when one to its left runs code that
+   stores into the slot, the read must stay in its place:
+   `visit(n.l) + visit(n.r)` reads n.r after the left visit has run, and
+   that visit may store a new n.r. */
+static int operand_hoists_slot_read(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (nt_kind(nt, node) != NK_CallNode) return subtree_reads_slot(c, node);
+  if (subtree_reads_slot(c, nt_ref(nt, node, "receiver"))) return 1;
+  int a = nt_ref(nt, node, "arguments"), ac = 0;
+  const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &ac) : NULL;
+  for (int i = 0; i < ac; i++) if (subtree_reads_slot(c, av[i])) return 1;
+  return 0;
+}
+
 /* See codegen_internal.h. */
 int operand_allocates_beside(Compiler *c, int v) {
   if (subtree_may_allocate(c->nt, v)) return !subtree_is_pure_read(c, v);
@@ -26193,10 +26232,14 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
     return 0;
   }
   /* an operand's hoisted statements stay ahead of the call unless they run
-     code an operand to their left must precede */
+     code an operand to their left must precede, or read a slot that code in
+     an operand to their left can store into (operand_hoists_slot_read) */
+  int left_stores = 0;
   for (int i = 0; i < nb; i++) {
+    if (i > 0 && subtree_may_reassign_state(c, node[i - 1])) left_stores = 1;
     if (!opp[i].p) continue;
-    int inl = i > 0 && operand_hoists_effect(c, node[i]);
+    int inl = i > 0 && (operand_hoists_effect(c, node[i]) ||
+                        (left_stores && operand_hoists_slot_read(c, node[i])));
     if (!inl) { buf_puts(g_pre, opp[i].p); free(opp[i].p); opp[i].p = NULL; }
   }
   buf_puts(b, "({ ");
