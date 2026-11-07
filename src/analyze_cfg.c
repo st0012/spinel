@@ -162,6 +162,46 @@ static void cfg_lower_pattern_binds(CfgB *g, int n, int depth) {
     for (int k = 0; k < an; k++) cfg_lower_pattern_binds(g, av[k], depth + 1);
   }
 }
+/* A multiple assignment runs in three steps (`a.b, c[d], e = v, w`): the
+   receivers and arguments of its targets, left to right; then the values;
+   then the stores, lefts first, then the splat, then rights. */
+static void cfg_masgn_operands(CfgB *g, int n, int depth) {
+  const NodeTable *nt = g->nt;
+  if (n < 0 || depth > 64) return;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_MultiWriteNode || k == NK_MultiTargetNode) {
+    int ln = 0; const int *l = nt_arr(nt, n, "lefts", &ln);
+    for (int i = 0; i < ln; i++) cfg_masgn_operands(g, l[i], depth + 1);
+    cfg_masgn_operands(g, nt_ref(nt, n, "rest"), depth + 1);
+    int rn = 0; const int *r = nt_arr(nt, n, "rights", &rn);
+    for (int i = 0; i < rn; i++) cfg_masgn_operands(g, r[i], depth + 1);
+    return;
+  }
+  if (k == NK_SplatNode) { cfg_masgn_operands(g, nt_ref(nt, n, "expression"), depth + 1); return; }
+  if (k == NK_IndexTargetNode || k == NK_CallTargetNode) {
+    cfg_lower(g, nt_ref(nt, n, "receiver"));
+    cfg_lower(g, nt_ref(nt, n, "arguments"));
+    int blk = nt_ref(nt, n, "block");
+    if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk);
+  }
+  /* a local, instance, class or global variable target has no operand */
+}
+static void cfg_masgn_stores(CfgB *g, int n, int depth) {
+  const NodeTable *nt = g->nt;
+  if (n < 0 || depth > 64) return;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_MultiWriteNode || k == NK_MultiTargetNode) {
+    int ln = 0; const int *l = nt_arr(nt, n, "lefts", &ln);
+    for (int i = 0; i < ln; i++) cfg_masgn_stores(g, l[i], depth + 1);
+    cfg_masgn_stores(g, nt_ref(nt, n, "rest"), depth + 1);
+    int rn = 0; const int *r = nt_arr(nt, n, "rights", &rn);
+    for (int i = 0; i < rn; i++) cfg_masgn_stores(g, r[i], depth + 1);
+    return;
+  }
+  if (k == NK_SplatNode) { cfg_masgn_stores(g, nt_ref(nt, n, "expression"), depth + 1); return; }
+  if (k == NK_LocalVariableTargetNode && cfg_owned(g, n)) cfg_emit(g, EV_WRITE_UNK, n);
+  /* the store of any other target writes no local of this method */
+}
 static void cfg_lower_children(CfgB *g, int n) {
   const NodeTable *nt = g->nt;
   for (int i = 0; i < nt_num_refs(nt, n); i++) cfg_lower(g, nt_ref_at(nt, n, i));
@@ -247,14 +287,32 @@ static void cfg_lower_begin(CfgB *g, int body, int rescue, int els, int ensure) 
   int rexits[64]; int nrex = 0;
   if (g->nbg < 64) { g->bg_entry[g->nbg] = entry; g->bg_endepth[g->nbg] = g->nen; }
   g->nbg++;
+  /* An exception goes to the first arm's test. An arm tries its classes
+     in order and stops at a match; when none matches, the next arm's
+     test runs. So each class can reach its arm, and only the last one's
+     miss reaches the next arm. An arm with no class takes StandardError
+     and passes anything else on. A miss of the last arm leaves the begin
+     (the ensure and the outer rescues see every block made here). */
+  int test = -1;
+  if (rescue >= 0) {
+    test = cfg_new_block(g);
+    cfg_add_edge(g, entry, test);
+    for (int k = first; k < last; k++) if (k != en) cfg_add_edge(g, k, test);
+  }
   for (int r = rescue; r >= 0; r = nt_ref(nt, r, "subsequent")) {
     int rb = cfg_new_block(g);
-    cfg_add_edge(g, entry, rb);
-    for (int k = first; k < last; k++) if (k != en) cfg_add_edge(g, k, rb);
-    g->cur = rb;
-    /* the classes the arm names are read when it is tried */
+    int nxt = nt_ref(nt, r, "subsequent") >= 0 ? cfg_new_block(g) : -1;
+    g->cur = test;
     { int xn = 0; const int *xs = nt_arr(nt, r, "exceptions", &xn);
-      for (int q = 0; q < xn; q++) cfg_lower(g, xs[q]); }
+      if (xn == 0) { cfg_add_edge(g, g->cur, rb); if (nxt >= 0) cfg_add_edge(g, g->cur, nxt); }
+      for (int q = 0; q < xn; q++) {
+        if (q > 0) cfg_fall(g);
+        cfg_lower(g, xs[q]);
+        if (g->cur >= 0) cfg_add_edge(g, g->cur, rb);
+      }
+      if (xn > 0 && nxt >= 0 && g->cur >= 0) cfg_add_edge(g, g->cur, nxt); }
+    test = nxt;
+    g->cur = rb;
     int ref = nt_ref(nt, r, "reference");
     if (ref >= 0) {
       if (nt_kind(nt, ref) == NK_LocalVariableTargetNode) cfg_emit(g, EV_WRITE_UNK, ref);
@@ -328,15 +386,43 @@ static void cfg_lower(CfgB *g, int n) {
     g->cur = join;
     return;
   }
-  case NK_MultiWriteNode: case NK_MultiTargetNode: {
+  case NK_MultiWriteNode: case NK_MultiTargetNode:
+    cfg_masgn_operands(g, n, 0);
     cfg_lower(g, nt_ref(nt, n, "value"));
-    const char *keys[] = { "lefts", "rights" };
-    for (int q = 0; q < 2; q++) {
-      int ln = 0; const int *l = nt_arr(nt, n, keys[q], &ln);
-      for (int i = 0; i < ln; i++) cfg_lower(g, l[i]);
+    cfg_masgn_stores(g, n, 0);
+    return;
+  case NK_InstanceVariableOrWriteNode: case NK_InstanceVariableAndWriteNode:
+  case NK_ClassVariableOrWriteNode: case NK_ClassVariableAndWriteNode:
+  case NK_GlobalVariableOrWriteNode: case NK_GlobalVariableAndWriteNode:
+  case NK_ConstantOrWriteNode: case NK_ConstantAndWriteNode:
+  case NK_ConstantPathOrWriteNode: case NK_ConstantPathAndWriteNode:
+  case NK_IndexOrWriteNode: case NK_IndexAndWriteNode:
+  case NK_CallOrWriteNode: case NK_CallAndWriteNode:
+  case NK_CallOperatorWriteNode: case NK_IndexOperatorWriteNode: {
+    /* `@a ||= v`, `h[k] &&= v`: the receiver and the arguments run, then
+       v runs only on one side of the test. An operator write (`h[k] += v`)
+       always runs v, unless it is `a&.b += v` on a nil `a`. */
+    cfg_lower(g, nt_ref(nt, n, "target"));
+    cfg_lower(g, nt_ref(nt, n, "receiver"));
+    int opw = k == NK_CallOperatorWriteNode || k == NK_IndexOperatorWriteNode;
+    int sn = nt_safe_nav(nt, n);
+    int before = g->cur, join = -1;
+    if (sn) { join = cfg_new_block(g); cfg_fall(g); }   /* a nil receiver: nothing after it runs */
+    cfg_lower(g, nt_ref(nt, n, "arguments"));
+    { int blk = nt_ref(nt, n, "block");
+      if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk); }
+    if (!opw) {   /* the test: the value runs on one side of it */
+      int tst = g->cur;
+      if (join < 0) join = cfg_new_block(g);
+      cfg_fall(g);
+      if (tst >= 0) cfg_add_edge(g, tst, join);
     }
-    int r = nt_ref(nt, n, "rest");
-    if (r >= 0) cfg_lower(g, nt_kind(nt, r) == NK_SplatNode ? nt_ref(nt, r, "expression") : r);
+    cfg_lower(g, nt_ref(nt, n, "value"));
+    if (join >= 0) {
+      cfg_jump_to(g, join);
+      if (sn && before >= 0) cfg_add_edge(g, before, join);
+      g->cur = join;
+    }
     return;
   }
   case NK_MatchRequiredNode:   /* `v => pat`: binds, or raises */
@@ -386,9 +472,16 @@ static void cfg_lower(CfgB *g, int n) {
       int arm = cfg_new_block(g);
       g->cur = test;
       if (k == NK_CaseNode) {
+        /* `when a, b`: the conditions run in order and the first match
+           runs the arm, so each condition can reach it; only the last
+           one's miss goes on to the next arm's test */
         int cn = 0; const int *cv = nt_arr(nt, w[i], "conditions", &cn);
-        for (int q = 0; q < cn; q++) cfg_lower(g, cv[q]);
-        cfg_add_edge(g, g->cur, arm); cfg_add_edge(g, g->cur, next);
+        for (int q = 0; q < cn; q++) {
+          if (q > 0) cfg_fall(g);
+          cfg_lower(g, cv[q]);
+          if (g->cur >= 0) cfg_add_edge(g, g->cur, arm);
+        }
+        if (g->cur >= 0) cfg_add_edge(g, g->cur, next);
         g->cur = arm;
       } else {
         int pat = nt_ref(nt, w[i], "pattern");
@@ -430,6 +523,10 @@ static void cfg_lower(CfgB *g, int n) {
     g->nlp++;
     g->cur = bodyb;
     cfg_lower(g, nt_ref(nt, n, "index"));
+    /* `redo` runs the body again on the same element: it goes to the
+       block after the index write, not the one that makes it */
+    { int again = cfg_fall(g);
+      if (g->nlp <= 64) g->lp_body[g->nlp - 1] = again; }
     cfg_lower_list(g, nt_ref(nt, n, "statements"));
     cfg_jump_to(g, head);
     g->nlp--;
@@ -477,19 +574,18 @@ static void cfg_lower(CfgB *g, int n) {
     return;
   case NK_CallNode: {
     cfg_lower(g, nt_ref(nt, n, "receiver"));
-    if (nt_safe_nav(nt, n)) {
-      /* `a&.m(x = v)`: the arguments run only when a is not nil */
-      int before = g->cur;
-      int join = cfg_new_block(g);
-      cfg_fall(g);
-      cfg_lower(g, nt_ref(nt, n, "arguments"));
+    /* `m(&x)` reads x after the arguments; a block is its own scope.
+       `a&.m(x = v, &e)`: the arguments and `e` run only when a is not nil */
+    int before = -1, join = -1;
+    if (nt_safe_nav(nt, n)) { before = g->cur; join = cfg_new_block(g); cfg_fall(g); }
+    cfg_lower(g, nt_ref(nt, n, "arguments"));
+    { int blk = nt_ref(nt, n, "block");
+      if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk); }
+    if (join >= 0) {
       cfg_jump_to(g, join);
       if (before >= 0) cfg_add_edge(g, before, join);
       g->cur = join;
-    } else cfg_lower(g, nt_ref(nt, n, "arguments"));
-    /* `m(&x)` reads x after the arguments; a block is its own scope */
-    { int blk = nt_ref(nt, n, "block");
-      if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode) cfg_lower(g, blk); }
+    }
     /* the block is its own scope; a bare raise/exit that reaches Kernel's
        never returns (a method of the program with the name does) */
     if (!g->ssa && an_call_diverges(g->c, n)) cfg_jump_out(g, g->exit_blk, 0);
