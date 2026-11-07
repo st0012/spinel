@@ -1741,9 +1741,6 @@ static void ir_dump(Compiler *c, Scope *s, CfgB *g, Ir *ir, Kd *K, const char *p
   for (int i = 0; i < no; i++) {
     int b = order[i];
     CBlock *bl = &g->b[b];
-    int nphi = 0;
-    for (int x = 0; x < ir->nv; x++) if (ir->v[x].kind == IV_PHI && ir->v[x].block == b && ir->v[x].repl < 0 && ir->v[x].live) nphi++;
-    if (!bl->nev && !nphi && b != 0) continue;
     fprintf(f, "bb%d:", b);
     int np = ir->pred_off[b + 1] - ir->pred_off[b];
     if (np) { fprintf(f, "  (from"); for (int q = 0; q < np; q++) fprintf(f, " bb%d", ir->preds[ir->pred_off[b] + q]); fprintf(f, ")"); }
@@ -1765,7 +1762,11 @@ static void ir_dump(Compiler *c, Scope *s, CfgB *g, Ir *ir, Kd *K, const char *p
       int line = node >= 0 ? (int)nt_int(c->nt, node, "node_line", 0) : 0;
       if (bl->ev_kind[e] == EV_READ) {
         fprintf(f, "  Read %s = v%d : ", s->locals[li].name, x); kd_print(c, K[x], f);
-        if (node >= 0 && c->nilnarrow[node] != TY_UNKNOWN) fprintf(f, "  -> unboxed as %s", ty_name(c->nilnarrow[node]));
+        if (node >= 0 && c->nilnarrow[node] != TY_UNKNOWN) {
+          TyKind nt2 = c->nilnarrow[node];
+          int oc = ty_is_object(nt2) ? ty_object_class(nt2) : -1;
+          fprintf(f, "  -> unboxed as %s", oc >= 0 && oc < c->nclasses ? c->classes[oc].name : ty_name(nt2));
+        }
         fprintf(f, "   (line %d)\n", line);
       } else if (bl->ev_kind[e] == EV_PI) {
         const CfgPi *p = &g->pis[bl->ev_aux[e]];
