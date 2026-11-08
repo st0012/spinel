@@ -15295,9 +15295,19 @@ int disp_def_build(NodeTable *nt, int like, const char *name, int sg, int ar, in
   return def;
 }
 
-/* A program's own `def method(n)` in a class body (#10719): its `super`
-   is Object#method, the Method of self that the builtin makes, which a
-   call reaches by name only when nothing of the program answers it. Each
+/* The statements def node `d` is one of, as itself or as the def a
+   `private def` statement wraps (fwd_body_def); -1 for none. */
+static int dmo_body_stmts(const NodeTable *nt, const int *par, int d) {
+  int st = par[d];
+  if (st >= 0 && nt_kind(nt, st) == NK_ArgumentsNode && par[st] >= 0 && fwd_body_def(nt, par[st]) == d) st = par[par[st]];
+  return st >= 0 && nt_kind(nt, st) == NK_StatementsNode ? st : -1;
+}
+/* A program's own `def method(n)` in a class or module body (#10719): its
+   `super` is Object#method, the Method of self that the builtin makes,
+   which a call reaches by name only when nothing of the program answers
+   it. Where the super can reach a `method` of the program's own (a
+   superclass's, an included module's: dmo_super_reaches_program), the
+   super is left as it is and calls that one. Elsewhere each
    super in the def's body (not in a def or class nested in it) becomes
    `self.method(args)` marked builtin_only, its own arguments or, for a
    bare super, the def's required parameters. A def with other parameters,
@@ -15340,6 +15350,7 @@ static void dmo_rewrite(NodeTable *nt, int n, const int *preq, int npreq, int *c
     for (int j = 0; j < an; j++) dmo_rewrite(nt, av[j], preq, npreq, changed);
   }
 }
+int dmo_super_reaches_program(const NodeTable *nt, const int *par, int n0, int owner, int def);
 int desugar_method_override_super(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int changed = 0, *parent = NULL, n0 = nt->count;
@@ -15348,9 +15359,12 @@ int desugar_method_override_super(Compiler *c) {
     const char *nm = nt_str(nt, id, "name");
     if (!nm || !sp_streq(nm, "method")) continue;
     if (!parent && !(parent = an_parent_map(nt))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    /* a statement of a class body (StatementsNode, then the ClassNode) */
-    int st = parent[id], owner = st >= 0 ? parent[st] : -1;
-    if (st < 0 || nt_kind(nt, st) != NK_StatementsNode || owner < 0 || nt_kind(nt, owner) != NK_ClassNode) continue;
+    /* a statement of a class or module body (StatementsNode, then the
+       ClassNode or ModuleNode) */
+    int st = parent[id];
+    int owner = st >= 0 ? parent[st] : -1;
+    if (st < 0 || nt_kind(nt, st) != NK_StatementsNode || owner < 0 ||
+        (nt_kind(nt, owner) != NK_ClassNode && nt_kind(nt, owner) != NK_ModuleNode)) continue;
     int ps = nt_ref(nt, id, "parameters"), npreq = 0;
     const int *preq = NULL;
     if (ps >= 0) {
@@ -15363,6 +15377,7 @@ int desugar_method_override_super(Compiler *c) {
       for (int i = 0; i < npreq && ok; i++) ok = nt_kind(nt, preq[i]) == NK_RequiredParameterNode && nt_str(nt, preq[i], "name");
       if (!ok) continue;
     }
+    if (dmo_super_reaches_program(nt, parent, n0, owner, id)) continue;
     dmo_rewrite(nt, nt_ref(nt, id, "body"), preq, npreq, &changed);
   }
   free(parent);
@@ -21486,6 +21501,120 @@ static int rod_inherits(RodIndex *x, const NodeTable *nt, int cls, const char *m
   for (int m = x->qhead[e]; m >= 0; m = x->qnext[m])
     if (rod_above_defines(x, nt, m, meth)) return 1;
   return 0;
+}
+/* Is node s a call that mixes a module in: include, prepend or extend,
+   with or without a receiver, or one a send names with a literal? Its name
+   and the modules it passes, then. */
+static const char *dmo_mixin_call(const NodeTable *nt, int s, const int **av, int *an) {
+  if (nt_kind(nt, s) != NK_CallNode) return NULL;
+  const char *cn = nt_str(nt, s, "name");
+  if (!cn) return NULL;
+  *av = nt_arr(nt, nt_ref(nt, s, "arguments"), "arguments", an);
+  if (sp_streq(cn, "send") || sp_streq(cn, "__send__") || sp_streq(cn, "public_send")) {
+    const char *sn = *an > 0 ? sym_or_str_literal(nt, (*av)[0]) : NULL;
+    if (!sn) return NULL;
+    cn = sn; (*av)++; (*an)--;
+  }
+  return sp_streq(cn, "include") || sp_streq(cn, "prepend") || sp_streq(cn, "extend") ? cn : NULL;
+}
+/* Can mix-in call `s` (dmo_mixin_call) add its module to class `owner` or
+   a superclass of it? A receiver this walk cannot name, or none (self in a
+   method, a block), says yes; a constant says yes when its leaf names the
+   class or one up its superclass chain, followed by leaf name. */
+static int dmo_mixes_into_chain(RodIndex *x, const NodeTable *nt, int s, int owner) {
+  const char *rl = rod_leaf(nt, nt_ref(nt, s, "receiver"));
+  if (!rl) return 1;
+  int cur = owner;
+  for (int d = 0; cur >= 0 && d < 64; d++) {
+    const char *cl = class_def_name(nt, cur);
+    if (!cl || sp_streq(cl, rl)) return 1;
+    const char *sl = rod_leaf(nt, class_def_super(nt, cur));
+    if (!sl) return class_def_super(nt, cur) >= 0;   /* (a superclass this walk cannot name) */
+    int e = anh_find(&x->byleaf, sl);
+    cur = e >= 0 ? x->lhead[e] : -1;
+  }
+  return 0;
+}
+/* Can a `super` in the instance `def method` node `def` declares in the
+   body of class or module `owner` reach a `method` of the program's own
+   (desugar_method_override_super)? Then the plain super calls it, and only
+   where none can is the super Object#method. par: an_parent_map.
+
+   Another `def method` at the top level or in Object, Kernel or BasicObject
+   is above every class, and one this walk cannot place (in a method body or
+   a block), an alias or a define_method of the name may be anywhere: each
+   answers yes. Where every other one is in a class or module body, a
+   class's super reaches one through its superclass chain or a module its
+   bodies include (rod_inherits), or through a module mixed in any other
+   way (`R.include(M)`) whose chain defines one. A module's super goes on
+   from the module in each class whose body includes it: past it, that
+   class's chain and its other includes (rod_inherits with the module's
+   headers left out). A module that is prepended, extended or included any
+   other way, or a mix-in of a module this walk cannot name, answers yes. */
+int dmo_super_reaches_program(const NodeTable *nt, const int *par, int n0, int owner, int def) {
+  int others = 0;
+  for (int d = 0; d < n0; d++) {
+    NodeKind k = nt_kind(nt, d);
+    if (k == NK_AliasMethodNode) {
+      const char *nn = sym_or_str_literal(nt, nt_ref(nt, d, "new_name"));
+      if (!nn || sp_streq(nn, "method")) return 1;
+      continue;
+    }
+    if (k == NK_CallNode) {
+      const char *cn = nt_str(nt, d, "name");
+      if (!cn || (!sp_streq(cn, "define_method") && !sp_streq(cn, "alias_method"))) continue;
+      int an = 0; const int *av = nt_arr(nt, nt_ref(nt, d, "arguments"), "arguments", &an);
+      const char *nn = an > 0 ? sym_or_str_literal(nt, av[0]) : NULL;
+      if (!nn || sp_streq(nn, "method")) return 1;
+      continue;
+    }
+    if (k != NK_DefNode || d == def || nt_ref(nt, d, "receiver") >= 0) continue;
+    const char *nm = nt_str(nt, d, "name");
+    if (!nm || !sp_streq(nm, "method")) continue;
+    int st = dmo_body_stmts(nt, par, d);
+    int h = st >= 0 && nt_kind(nt, st) == NK_StatementsNode ? par[st] : -1;
+    if (h < 0 || !class_def_opens_frame(nt, h) || class_def_body(nt, h) != st) return 1;
+    const char *hn = class_def_name(nt, h);
+    if (!hn || sp_streq(hn, "Object") || sp_streq(hn, "Kernel") || sp_streq(hn, "BasicObject")) return 1;
+    others++;
+  }
+  if (!others) return 0;
+  RodIndex rx;
+  rod_index_build(&rx, nt, n0);
+  int is_class = class_def_is_class(nt, owner), hit = 0;
+  const char *leaf = class_def_name(nt, owner);
+  for (int s = 0; s < n0 && !hit; s++) {
+    int an = 0; const int *av = NULL;
+    const char *cn = dmo_mixin_call(nt, s, &av, &an);
+    if (!cn) continue;
+    /* a receiverless `include M` statement of a class or module body */
+    int st = par[s], h = st >= 0 && nt_kind(nt, st) == NK_StatementsNode ? par[st] : -1;
+    int stmt = sp_streq(cn, "include") && sp_streq(nt_str(nt, s, "name"), "include") && nt_ref(nt, s, "receiver") < 0 &&
+               h >= 0 && class_def_opens_frame(nt, h) && class_def_body(nt, h) == st;
+    for (int a = 0; a < an && !hit; a++) {
+      const char *l = rod_leaf(nt, av[a]);
+      if (!l) { hit = 1; break; }   /* (a module this walk cannot name) */
+      if (stmt && is_class) continue;   /* (rod_inherits follows it) */
+      if (is_class) {
+        if (!dmo_mixes_into_chain(&rx, nt, s, owner)) continue;
+        rx.gen++; hit = rod_named_defines(&rx, nt, NULL, l, "method"); continue;
+      }
+      if (!leaf || !sp_streq(l, leaf)) continue;
+      if (!stmt) { hit = 1; break; }
+      /* past the module: the includer's chain, the module's headers left out */
+      rx.gen++;
+      int e = rx.qn[owner] ? anh_find(&rx.byq, rx.qn[owner]) : -1;
+      if (e >= 0) for (int m = rx.qhead[e]; m >= 0; m = rx.qnext[m]) rx.seen[m] = rx.gen;
+      rx.seen[owner] = rx.gen;
+      e = rx.qn[h] ? anh_find(&rx.byq, rx.qn[h]) : -1;
+      if (e < 0) { rx.seen[h] = rx.gen; hit = rod_above_defines(&rx, nt, h, "method"); continue; }
+      for (int m = rx.qhead[e]; m >= 0; m = rx.qnext[m]) rx.seen[m] = rx.gen;
+      for (int m = rx.qhead[e]; m >= 0 && !hit; m = rx.qnext[m]) hit = rod_above_defines(&rx, nt, m, "method");
+    }
+  }
+  if (!hit && is_class) hit = rod_inherits(&rx, nt, owner, "method");
+  rod_index_free(&rx, n0);
+  return hit;
 }
 /* `def meth = @meth` like node `like` */
 static int rod_reader_def(NodeTable *nt, int like, const char *meth) {
