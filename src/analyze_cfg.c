@@ -38,6 +38,12 @@ enum { KN_NIL = 1 << 0, KN_TRUE = 1 << 1, KN_FALSE = 1 << 2, KN_INT = 1 << 3, KN
        KN_FLOAT = 1 << 5, KN_STR = 1 << 6, KN_SYM = 1 << 7, KN_ARR = 1 << 8, KN_HASH = 1 << 9,
        KN_OBJ = 1 << 10, KN_OTHER = 1 << 11 };
 #define KN_ALL 0x0fff
+/* The IR's own types (ir_own_kinds) mark a value they know nothing of
+   with KN_UNK too, so a test that narrows it (`x || 1`) keeps it unknown */
+#define KN_UNK (1 << 12)
+#define KN_INTS (KN_INT | KN_BIG)
+#define KN_BOOL (KN_TRUE | KN_FALSE)
+#define KN_BOXY (KN_ARR | KN_HASH | KN_OBJ | KN_OTHER)
 
 typedef struct {
   int *ev_kind, *ev_node; int nev, cev;
@@ -1054,8 +1060,16 @@ static void cfg_lower(CfgB *g, int n) {
    join block makes a phi and asks each predecessor for an operand. Then a
    phi whose operands are all one value (or the phi itself) stands for that
    value and is dropped, until none is left. A phi that no read reaches
-   (through other phis) is dead: the passes skip it. */
-enum { IV_ENTRY = 1, IV_DEF, IV_PHI, IV_PI };
+   (through other phis) is dead: the passes skip it.
+
+   ir_add_exprs (below) adds a value for each step of what a write stores:
+   a Const per literal, a Send per call, a Phi where the arms of an `if` or
+   a `case` join, an And or an Or for `&&` and `||`, a Rescued for the
+   exception a rescue arm binds, and an Other for anything else. */
+enum { IV_ENTRY = 1, IV_DEF, IV_PHI, IV_PI, IV_CONST, IV_SEND, IV_JOIN, IV_AND, IV_OR, IV_RESCUED, IV_OTHER };
+/* a SEND's flags (its evk): a splat, keyword or block-pass argument; a
+   block; `&.` */
+enum { SF_ODD = 1, SF_BLOCK = 2, SF_SAFE = 4 };
 
 typedef struct {
   unsigned char kind, live;
@@ -1064,8 +1078,12 @@ typedef struct {
   int evk;         /* a DEF: the event kind (EV_WRITE ...); a PI: its CfgB.pis index */
   int block;
   int src;         /* a PI, and the DEF of `x &&= v`: the value before it */
-  int op0, nop;    /* a PHI: ops[op0 .. op0 + nop), one per predecessor */
+  int op0, nop;    /* a PHI: ops[op0 .. op0 + nop), one per predecessor; a SEND: the
+                      receiver (-1: self), then the arguments; a JOIN, an AND, an OR:
+                      the values it joins */
   int repl;        /* a trivial PHI: the value it stands for, else -1 */
+  int arg;         /* a DEF: the value it stores (ir_add_exprs), else -1 */
+  int owner;       /* a value of what a write stores: that write's DEF, else -1 */
 } IrVal;
 
 typedef struct {
@@ -1098,7 +1116,7 @@ static int ir_val_new(Ir *ir, int kind, int local, int node, int evk, int block)
   IrVal *x = &ir->v[ir->nv];
   memset(x, 0, sizeof *x);
   x->kind = (unsigned char)kind; x->local = local; x->node = node; x->evk = evk; x->block = block;
-  x->src = -1; x->op0 = -1; x->repl = -1;
+  x->src = -1; x->op0 = -1; x->repl = -1; x->arg = -1; x->owner = -1;
   return ir->nv++;
 }
 static int ir_find(Ir *ir, int x) {
@@ -1709,7 +1727,7 @@ static const char *kd_class(Compiler *c, Kd k) {
 static void kd_print(Compiler *c, Kd k, FILE *f) {
   static const char *const nm[] = { "nil", "true", "false", "Integer", "Bignum", "Float", "String",
     "Symbol", "Array", "Hash", "Object", "other" };
-  if (k.k == KN_ALL) { fprintf(f, "any"); return; }
+  if (k.k == KN_ALL || (k.k & KN_UNK)) { fprintf(f, "any"); return; }
   if (!k.k) { fprintf(f, "none"); return; }
   int any = 0;
   for (int b = 0; b < 12; b++) if (k.k & (1 << b)) {
@@ -1724,6 +1742,52 @@ static const char *pi_op_name(int op) {
   case PI_NOTNIL: return "is not nil"; case PI_TRUTHY: return "truthy"; case PI_FALSY: return "falsy";
   }
   return "?";
+}
+/* the name of local li of graph g (an SSA graph has its own list: the
+   scope's locals are registered after the rename) */
+static const char *ir_local_name(CfgB *g, int li) {
+  if (g->ssa) return li >= 0 && li < g->nsn ? g->sn[li] : "?";
+  return li >= 0 && li < g->s->nlocals ? g->s->locals[li].name : "?";
+}
+/* the values of what write x stores, before its Write line */
+static void ir_dump_owned(Compiler *c, Ir *ir, Kd *K, int x, FILE *f) {
+  const NodeTable *nt = c->nt;
+  for (int y = 0; y < ir->nv; y++) {
+    IrVal *v = &ir->v[y];
+    if (v->owner != x || v->kind == IV_DEF) continue;
+    fprintf(f, "  v%d = ", y);
+    int n = v->node;
+    NodeKind nk = n >= 0 ? nt_kind(nt, n) : NK_NilNode;
+    switch (v->kind) {
+    case IV_CONST:
+      if (n < 0 || nk == NK_NilNode) fprintf(f, "Const nil");
+      else if (nk == NK_IntegerNode && nt_str(nt, n, "bigval")) fprintf(f, "Const %s", nt_str(nt, n, "bigval"));
+      else if (nk == NK_IntegerNode) fprintf(f, "Const %lld", nt_int(nt, n, "value", 0));
+      else if (nk == NK_TrueNode) fprintf(f, "Const true");
+      else if (nk == NK_FalseNode) fprintf(f, "Const false");
+      else if (nk == NK_SymbolNode && nt_str(nt, n, "value")) fprintf(f, "Const :%s", nt_str(nt, n, "value"));
+      else if (nk == NK_StringNode && nt_str(nt, n, "content")) fprintf(f, "Const \"%.20s\"", nt_str(nt, n, "content"));
+      else if (nk == NK_FloatNode && nt_content(nt, n)) fprintf(f, "Const %s", nt_content(nt, n));
+      else fprintf(f, "Const %s", nt_type(nt, n) ? nt_type(nt, n) : "?");
+      break;
+    case IV_SEND: {
+      const char *m = nk == NK_CallNode ? nt_str(nt, n, "name") : nt_str(nt, n, "binary_operator");
+      int rv = v->nop > 0 ? ir->ops[v->op0] : -1;
+      if (rv >= 0) fprintf(f, "Send v%d, :%s", rv, m ? m : "?");
+      else fprintf(f, "Send self, :%s", m ? m : "?");
+      for (int q = 1; q < v->nop; q++) fprintf(f, ", v%d", ir->ops[v->op0 + q]);
+      if (v->evk & SF_BLOCK) fprintf(f, ", block");
+      break;
+    }
+    case IV_JOIN: case IV_AND: case IV_OR:
+      fprintf(f, "%s", v->kind == IV_JOIN ? "Phi" : v->kind == IV_AND ? "And" : "Or");
+      for (int q = 0; q < v->nop; q++) fprintf(f, "%s v%d", q ? "," : "", ir->ops[v->op0 + q]);
+      break;
+    case IV_RESCUED: fprintf(f, "Rescued"); break;
+    default: fprintf(f, "Other %s", n >= 0 && nt_type(nt, n) ? nt_type(nt, n) : "?"); break;
+    }
+    fprintf(f, " : "); kd_print(c, K[y], f); fprintf(f, "\n");
+  }
 }
 /* SP_IR_DUMP=name prints the IR of each method of that name, in the shape
    ZJIT's HIR dump has: blocks, their phis, and one line per value */
@@ -1747,12 +1811,12 @@ static void ir_dump(Compiler *c, Scope *s, CfgB *g, Ir *ir, Kd *K, const char *p
     fprintf(f, "\n");
     if (b == 0)
       for (int x = 0; x < ir->nv; x++) if (ir->v[x].kind == IV_ENTRY && ir->v[x].live) {
-        fprintf(f, "  v%d = Entry %s : ", x, s->locals[ir->v[x].local].name); kd_print(c, K[x], f); fprintf(f, "\n");
+        fprintf(f, "  v%d = Entry %s : ", x, ir_local_name(g, ir->v[x].local)); kd_print(c, K[x], f); fprintf(f, "\n");
       }
     for (int x = 0; x < ir->nv; x++) {
       IrVal *v = &ir->v[x];
       if (v->kind != IV_PHI || v->block != b || v->repl >= 0 || !v->live) continue;
-      fprintf(f, "  v%d = Phi %s", x, s->locals[v->local].name);
+      fprintf(f, "  v%d = Phi %s", x, ir_local_name(g, v->local));
       for (int q = 0; q < v->nop; q++) fprintf(f, "%s v%d", q ? "," : "", ir->ops[v->op0 + q]);
       fprintf(f, " : "); kd_print(c, K[x], f); fprintf(f, "\n");
     }
@@ -1761,8 +1825,8 @@ static void ir_dump(Compiler *c, Scope *s, CfgB *g, Ir *ir, Kd *K, const char *p
       if (li < 0 || x < 0) continue;
       int line = node >= 0 ? (int)nt_int(c->nt, node, "node_line", 0) : 0;
       if (bl->ev_kind[e] == EV_READ) {
-        fprintf(f, "  Read %s = v%d : ", s->locals[li].name, x); kd_print(c, K[x], f);
-        if (node >= 0 && c->nilnarrow[node] != TY_UNKNOWN) {
+        fprintf(f, "  Read %s = v%d : ", ir_local_name(g, li), x); kd_print(c, K[x], f);
+        if (!g->ssa && node >= 0 && c->nilnarrow && c->nilnarrow[node] != TY_UNKNOWN) {
           TyKind nt2 = c->nilnarrow[node];
           int oc = ty_is_object(nt2) ? ty_object_class(nt2) : -1;
           fprintf(f, "  -> unboxed as %s", oc >= 0 && oc < c->nclasses ? c->classes[oc].name : ty_name(nt2));
@@ -1770,16 +1834,549 @@ static void ir_dump(Compiler *c, Scope *s, CfgB *g, Ir *ir, Kd *K, const char *p
         fprintf(f, "   (line %d)\n", line);
       } else if (bl->ev_kind[e] == EV_PI) {
         const CfgPi *p = &g->pis[bl->ev_aux[e]];
-        fprintf(f, "  v%d = Pi v%d, %s %s %s : ", x, ir->v[x].src, s->locals[li].name, pi_op_name(p->op), p->cls ? p->cls : "");
+        fprintf(f, "  v%d = Pi v%d, %s %s %s : ", x, ir->v[x].src, ir_local_name(g, li), pi_op_name(p->op), p->cls ? p->cls : "");
         kd_print(c, K[x], f); fprintf(f, "   (line %d)\n", line);
       } else {
-        fprintf(f, "  v%d = Write %s : ", x, s->locals[li].name); kd_print(c, K[x], f); fprintf(f, "   (line %d)\n", line);
+        ir_dump_owned(c, ir, K, x, f);
+        fprintf(f, "  v%d = Write %s", x, ir_local_name(g, li));
+        if (ir->v[x].arg >= 0) fprintf(f, " v%d", ir->v[x].arg);
+        fprintf(f, " : "); kd_print(c, K[x], f); fprintf(f, "   (line %d)\n", line);
       }
     }
     int ns = bl->nsucc;
     if (ns) { fprintf(f, "  -> "); for (int q = 0; q < ns; q++) fprintf(f, "%sbb%d", q ? ", " : "", bl->succ[q]); fprintf(f, "\n"); }
   }
   free(order);
+}
+
+/* ---- the IR's own types: a value for each step of what a write stores --
+
+   A Write above stores a value the IR did not see: the value subtree of
+   its node. ir_add_exprs gives each step of that subtree a value of its
+   own, as ZJIT's HIR does:
+
+     y = a + 1        v7 = Const 1
+                      v8 = Send v4, :+, v7      (v4: the value `a` has there)
+                      v9 = Write y v8
+
+   A literal is a Const, a call a Send (its operands: the receiver, -1 for
+   a call on self, then the arguments), the arms of an `if`, a `case` or a
+   `rescue` modifier meet at a Phi, `a && b` is an And and `a || b` an Or,
+   the exception a rescue arm binds is a Rescued, and anything else is an
+   Other. A local read makes no value: it names the value its event sees.
+   Each value keeps the write it belongs to (owner), so the dump prints it
+   just before that write.
+
+   ir_own_kinds then works out the kinds of every value from these alone,
+   with no type from Spinel's inference: a Const has its literal's kind, a
+   Send the kind a rule for its method gives on its receiver's and its
+   arguments' kinds (an Integer plus an Integer is an Integer), a Write the
+   kinds of what it stores, and a Phi the kinds of all its operands. A
+   parameter's entry, an Other and a Send with no rule are any value
+   (KN_UNK). */
+
+
+typedef struct {
+  Ir *ir; const NodeTable *nt;
+  const int *rd, *wd; int cap;    /* per node: the value a read sees, the DEF a write makes */
+  const int *resc; int nresc;     /* the targets rescue arms bind */
+  int owner, block, depth;
+  char *built;                    /* per DEF (below nbase): its value is made */
+  int nbase;
+} IrX;
+
+static int irx_new(IrX *x, int kind, int node, const int *ops, int nop) {
+  Ir *ir = x->ir;
+  int v = ir_val_new(ir, kind, -1, node, 0, x->block);
+  ir->v[v].owner = x->owner;
+  if (nop > 0) {
+    if (ir->nops + nop > ir->cops) {
+      while (ir->nops + nop > ir->cops) ir->cops = ir->cops ? ir->cops * 2 : 256;
+      ir->ops = realloc(ir->ops, sizeof(int) * (size_t)ir->cops);
+      if (!ir->ops) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    ir->v[v].op0 = ir->nops; ir->v[v].nop = nop;
+    memcpy(ir->ops + ir->nops, ops, sizeof(int) * (size_t)nop);
+    ir->nops += nop;
+  }
+  return v;
+}
+static int irx_value(IrX *x, int n);
+static void irx_def(IrX *x, int d);
+/* the value of a body: its last statement's, nil when it is empty */
+static int irx_body(IrX *x, int n) {
+  if (n < 0) return irx_new(x, IV_CONST, -1, NULL, 0);
+  if (nt_kind(x->nt, n) != NK_StatementsNode) return irx_value(x, n);
+  int bn = 0; const int *b = nt_arr(x->nt, n, "body", &bn);
+  return bn > 0 ? irx_value(x, b[bn - 1]) : irx_new(x, IV_CONST, -1, NULL, 0);
+}
+static int irx_value(IrX *x, int n) {
+  const NodeTable *nt = x->nt;
+  if (n < 0) return irx_new(x, IV_CONST, -1, NULL, 0);
+  if (x->depth > 200) return irx_new(x, IV_OTHER, n, NULL, 0);
+  x->depth++;
+  int r, ops[40], no = 0;
+  NodeKind k = nt_kind(nt, n);
+  switch (k) {
+  case NK_IntegerNode: case NK_FloatNode: case NK_RationalNode: case NK_ImaginaryNode:
+  case NK_StringNode: case NK_InterpolatedStringNode: case NK_XStringNode: case NK_InterpolatedXStringNode:
+  case NK_SymbolNode: case NK_InterpolatedSymbolNode: case NK_NilNode: case NK_TrueNode: case NK_FalseNode:
+  case NK_ArrayNode: case NK_HashNode: case NK_RangeNode: case NK_RegularExpressionNode:
+  case NK_InterpolatedRegularExpressionNode: case NK_LambdaNode: case NK_SourceFileNode:
+  case NK_SourceLineNode: case NK_DefinedNode:
+    r = irx_new(x, IV_CONST, n, NULL, 0);
+    break;
+  case NK_LocalVariableReadNode:
+    r = n < x->cap && x->rd[n] >= 0 ? x->rd[n] : irx_new(x, IV_OTHER, n, NULL, 0);
+    break;
+  case NK_LocalVariableWriteNode: case NK_LocalVariableOperatorWriteNode:
+  case NK_LocalVariableOrWriteNode: case NK_LocalVariableAndWriteNode: {
+    /* `x = (y = v)`: x stores what y does */
+    int d = n < x->cap ? x->wd[n] : -1;
+    if (d >= 0 && d < x->nbase && x->ir->v[d].kind == IV_DEF) { irx_def(x, d); r = d; }
+    else r = irx_new(x, IV_OTHER, n, NULL, 0);
+    break;
+  }
+  case NK_InstanceVariableWriteNode: case NK_GlobalVariableWriteNode: case NK_ClassVariableWriteNode:
+  case NK_ConstantWriteNode:
+    r = irx_value(x, nt_ref(nt, n, "value"));
+    break;
+  case NK_ParenthesesNode: r = irx_body(x, nt_ref(nt, n, "body")); break;
+  case NK_StatementsNode: r = irx_body(x, n); break;
+  case NK_BeginNode:
+    if (nt_ref(nt, n, "rescue_clause") < 0 && nt_ref(nt, n, "else_clause") < 0) r = irx_body(x, nt_ref(nt, n, "statements"));
+    else r = irx_new(x, IV_OTHER, n, NULL, 0);
+    break;
+  case NK_IfNode: case NK_UnlessNode: {
+    int els = nt_ref(nt, n, k == NK_IfNode ? "subsequent" : "else_clause");
+    ops[no++] = irx_body(x, nt_ref(nt, n, "statements"));
+    ops[no++] = els >= 0 ? irx_value(x, els) : irx_new(x, IV_CONST, -1, NULL, 0);
+    r = irx_new(x, IV_JOIN, n, ops, no);
+    break;
+  }
+  case NK_ElseNode: r = irx_body(x, nt_ref(nt, n, "statements")); break;
+  case NK_CaseNode: case NK_CaseMatchNode: {
+    int wn = 0; const int *w = nt_arr(nt, n, "conditions", &wn);
+    if (wn > 32) { r = irx_new(x, IV_OTHER, n, NULL, 0); break; }
+    for (int i = 0; i < wn; i++) ops[no++] = irx_body(x, nt_ref(nt, w[i], "statements"));
+    int els = nt_ref(nt, n, "else_clause");
+    if (els >= 0) ops[no++] = irx_value(x, els);
+    /* no arm matched: a `case` gives nil, a `case ... in` raises */
+    else if (k == NK_CaseNode) ops[no++] = irx_new(x, IV_CONST, -1, NULL, 0);
+    r = irx_new(x, IV_JOIN, n, ops, no);
+    break;
+  }
+  case NK_AndNode: case NK_OrNode:
+    ops[no++] = irx_value(x, nt_ref(nt, n, "left"));
+    ops[no++] = irx_value(x, nt_ref(nt, n, "right"));
+    r = irx_new(x, k == NK_AndNode ? IV_AND : IV_OR, n, ops, no);
+    break;
+  case NK_RescueModifierNode:
+    ops[no++] = irx_value(x, nt_ref(nt, n, "expression"));
+    ops[no++] = irx_value(x, nt_ref(nt, n, "rescue_expression"));
+    r = irx_new(x, IV_JOIN, n, ops, no);
+    break;
+  case NK_CallNode: {
+    int rc = nt_ref(nt, n, "receiver"), args = nt_ref(nt, n, "arguments"), blk = nt_ref(nt, n, "block");
+    int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+    if (an > 32) { r = irx_new(x, IV_OTHER, n, NULL, 0); break; }
+    int fl = (blk >= 0 ? SF_BLOCK : 0) | (nt_safe_nav(nt, n) ? SF_SAFE : 0);
+    ops[no++] = rc >= 0 ? irx_value(x, rc) : -1;
+    for (int i = 0; i < an; i++) {
+      NodeKind ak = nt_kind(nt, av[i]);
+      if (ak == NK_SplatNode || ak == NK_KeywordHashNode || ak == NK_BlockArgumentNode ||
+          ak == NK_ForwardingArgumentsNode) fl |= SF_ODD;
+      ops[no++] = irx_value(x, av[i]);
+    }
+    r = irx_new(x, IV_SEND, n, ops, no);
+    x->ir->v[r].evk = fl;
+    break;
+  }
+  default:
+    r = irx_new(x, IV_OTHER, n, NULL, 0);
+    break;
+  }
+  x->depth--;
+  return r;
+}
+/* what DEF d stores */
+static void irx_def(IrX *x, int d) {
+  if (d < 0 || d >= x->nbase || x->built[d]) return;
+  x->built[d] = 1;
+  Ir *ir = x->ir;
+  const NodeTable *nt = x->nt;
+  int node = ir->v[d].node, evk = ir->v[d].evk;
+  if (node < 0) return;
+  int so = x->owner, sb = x->block;
+  x->owner = d; x->block = ir->v[d].block;
+  NodeKind nk = nt_kind(nt, node);
+  int a = -1, ops[2];
+  if (evk == EV_WRITE) a = irx_value(x, nt_ref(nt, node, "value"));
+  else if (evk == EV_OPWRITE) {          /* `x += v`: x's value before, then v */
+    ops[0] = node < x->cap ? x->rd[node] : -1;
+    ops[1] = irx_value(x, nt_ref(nt, node, "value"));
+    a = irx_new(x, IV_SEND, node, ops, 2);
+  } else if (evk == EV_ANDWRITE) {       /* `x &&= v` */
+    ops[0] = ir->v[d].src;
+    ops[1] = irx_value(x, nt_ref(nt, node, "value"));
+    a = irx_new(x, IV_AND, node, ops, 2);
+  } else if (evk == EV_WRITE_UNK && nk == NK_LocalVariableOrWriteNode) {   /* `x ||= v` */
+    ops[0] = node < x->cap ? x->rd[node] : -1;
+    ops[1] = irx_value(x, nt_ref(nt, node, "value"));
+    a = irx_new(x, IV_OR, node, ops, 2);
+  } else if (evk == EV_WRITE_UNK && nk == NK_LocalVariableTargetNode) {
+    for (int i = 0; i < x->nresc; i++) if (x->resc[i] == node) { a = irx_new(x, IV_RESCUED, node, NULL, 0); break; }
+  }
+  ir->v[d].arg = a;
+  x->owner = so; x->block = sb;
+}
+/* the values of what each write of a reached block stores; rd and wd map
+   a node to the value its read sees and to the DEF its write makes */
+static void ir_add_exprs(Ir *ir, const NodeTable *nt, const int *rd, const int *wd, int cap,
+                         const int *resc, int nresc) {
+  IrX x; memset(&x, 0, sizeof x);
+  x.ir = ir; x.nt = nt; x.rd = rd; x.wd = wd; x.cap = cap; x.resc = resc; x.nresc = nresc;
+  x.owner = -1; x.nbase = ir->nv;
+  x.built = ir_xalloc((size_t)ir->nv + 1);
+  for (int d = 0; d < x.nbase; d++)
+    if (ir->v[d].kind == IV_DEF && ir->reached[ir->v[d].block]) irx_def(&x, d);
+  free(x.built);
+}
+
+/* The method names the program defines (its prelude aside): any of them
+   (a call on self can reach one), and those on the class of a builtin kind
+   (a reopen of Integer or String can change what its `+` gives). A rule
+   for a name the program defines does not apply. */
+typedef struct { char **all; int nall; char **core; int ncore; } IrNames;
+static IrNames g_ir_names;
+static int ir_names_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static int ir_names_has(char **l, int n, const char *m) {
+  return n > 0 && m && bsearch(&m, l, (size_t)n, sizeof(char *), ir_names_cmp) != NULL;
+}
+static void ir_names_build(Compiler *c) {
+  IrNames *R = &g_ir_names;
+  R->all = malloc(sizeof(char *) * ((size_t)c->nscopes + 1));
+  R->core = malloc(sizeof(char *) * ((size_t)c->nscopes + 1));
+  if (!R->all || !R->core) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  R->nall = R->ncore = 0;
+  for (int si = 0; si < c->nscopes; si++) {
+    Scope *s = &c->scopes[si];
+    if (s->def_node < 0 || !s->name || nt_kind(c->nt, s->def_node) != NK_DefNode) continue;
+    if (nt_int(c->nt, s->def_node, "node_bi", 0)) continue;
+    R->all[R->nall++] = s->name;
+    if (s->class_id >= 0 && s->class_id < c->nclasses && is_builtin_reopen(c->classes[s->class_id].name))
+      R->core[R->ncore++] = s->name;
+  }
+  qsort(R->all, (size_t)R->nall, sizeof(char *), ir_names_cmp);
+  qsort(R->core, (size_t)R->ncore, sizeof(char *), ir_names_cmp);
+}
+static void ir_names_free(void) {
+  free(g_ir_names.all); free(g_ir_names.core);
+  memset(&g_ir_names, 0, sizeof g_ir_names);
+}
+
+static int ir_m_in(const char *m, const char *const *l) {
+  for (; *l; l++) if (sp_streq(m, *l)) return 1;
+  return 0;
+}
+static const char *const RM_TEST[] = { "==", "!=", "<", ">", "<=", ">=", "===", "eql?", "equal?",
+  "between?", "nil?", "zero?", "positive?", "negative?", "even?", "odd?", "integer?", "finite?", "nan?",
+  "is_a?", "kind_of?", "instance_of?", "frozen?", "empty?", "include?", "start_with?", "end_with?",
+  "key?", "has_key?", "member?", "value?", "has_value?", "any?", "all?", "none?", "ascii_only?",
+  "match?", "!", NULL };
+static const char *const RM_SAME[] = { "dup", "clone", "itself", "freeze", NULL };
+static const char *const RM_NUM_OP[] = { "+", "-", "*", "/", "%", "modulo", NULL };
+static const char *const RM_INT_BITS[] = { "&", "|", "^", "<<", ">>", "gcd", "lcm", NULL };
+static const char *const RM_INT_INT[] = { "-@", "+@", "~", "abs", "magnitude", "succ", "next", "pred",
+  "ord", "floor", "ceil", "round", "truncate", "to_i", "to_int", "bit_length", "size", "hash", NULL };
+static const char *const RM_FLT_INT[] = { "floor", "ceil", "round", "truncate", "to_i", "to_int", "hash", NULL };
+static const char *const RM_STR_STR[] = { "upcase", "downcase", "capitalize", "swapcase", "strip",
+  "lstrip", "rstrip", "chomp", "chop", "chr", "reverse", "squeeze", "succ", "next", "to_s", "to_str",
+  "inspect", "dump", "center", "ljust", "rjust", "tr", "tr_s", "delete", "sub", "encode",
+  "force_encoding", "unicode_normalize", "scrub", "b", "+@", "-@", "dedup", "%", "<<", "concat",
+  "prepend", "insert", "replace", NULL };
+static const char *const RM_STR_BANG[] = { "upcase!", "downcase!", "capitalize!", "swapcase!", "strip!",
+  "lstrip!", "rstrip!", "chomp!", "chop!", "squeeze!", "sub!", "gsub!", "tr!", "delete!", "[]",
+  "slice", "byteslice", NULL };
+static const char *const RM_STR_INT[] = { "size", "length", "bytesize", "count", "ord", "hex", "oct",
+  "to_i", "hash", "sum", NULL };
+static const char *const RM_STR_ARR[] = { "split", "chars", "bytes", "lines", "codepoints", "scan",
+  "partition", "rpartition", "unpack", NULL };
+static const char *const RM_NIL_RAISE[] = { "+", "-", "*", "/", "%", "**", "<", ">", "<=", ">=",
+  "<<", ">>", "[]", "size", "length", NULL };
+static const char *const RM_ARR_ARR[] = { "to_a", "entries", "compact", "flatten", "uniq", "sort",
+  "reverse", "rotate", "shuffle", "push", "append", "<<", "concat", "unshift", "prepend", "insert",
+  "fill", "clear", "replace", "drop", "take", "zip", "product", "transpose", "values_at", NULL };
+
+/* the kinds the numeric operator m gives on an Integer (or a Float,
+   flt) receiver: per kind of its argument, an Integer, a Float, a raise
+   (TypeError), or any value (an object can coerce) */
+static unsigned short ir_num_op(int flt, int bits, unsigned short a) {
+  unsigned short r = 0;
+  if (a & KN_INTS) r |= flt ? KN_FLOAT : (KN_INT | (a & KN_BIG));
+  if (a & KN_FLOAT) r |= bits && !flt ? 0 : KN_FLOAT;
+  if (a & (KN_OBJ | KN_OTHER | KN_UNK)) r |= KN_ALL | KN_UNK;
+  return r;
+}
+/* what method m gives on a receiver of the one kind bit, with these
+   arguments; KN_UNK when no rule says */
+static unsigned short ir_rule(int bit, const char *m, int na, const Kd *ak) {
+  const unsigned short any = KN_ALL | KN_UNK;
+  unsigned short a0 = na > 0 ? ak[0].k : 0;
+  if (sp_streq(m, "to_s") || sp_streq(m, "inspect")) return bit & (KN_OBJ | KN_OTHER) ? any : KN_STR;
+  if (ir_m_in(m, RM_SAME)) return bit & (KN_OBJ | KN_OTHER) ? any : (unsigned short)bit;
+  if (bit & (KN_OBJ | KN_OTHER)) return any;
+  if (ir_m_in(m, RM_TEST)) return KN_BOOL;
+  if (sp_streq(m, "<=>")) return KN_INT | KN_NIL;
+  switch (bit) {
+  case KN_INT: case KN_BIG:
+    if (na == 1 && (ir_m_in(m, RM_NUM_OP) || ir_m_in(m, RM_INT_BITS))) {
+      unsigned short k = ir_num_op(0, !ir_m_in(m, RM_NUM_OP), a0);
+      return k & KN_INT ? (unsigned short)(k | (bit & KN_BIG)) : k;
+    }
+    if (na == 0 && ir_m_in(m, RM_INT_INT)) return KN_INT | (bit & KN_BIG);
+    if ((na == 0 && sp_streq(m, "to_f")) || (na == 1 && sp_streq(m, "fdiv"))) return KN_FLOAT;
+    if (na == 0 && sp_streq(m, "chr")) return KN_STR;
+    if (na == 0 && (sp_streq(m, "digits") || sp_streq(m, "divmod"))) return KN_ARR;
+    if (na == 1 && sp_streq(m, "divmod")) return KN_ARR;
+    if (na == 0 && (sp_streq(m, "to_r") || sp_streq(m, "rationalize") || sp_streq(m, "to_c"))) return KN_OTHER;
+    return any;
+  case KN_FLOAT:
+    if (na == 1 && (ir_m_in(m, RM_NUM_OP) || sp_streq(m, "quo") || sp_streq(m, "fdiv"))) return ir_num_op(1, 0, a0);
+    if (na == 0 && (sp_streq(m, "-@") || sp_streq(m, "+@") || sp_streq(m, "abs") || sp_streq(m, "magnitude") ||
+                    sp_streq(m, "to_f"))) return KN_FLOAT;
+    if (na == 0 && ir_m_in(m, RM_FLT_INT)) return KN_INT;
+    if (na == 1 && sp_streq(m, "divmod")) return KN_ARR;
+    if (na == 0 && (sp_streq(m, "to_r") || sp_streq(m, "rationalize"))) return KN_OTHER;
+    return any;
+  case KN_STR:
+    if (na == 1 && sp_streq(m, "+"))
+      return (a0 & KN_STR ? KN_STR : 0) | (a0 & (KN_OBJ | KN_OTHER | KN_UNK) ? any : 0);
+    if (na == 1 && sp_streq(m, "*"))
+      return (a0 & (KN_INTS | KN_FLOAT) ? KN_STR : 0) | (a0 & (KN_OBJ | KN_OTHER | KN_UNK) ? any : 0);
+    if (ir_m_in(m, RM_STR_STR)) return KN_STR;
+    if (sp_streq(m, "gsub")) return na >= 2 ? KN_STR : na == 1 ? KN_OTHER : any;
+    if (ir_m_in(m, RM_STR_BANG)) return KN_STR | KN_NIL;
+    if (ir_m_in(m, RM_STR_INT)) return KN_INT;
+    if (sp_streq(m, "index") || sp_streq(m, "rindex") || sp_streq(m, "byteindex") || sp_streq(m, "=~") ||
+        sp_streq(m, "casecmp")) return KN_INT | KN_NIL;
+    if (na == 0 && sp_streq(m, "to_f")) return KN_FLOAT;
+    if (na == 0 && (sp_streq(m, "to_sym") || sp_streq(m, "intern"))) return KN_SYM;
+    if (na == 0 && (sp_streq(m, "to_r") || sp_streq(m, "to_c"))) return KN_OTHER;
+    if (ir_m_in(m, RM_STR_ARR)) return KN_ARR;
+    return any;
+  case KN_SYM:
+    if (na == 0 && (sp_streq(m, "id2name") || sp_streq(m, "name"))) return KN_STR;
+    if (na == 0 && (sp_streq(m, "to_sym") || sp_streq(m, "upcase") || sp_streq(m, "downcase") ||
+                    sp_streq(m, "capitalize") || sp_streq(m, "swapcase") || sp_streq(m, "succ") ||
+                    sp_streq(m, "next"))) return KN_SYM;
+    if (na == 0 && (sp_streq(m, "size") || sp_streq(m, "length"))) return KN_INT;
+    if (sp_streq(m, "[]")) return KN_STR | KN_NIL;
+    if (na == 0 && sp_streq(m, "to_proc")) return KN_OTHER;
+    return any;
+  case KN_NIL: case KN_TRUE: case KN_FALSE:
+    if (ir_m_in(m, RM_NIL_RAISE)) return 0;   /* NoMethodError */
+    if (sp_streq(m, "&") || sp_streq(m, "|") || sp_streq(m, "^")) return KN_BOOL;
+    if (bit != KN_NIL || na != 0) return any;
+    if (sp_streq(m, "to_a")) return KN_ARR;
+    if (sp_streq(m, "to_h")) return KN_HASH;
+    if (sp_streq(m, "to_i")) return KN_INT;
+    if (sp_streq(m, "to_f")) return KN_FLOAT;
+    if (sp_streq(m, "to_r")) return KN_OTHER;
+    return any;
+  case KN_ARR:
+    if (na == 0 && (sp_streq(m, "size") || sp_streq(m, "length") || sp_streq(m, "count"))) return KN_INT;
+    if (sp_streq(m, "index") || sp_streq(m, "find_index") || sp_streq(m, "rindex")) return KN_INT | KN_NIL;
+    if (sp_streq(m, "join") || sp_streq(m, "pack")) return KN_STR;
+    if (na == 1 && sp_streq(m, "*"))
+      return (a0 & KN_STR ? KN_STR : 0) | (a0 & (KN_INTS | KN_FLOAT) ? KN_ARR : 0) |
+             (a0 & (KN_OBJ | KN_OTHER | KN_UNK) ? any : 0);
+    if (na == 1 && (sp_streq(m, "+") || sp_streq(m, "-") || sp_streq(m, "&") || sp_streq(m, "|")))
+      return (a0 & KN_ARR ? KN_ARR : 0) | (a0 & (KN_OBJ | KN_OTHER | KN_UNK) ? any : 0);
+    if (ir_m_in(m, RM_ARR_ARR)) return KN_ARR;
+    if (na == 1 && (sp_streq(m, "first") || sp_streq(m, "last") || sp_streq(m, "sample") ||
+                    sp_streq(m, "min") || sp_streq(m, "max"))) return KN_ARR;
+    if (na == 0 && (sp_streq(m, "to_h") || sp_streq(m, "tally"))) return KN_HASH;
+    return any;
+  case KN_HASH:
+    if (na == 0 && (sp_streq(m, "size") || sp_streq(m, "length") || sp_streq(m, "count"))) return KN_INT;
+    if (na == 0 && (sp_streq(m, "keys") || sp_streq(m, "values") || sp_streq(m, "to_a"))) return KN_ARR;
+    if ((na == 0 && (sp_streq(m, "to_h") || sp_streq(m, "invert") || sp_streq(m, "compact"))) ||
+        (na == 1 && sp_streq(m, "merge"))) return KN_HASH;
+    return any;
+  }
+  return any;
+}
+/* the kinds `K.new` (and a few calls on a class) give, by the class's
+   name: a class of the program's whose superclasses are all its own makes
+   an object of that class */
+static Kd ir_class_call_kinds(Compiler *c, const char *cn, const char *m) {
+  Kd any = { KN_ALL | KN_UNK, -2 }, r = { 0, -1 };
+  if (!cn || !m) return any;
+  if (sp_streq(m, "new")) {
+    if (sp_streq(cn, "Array")) { r.k = KN_ARR; return r; }
+    if (sp_streq(cn, "Hash")) { r.k = KN_HASH; return r; }
+    if (sp_streq(cn, "String")) { r.k = KN_STR; return r; }
+    if (is_builtin_exception_name(cn) || sp_streq(cn, "Struct") || sp_streq(cn, "Proc") ||
+        sp_streq(cn, "Range") || sp_streq(cn, "Set") || sp_streq(cn, "Time")) { r.k = KN_OTHER; return r; }
+    int ci = comp_class_index(c, cn);
+    if (ci < 0 || comp_cmethod_in_chain(c, ci, "new", NULL) >= 0) return any;   /* a `def self.new` */
+    for (int k = ci, d = 0; k >= 0 && d < 64; d++) {
+      if (k >= c->nclasses || is_builtin_reopen(c->classes[k].name) || c->classes[k].is_struct) return any;
+      int dn = c->classes[k].def_node;
+      if (dn < 0 || nt_kind(c->nt, dn) != NK_ClassNode) return any;
+      int sup = nt_ref(c->nt, dn, "superclass");
+      if (sup < 0) { r.k = KN_OBJ; r.cid = ci; return r; }
+      if (nt_kind(c->nt, sup) != NK_ConstantReadNode) return any;
+      k = comp_class_index(c, nt_str(c->nt, sup, "name"));
+    }
+    return any;
+  }
+  return any;
+}
+/* the kinds a receiver-less call gives: Kernel's conversions and a few
+   others, when the program defines no method of that name */
+static unsigned short ir_self_rule(const char *m, int na) {
+  const unsigned short any = KN_ALL | KN_UNK;
+  if (ir_names_has(g_ir_names.all, g_ir_names.nall, m)) return any;
+  if (na == 1 && sp_streq(m, "Integer")) return KN_INT;
+  if (na == 1 && sp_streq(m, "Float")) return KN_FLOAT;
+  if (na == 1 && sp_streq(m, "String")) return KN_STR;
+  if (na == 1 && sp_streq(m, "Array")) return KN_ARR;
+  if (sp_streq(m, "Rational") || sp_streq(m, "Complex")) return KN_OTHER;
+  if (na >= 1 && (sp_streq(m, "format") || sp_streq(m, "sprintf"))) return KN_STR;
+  if (sp_streq(m, "puts") || sp_streq(m, "print")) return KN_NIL;
+  if (sp_streq(m, "raise") || sp_streq(m, "fail")) return 0;
+  if (sp_streq(m, "block_given?")) return KN_BOOL;
+  return any;
+}
+/* the kinds of SEND value v, from its operands' kinds */
+static Kd ir_send_kinds(Compiler *c, const NodeTable *nt, Ir *ir, const Kd *K, int v) {
+  Kd any = { KN_ALL | KN_UNK, -2 }, r = { 0, -1 };
+  IrVal *x = &ir->v[v];
+  int node = x->node;
+  const char *m = nt_kind(nt, node) == NK_CallNode ? nt_str(nt, node, "name") : nt_str(nt, node, "binary_operator");
+  if (!m) return any;
+  int fl = nt_kind(nt, node) == NK_CallNode ? x->evk : 0;
+  int rv = x->op0 >= 0 ? ir->ops[x->op0] : -1;
+  int na = x->nop - 1;
+  Kd ak[40];
+  for (int i = 0; i < na && i < 40; i++) {
+    int o = ir->ops[x->op0 + 1 + i];
+    if (o < 0) return any;
+    ak[i] = K[o];
+    if (!ak[i].k) return r;              /* an argument with no value yet */
+  }
+  if (rv < 0 && nt_kind(nt, node) != NK_CallNode) return any;
+  if (rv < 0) {                            /* a call on self */
+    if (fl & (SF_ODD | SF_BLOCK)) {
+      if ((fl & SF_BLOCK) && (sp_streq(m, "lambda") || sp_streq(m, "proc")) &&
+          !ir_names_has(g_ir_names.all, g_ir_names.nall, m)) { r.k = KN_OTHER; return r; }
+      return any;
+    }
+    r.k = ir_self_rule(m, na);
+    if (r.k & KN_UNK) r.cid = -2;
+    return r;
+  }
+  if (fl & (SF_ODD | SF_BLOCK)) return any;
+  if (ir_names_has(g_ir_names.core, g_ir_names.ncore, m)) return any;
+  if (ir->v[rv].kind == IV_OTHER && ir->v[rv].node >= 0 && nt_kind(nt, ir->v[rv].node) == NK_ConstantReadNode)
+    return ir_class_call_kinds(c, nt_str(nt, ir->v[rv].node, "name"), m);
+  Kd rk = K[rv];
+  if (!rk.k) return r;                     /* the receiver has no value yet */
+  if (rk.k & KN_UNK) return any;
+  unsigned short rb = rk.k;
+  if (fl & SF_SAFE) { r.k |= rb & KN_NIL; rb &= (unsigned short)~KN_NIL; }   /* `a&.m` on nil is nil */
+  for (int b = 0; b < 12; b++) {
+    if (!(rb & (1 << b))) continue;
+    unsigned short k = ir_rule(1 << b, m, na, ak);
+    if (k & KN_UNK) return any;
+    r.k |= k;
+  }
+  return r;
+}
+/* the kinds of a literal */
+static unsigned short ir_const_kinds(const NodeTable *nt, int node) {
+  if (node < 0) return KN_NIL;
+  switch (nt_kind(nt, node)) {
+  case NK_IntegerNode: return nt_str(nt, node, "bigval") ? KN_BIG : KN_INT;
+  case NK_FloatNode: return KN_FLOAT;
+  case NK_StringNode: case NK_InterpolatedStringNode: case NK_XStringNode: case NK_InterpolatedXStringNode:
+  case NK_SourceFileNode: return KN_STR;
+  case NK_SymbolNode: case NK_InterpolatedSymbolNode: return KN_SYM;
+  case NK_NilNode: return KN_NIL;
+  case NK_TrueNode: return KN_TRUE;
+  case NK_FalseNode: return KN_FALSE;
+  case NK_ArrayNode: return KN_ARR;
+  case NK_HashNode: return KN_HASH;
+  case NK_SourceLineNode: return KN_INT;
+  case NK_DefinedNode: return KN_STR | KN_NIL;
+  default: return KN_OTHER;   /* a Range, a Regexp, a Rational, a lambda */
+  }
+}
+/* The kinds of every value of an IR that has its expression values:
+   from the literals, the rules and the parameters (any value) alone. */
+static Kd *ir_own_kinds(CfgB *g, Ir *ir, const char *is_param) {
+  int nv = ir->nv;
+  const NodeTable *nt = g->nt;
+  Kd *K = malloc(sizeof(Kd) * ((size_t)nv + 1));
+  if (!K) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  Kd any = { KN_ALL | KN_UNK, -2 }, nil = { KN_NIL, -1 }, none = { 0, -1 };
+  for (int x = 0; x < nv; x++) {
+    IrVal *v = &ir->v[x];
+    K[x] = none;
+    if (v->kind == IV_ENTRY) K[x] = is_param[v->local] ? any : nil;
+    else if (v->kind == IV_CONST) K[x].k = ir_const_kinds(nt, v->node);
+    else if (v->kind == IV_RESCUED) { K[x].k = KN_OTHER | KN_OBJ; K[x].cid = -2; }
+    else if (v->kind == IV_OTHER) {
+      NodeKind nk = v->node >= 0 ? nt_kind(nt, v->node) : NK_NilNode;
+      /* a jump gives no value where it is */
+      if (!(nk == NK_ReturnNode || nk == NK_BreakNode || nk == NK_NextNode || nk == NK_RedoNode || nk == NK_RetryNode))
+        K[x] = any;
+    } else if (v->kind == IV_DEF && v->arg < 0) K[x] = any;
+  }
+  for (int changed = 1, round = 0; changed && round < 1000; round++) {
+    changed = 0;
+    for (int x = 0; x < nv; x++) {
+      IrVal *v = &ir->v[x];
+      Kd r = none;
+      switch (v->kind) {
+      case IV_DEF:
+        if (v->arg < 0) continue;
+        r = K[v->arg];
+        break;
+      case IV_PI:
+        if (v->src < 0) continue;
+        r = kd_refine(K[v->src], &g->pis[v->evk]);
+        break;
+      case IV_PHI:
+        if (v->repl >= 0) continue;
+        /* fallthrough */
+      case IV_JOIN:
+        for (int q = 0; q < v->nop; q++) { int o = ir->ops[v->op0 + q]; if (o >= 0) r = kd_meet(r, K[o]); }
+        break;
+      case IV_AND: case IV_OR: {
+        int a = ir->ops[v->op0], b = ir->ops[v->op0 + 1];
+        Kd ka = a >= 0 ? K[a] : any, kb = b >= 0 ? K[b] : any;
+        /* `a && b`: a when it is nil or false, else b; `a || b` the other way */
+        unsigned short keep = v->kind == IV_AND ? (KN_NIL | KN_FALSE) : (unsigned short)~(KN_NIL | KN_FALSE);
+        Kd kl = ka; kl.k = (unsigned short)(ka.k & (keep | KN_UNK));
+        if (!(kl.k & KN_OBJ)) kl.cid = -1;
+        r = kl;
+        if (ka.k & ~keep & ~KN_UNK) r = kd_meet(r, kb);
+        else if (ka.k & KN_UNK) r = kd_meet(r, kb);
+        break;
+      }
+      case IV_SEND:
+        r = ir_send_kinds(g->c, nt, ir, K, x);
+        break;
+      default:
+        continue;
+      }
+      if (r.k != K[x].k || r.cid != K[x].cid) { K[x] = r; changed = 1; }
+    }
+  }
+  return K;
 }
 
 /* (analyze.c) the is_a? guard walk's class rule and its Array rule */
@@ -1940,6 +2537,7 @@ typedef struct {
   int method_bad;
   int *nodes, *node_name, nnodes, cnodes;   /* every local node of the body */
   int *pw, *pr, np, cp;   /* a write and a read of the same local in its value */
+  int *resc, nresc, cresc;   /* the targets rescue arms bind (`rescue => e`) */
 } SsaNames;
 
 static int ssa_name_add(SsaNames *t, const char *nm) {
@@ -2103,6 +2701,14 @@ static void ssa_collect_in(Compiler *c, Scope *s, int n, SsaNames *t, int in_clo
       cfg_block_on_graph(c, n, 0))
     gblk = nt_ref(nt, n, "block");
   if (k == NK_DefinedNode || k == NK_MatchWriteNode) opaque = 1;
+  if (k == NK_RescueNode && nt_ref(nt, n, "reference") >= 0) {
+    if (t->nresc >= t->cresc) {
+      t->cresc = t->cresc ? t->cresc * 2 : 8;
+      t->resc = realloc(t->resc, sizeof(int) * (size_t)t->cresc);
+      if (!t->resc) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    t->resc[t->nresc++] = nt_ref(nt, n, "reference");
+  }
   if (k == NK_ForwardingSuperNode) t->method_bad = 1;   /* passes the parameters by name */
   if (k == NK_CallNode && ssa_frame_name(nt_str(nt, n, "name"))) t->method_bad = 1;
   if (k == NK_SymbolNode && ssa_frame_name(nt_str(nt, n, "value"))) t->method_bad = 1;
@@ -2154,7 +2760,13 @@ static int *g_ssa_rd;      /* per node: a definition its read sees, or -1 */
 static int *g_ssa_wd;      /* per node: the definition its write makes, or -1 */
 static int g_ssa_rd_cap;
 static char *g_ssa_seen;   /* per node: the graph keeps an event for it */
-static int st_ssa_methods, st_ssa_split, st_ssa_renamed, st_ssa_phis;
+static int st_ssa_methods, st_ssa_split, st_ssa_renamed, st_ssa_phis, st_ssa_ir_whole;
+/* SP_IR_TYPES_OFF: the SSA rename decides without the IR's own types */
+static int ir_types_off(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("SP_IR_TYPES_OFF") != NULL;
+  return v;
+}
 
 /* Each split made, so ssa_check_splits can read the types its slots got.
    A split is kept only when every slot of it is a plain value (Integer,
@@ -2162,7 +2774,7 @@ static int st_ssa_methods, st_ssa_split, st_ssa_renamed, st_ssa_phis;
    Spinel's typed containers can refuse an element a poly slot took, so a
    split that types one is undone: the compile runs again with that local
    left whole (SP_SSA_VETO). */
-typedef struct { int scope; char *key; char **names; int nnames; } SsaSplit;
+typedef struct { int scope; char *key; char **names; int nnames; int entry_nil; } SsaSplit;
 static SsaSplit *g_ssa_splits;
 static int g_nssa_splits, g_cssa_splits;
 char **g_sp_argv;   /* main's argv, to run the compile again */
@@ -2188,6 +2800,106 @@ static int ssa_vetoed(const char *key) {
 static int ssa_line(Compiler *c, int node) {
   return node >= 0 ? (int)nt_int(c->nt, node, "node_line", 0) : 0;
 }
+/* marks the names of t that a def's parameters bind */
+static void ssa_param_names(const NodeTable *nt, int n, SsaNames *t, char *is_param, int depth) {
+  if (n < 0 || depth > 64) return;
+  const char *ty = nt_type(nt, n);
+  if (ty && strstr(ty, "ParameterNode")) {
+    const char *nm = nt_str(nt, n, "name");
+    if (nm) for (int i = 0; i < t->n; i++) if (sp_streq(t->nm[i], nm)) is_param[i] = 1;
+  }
+  for (int i = 0; i < nt_num_refs(nt, n); i++) ssa_param_names(nt, nt_ref_at(nt, n, i), t, is_param, depth + 1);
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int q = 0; q < an; q++) ssa_param_names(nt, av[q], t, is_param, depth + 1);
+  }
+}
+
+/* The kinds of value each slot holds by the IR's own types, kept until
+   the types are known (ir_types_report compares them, SP_IR_TYPES) */
+typedef struct { int scope; char *name; Kd k; int unk, ndef, param; } IrSlot;
+static IrSlot *g_ir_slots;
+static int g_nir_slots, g_cir_slots;
+static void ir_slot_note(int scope, const char *name, Kd k, int known, int param) {
+  static int on = -1;
+  if (on < 0) on = getenv("SP_IR_TYPES") != NULL;
+  if (!on) return;
+  IrSlot *sl = NULL;
+  for (int i = g_nir_slots - 1; i >= 0 && g_ir_slots[i].scope == scope; i--)
+    if (sp_streq(g_ir_slots[i].name, name)) { sl = &g_ir_slots[i]; break; }
+  if (!sl) {
+    if (g_nir_slots >= g_cir_slots) {
+      g_cir_slots = g_cir_slots ? g_cir_slots * 2 : 64;
+      g_ir_slots = realloc(g_ir_slots, sizeof(IrSlot) * (size_t)g_cir_slots);
+      if (!g_ir_slots) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    sl = &g_ir_slots[g_nir_slots++];
+    sl->scope = scope; sl->name = strdup(name); sl->k.k = 0; sl->k.cid = -1; sl->unk = 0; sl->ndef = 0; sl->param = 0;
+    if (!sl->name) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  sl->ndef++;
+  if (param) sl->param = 1;
+  if (!known) { sl->unk = 1; return; }
+  sl->k = kd_meet(sl->k, k);
+}
+
+/* The plain kinds of value one slot of Spinel's can hold. Two of them in
+   one slot make it poly (an Integer and a String); nil joins an Integer, a
+   Float or a String in their slots, not true/false or a Symbol. */
+enum { CAT_BOOL = 1, CAT_INT = 2, CAT_FLOAT = 4, CAT_STR = 8, CAT_SYM = 16 };
+static int kd_cats(unsigned short k) {
+  return (k & KN_BOOL ? CAT_BOOL : 0) | (k & KN_INTS ? CAT_INT : 0) | (k & KN_FLOAT ? CAT_FLOAT : 0) |
+         (k & KN_STR ? CAT_STR : 0) | (k & KN_SYM ? CAT_SYM : 0);
+}
+static int cat_count(int c) { int n = 0; for (; c; c &= c - 1) n++; return n; }
+static const char *cat_names(int c, char *buf, size_t cap) {
+  static const char *const nm[] = { "true/false", "Integer", "Float", "String", "Symbol" };
+  buf[0] = 0;
+  for (int b = 0; b < 5; b++) if (c & (1 << b)) {
+    size_t l = strlen(buf);
+    snprintf(buf + l, cap - l, "%s%s", l ? " and " : "", nm[b]);
+  }
+  return buf;
+}
+/* Why the IR's own types show that splitting local li gives a slot that
+   is not a plain value (ssa_check_splits would undo the split after
+   typing), or NULL: a web where a write stores an Array, a Hash, an
+   object or another boxed value, or where two plain kinds meet that no
+   one slot holds. Writes the IR has no kind for prove nothing. */
+static const char *ssa_ir_boxed(Ir *ir, const Kd *K, int *uf, const int *dl, const int *dl_off, int li,
+                                int param, char *why, size_t cap) {
+  int entry_web = ssa_find(uf, li);
+  for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+    int r = ssa_find(uf, dl[q]), seen = 0;
+    for (int q2 = dl_off[li]; q2 < q; q2++) if (ssa_find(uf, dl[q2]) == r) { seen = 1; break; }
+    if (seen) continue;
+    int cats = 0, nil = 0;
+    for (int q2 = q; q2 < dl_off[li + 1]; q2++) {
+      int d = dl[q2];
+      if (ssa_find(uf, d) != r || ir->v[d].kind != IV_DEF || !ir->reached[ir->v[d].block]) continue;
+      unsigned short k = K[d].k;
+      if (!k || (k & KN_UNK)) continue;
+      if (k & KN_BOXY) {
+        snprintf(why, cap, "a write stores %s", k & KN_ARR ? "an Array" : k & KN_HASH ? "a Hash" :
+                 k & KN_OBJ ? "an object" : "a boxed value (a Range, a Rational, an exception)");
+        return why;
+      }
+      cats |= kd_cats(k);
+      if (k & KN_NIL) nil = 1;
+    }
+    char b[96];
+    if (cat_count(cats) >= 2) { snprintf(why, cap, "one slot gets %s", cat_names(cats, b, sizeof b)); return why; }
+    if (nil && (cats == CAT_BOOL || cats == CAT_SYM)) { snprintf(why, cap, "one slot gets nil and %s", cat_names(cats, b, sizeof b)); return why; }
+    /* a true/false slot has no nil: a read before the first write (`x =
+       true if c; p x`) would see false */
+    if (r == entry_web && !param && ir->v[li].live && cats == CAT_BOOL) {
+      snprintf(why, cap, "a true/false slot that a read can see before its first write");
+      return why;
+    }
+  }
+  return NULL;
+}
+
 static void ssa_method(Compiler *c, Scope *s) {
   const NodeTable *nt = c->nt;
   int body = s->body >= 0 ? s->body : nt_ref(nt, s->def_node, "body");
@@ -2196,7 +2908,7 @@ static void ssa_method(Compiler *c, Scope *s) {
   ssa_collect(c, s, body, &t, 0, 0, 0);
   if (t.method_bad || t.n == 0) {
     for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
-    free(t.nm); free(t.bad); free(t.nodes); free(t.node_name); free(t.pw); free(t.pr);
+    free(t.nm); free(t.bad); free(t.nodes); free(t.node_name); free(t.pw); free(t.pr); free(t.resc);
     return;
   }
   /* a parameter's entry definition is the argument, any other's is nil:
@@ -2228,6 +2940,9 @@ static void ssa_method(Compiler *c, Scope *s) {
   Ir ir; memset(&ir, 0, sizeof ir);
   int *uf = NULL, *dl_off = NULL, *dl = NULL;
   char *has_read = NULL;
+  Kd *K = NULL;
+  char *is_param = ir_xalloc((size_t)nn + 1);
+  ssa_param_names(nt, nt_ref(nt, s->def_node, "parameters"), &t, is_param, 0);
   int nvals = 0;
   { /* a huge method is left as it is (the bound the reaching definitions
        had: a bit per write, per block) */
@@ -2274,6 +2989,13 @@ static void ssa_method(Compiler *c, Scope *s) {
       else if (bl->ev_kind[e] != EV_PI) g_ssa_wd[node] = bl->ev_val[e];
     }
   }
+  /* the IR's own types: a value for each step of what each write stores,
+     and the kinds of every value from those alone */
+  if (!ir_types_off()) {
+    ir_add_exprs(&ir, nt, g_ssa_rd, g_ssa_wd, g_ssa_rd_cap, t.resc, t.nresc);
+    K = ir_own_kinds(&g, &ir, is_param);
+    ir_dump(c, s, &g, &ir, K, "SSA rename, before typing");
+  }
   /* `x += 1`, `x ||= v`: one node reads and writes, so one name */
   for (int b = 0; b < g.nb; b++) {
     CBlock *bl = &g.b[b];
@@ -2316,7 +3038,11 @@ static void ssa_method(Compiler *c, Scope *s) {
         for (int q2 = dl_off[li]; q2 < q; q2++) if (ssa_find(uf, dl[q2]) == r) { seen = 1; break; }
         if (!seen) roots++;
       }
-      if (roots < 2) continue;
+      if (roots < 2) {
+        if (K) for (int q = dl_off[li]; q < dl_off[li + 1]; q++)
+          if (ir.v[dl[q]].kind == IV_DEF || is_param[li]) ir_slot_note(s->idx, t.nm[li], K[dl[q]], !(K[dl[q]].k & KN_UNK), ir.v[dl[q]].kind == IV_ENTRY);
+        continue;
+      }
       /* the entry definition's web keeps the name (a parameter is that
          name); when no read sees it, the first write's web joins it */
       int r0 = ssa_find(uf, li);
@@ -2342,6 +3068,27 @@ static void ssa_method(Compiler *c, Scope *s) {
         }
         web_name[r] = nmb;
       }
+      /* The IR's own types, before typing: a split that gives a slot no
+         plain value would be undone after typing (ssa_check_splits), and
+         the compile would run again. The local stays whole now. */
+      { char why[128];
+        if (k && K && ssa_ir_boxed(&ir, K, uf, dl, dl_off, li, is_param[li], why, sizeof why)) {
+          for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+            int r = ssa_find(uf, dl[q]);
+            free(web_name[r]); web_name[r] = NULL;
+          }
+          t.bad[li] = 1;
+          st_ssa_ir_whole++;
+          if (ssa_log()) fprintf(stderr, "spinel-ssa: %s: the IR's own types: %s: one slot, before typing\n", key, why);
+          for (int q = dl_off[li]; q < dl_off[li + 1]; q++)
+            if (ir.v[dl[q]].kind == IV_DEF || is_param[li]) ir_slot_note(s->idx, t.nm[li], K[dl[q]], !(K[dl[q]].k & KN_UNK), ir.v[dl[q]].kind == IV_ENTRY);
+          continue;
+        } }
+      if (K) for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+        int d = dl[q], r = ssa_find(uf, d);
+        if (ir.v[d].kind != IV_DEF && !is_param[li]) continue;   /* (nil before the first write: Spinel's types leave it out) */
+        ir_slot_note(s->idx, keeps[r] || !web_name[r] ? t.nm[li] : web_name[r], K[d], !(K[d].k & KN_UNK), ir.v[d].kind == IV_ENTRY);
+      }
       if (!k) continue;   /* every web keeps the name */
       st_ssa_split++;
       renamed_any = 1;
@@ -2353,6 +3100,9 @@ static void ssa_method(Compiler *c, Scope *s) {
       {
         SsaSplit *sp = &g_ssa_splits[g_nssa_splits++];
         sp->scope = s->idx; sp->key = strdup(key);
+        /* the kept name's slot is nil before the first write when a read
+           can see the entry */
+        sp->entry_nil = !is_param[li] && ir.v[li].live;
         sp->names = malloc(sizeof(char *) * (size_t)(k + 2)); sp->nnames = 0;
         if (!sp->key || !sp->names) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
         sp->names[sp->nnames++] = strdup(t.nm[li]);
@@ -2433,7 +3183,8 @@ done:
   ir_free(&ir);
   free(uf); free(has_read); free(dl_off); free(dl);
   for (int i = 0; i < t.n; i++) free((char *)t.nm[i]);
-  free(t.nm); free(t.bad); free(t.nodes); free(t.node_name); free(t.pw); free(t.pr);
+  free(t.nm); free(t.bad); free(t.nodes); free(t.node_name); free(t.pw); free(t.pr); free(t.resc);
+  free(K); free(is_param);
 }
 
 int ssa_rename_locals(Compiler *c) {
@@ -2447,7 +3198,8 @@ int ssa_rename_locals(Compiler *c) {
   for (int i = 0; i <= g_ssa_rd_cap; i++) g_ssa_rd[i] = g_ssa_wd[i] = -1;
   g_ssa_seen = calloc((size_t)g_ssa_rd_cap + 1, 1);
   if (!g_ssa_seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  st_ssa_methods = st_ssa_split = st_ssa_renamed = st_ssa_phis = 0;
+  st_ssa_methods = st_ssa_split = st_ssa_renamed = st_ssa_phis = st_ssa_ir_whole = 0;
+  ir_names_build(c);
   for (int si = 0; si < c->nscopes; si++) {
     Scope *s = &c->scopes[si];
     if (s->def_node < 0 || nt_kind(nt, s->def_node) != NK_DefNode || s->cs_synth) continue;
@@ -2458,8 +3210,9 @@ int ssa_rename_locals(Compiler *c) {
   free(g_ssa_rd); g_ssa_rd = NULL; g_ssa_rd_cap = 0;
   free(g_ssa_wd); g_ssa_wd = NULL;
   free(g_ssa_seen); g_ssa_seen = NULL;
-  if (ssa_log()) fprintf(stderr, "spinel-ssa: methods=%d phis=%d locals-split=%d nodes-renamed=%d\n",
-                         st_ssa_methods, st_ssa_phis, st_ssa_split, st_ssa_renamed);
+  ir_names_free();
+  if (ssa_log()) fprintf(stderr, "spinel-ssa: methods=%d phis=%d locals-split=%d nodes-renamed=%d ir-whole=%d\n",
+                         st_ssa_methods, st_ssa_phis, st_ssa_split, st_ssa_renamed, st_ssa_ir_whole);
   return st_ssa_renamed;
 }
 
@@ -2495,7 +3248,75 @@ static char *ssa_later_nodes(Compiler *c) {
     }
   return m;
 }
+/* SP_IR_TYPES=1 prints, once the types are known, how many slots the
+   IR's own types give a kind and how many of those match the type
+   Spinel's inference gave the slot (=2: each slot that does not match) */
+static const char *ty_cat(TyKind t) {
+  if (t == TY_NIL) return "nil";
+  if (t == TY_INT || t == TY_BIGINT) return "Integer";
+  if (t == TY_FLOAT) return "Float";
+  if (t == TY_STRING || t == TY_STRBUF) return "String";
+  if (t == TY_SYMBOL) return "Symbol";
+  if (t == TY_BOOL) return "true/false";
+  if (t == TY_POLY) return "poly";
+  if (t == TY_UNKNOWN) return "unknown";
+  if (ty_is_array(t) || ty_is_obj_array(t) || t == TY_POLY_ARRAY) return "Array";
+  if (ty_is_hash(t)) return "Hash";
+  if (ty_is_object(t)) return "Object";
+  return "other";
+}
+static const char *kd_cat(Kd k) {
+  unsigned short b = k.k & (unsigned short)~KN_NIL;
+  if (k.k & KN_BOXY) {
+    if (b == KN_ARR) return "Array";
+    if (b == KN_HASH) return "Hash";
+    if (b == KN_OBJ) return "Object";
+    if (b && !(b & ~(KN_OTHER | KN_OBJ))) return "other";
+    return "poly";
+  }
+  int cats = kd_cats(k.k);
+  if (cat_count(cats) >= 2) return "poly";
+  if ((k.k & KN_NIL) && (cats == CAT_BOOL || cats == CAT_SYM)) return "poly";
+  if (!cats) return "nil";
+  if (cats == CAT_BOOL) return "true/false";
+  if (cats == CAT_INT) return "Integer";
+  if (cats == CAT_FLOAT) return "Float";
+  if (cats == CAT_STR) return "String";
+  return "Symbol";
+}
+static void ir_types_report(Compiler *c) {
+  const char *on = getenv("SP_IR_TYPES");
+  if (!on) return;
+  int slots = 0, typed = 0, agree = 0, unknown = 0, novalue = 0, boxed = 0, finer = 0, params = 0;
+  for (int i = 0; i < g_nir_slots; i++) {
+    IrSlot *sl = &g_ir_slots[i];
+    Scope *sc = sl->scope >= 0 && sl->scope < c->nscopes ? &c->scopes[sl->scope] : NULL;
+    if (!sc || !sc->reachable) continue;
+    LocalVar *lv = scope_local(sc, sl->name);
+    if (!lv) continue;
+    if (sl->param) { params++; continue; }
+    slots++;
+    if (sl->unk) { unknown++; continue; }
+    if (!sl->k.k) { novalue++; continue; }
+    typed++;
+    const char *a = kd_cat(sl->k), *b = ty_cat(lv->type);
+    if (sp_streq(a, b) || (sp_streq(a, "other") && sp_streq(b, "Object"))) { agree++; continue; }
+    /* both say the slot is no plain value (an Array, poly): the same split */
+    int pa = !sp_streq(a, "poly") && !sp_streq(a, "Array") && !sp_streq(a, "Hash") && !sp_streq(a, "Object") && !sp_streq(a, "other");
+    int pb = ssa_plain(lv->type);
+    if (!pa && !pb) { boxed++; continue; }
+    /* the IR has one plain kind where Spinel's types have poly */
+    if (pa && (lv->type == TY_POLY || (pb && sp_streq(a, "nil")))) finer++;
+    if (atoi(on) >= 2)
+      fprintf(stderr, "spinel-ir-types: %s:%s: the IR's own types say %s, Spinel's types say %s (%s)\n",
+              sc->name ? sc->name : "?", sl->name, a, b, ty_name(lv->type));
+  }
+  fprintf(stderr, "spinel-ir-types: slots=%d typed=%d agree=%d both-boxed=%d ir-finer=%d conflict=%d unknown=%d no-value=%d params=%d\n",
+          slots, typed, agree, boxed, finer, typed - agree - boxed - finer, unknown, novalue, params);
+}
+
 void ssa_check_splits(Compiler *c) {
+  ir_types_report(c);
   if (g_nssa_splits == 0) return;
   /* a split read or written inside a block that can run after its call
      (the graph ran it inside the call), or of a slot a proc shares */
@@ -2542,6 +3363,11 @@ void ssa_check_splits(Compiler *c) {
       else if (lv->is_cell || lv->proc_rebinds || lv->cell_outlives) { why = sp->names[q]; later = "a proc shares it"; }
     }
     if (!why && later_bad[i]) { why = sp->names[0]; later = "a block that can run after its call uses it"; }
+    /* a true/false slot has no nil: a read the entry reaches would see false */
+    if (!why && sp->entry_nil) {
+      LocalVar *lv = scope_local(sc, sp->names[0]);
+      if (lv && lv->type == TY_BOOL) { why = sp->names[0]; later = "a true/false slot that a read can see before its first write"; }
+    }
     if (!why) continue;
     if (ssa_log()) {
       LocalVar *lv = scope_local(sc, why);
