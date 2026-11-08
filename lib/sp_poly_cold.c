@@ -231,6 +231,7 @@ const char *(*sp_class_name_fn)(sp_Class);
 const char *(*sp_class_display_fn)(sp_Class);
 const char *(*sp_class_user_to_s_fn)(sp_Class);
 const char *(*sp_class_user_inspect_fn)(sp_Class);
+const char *(*sp_array_user_inspect_fn)(sp_RbVal);
 /* A boxed Time's to_s (inspect 0) or inspect (1): a Time subclass
    instance's goes through its class's own dispatcher, which runs an
    override of the class's and falls back to Time's. */
@@ -299,16 +300,21 @@ void sp_poly_puts(sp_RbVal v)
          line (using to_s on each); a non-Array OBJ falls back to
          inspect / class-name. */
       switch (v.cls_id) {
+        /* an element that is nil (a gap a write past the end left, its nil
+           bit) prints puts nil's empty line, as the typed puts does */
         case SP_BUILTIN_INT_ARRAY: {
           sp_IntArray *_a = (sp_IntArray *)v.v.p;
-          for (sp_int _i = 0; _i < _a->len; _i++)
-            printf("%lld\n", (long long)_a->data[_a->start + _i]);
+          for (sp_int _i = 0; _i < _a->len; _i++) {
+            sp_oint _e = sp_IntArray_oget(_a, _i);
+            if (_e.nil) putchar('\n');
+            else printf("%lld\n", (long long)_e.v);
+          }
           break;
         }
         case SP_BUILTIN_FLT_ARRAY: {
           sp_FloatArray *_a = (sp_FloatArray *)v.v.p;
           for (sp_int _i = 0; _i < _a->len; _i++) {
-            fputs(sp_float_to_s(_a->data[_i]), stdout); putchar('\n');
+            fputs(sp_float_opt_to_s(sp_FloatArray_oget(_a, _i)), stdout); putchar('\n');
           }
           break;
         }
@@ -673,6 +679,11 @@ const char *sp_poly_inspect(sp_RbVal v)
     case SP_TAG_CLASS: return sp_class_val_user(v, sp_class_user_inspect_fn);
     case SP_TAG_BIGINT: return sp_bigint_to_s((sp_Bigint *)v.v.p);
     case SP_TAG_OBJ:
+      /* an Array of any kind, where the program reopens Array#inspect */
+      if (sp_array_user_inspect_fn && sp_poly_is_array_kind(v.cls_id)) {
+        const char *r = sp_array_user_inspect_fn(v);
+        if (r) return r;
+      }
  /* Built-in container / value-type tags get their typed inspect
     helper. Matches the dispatch shape in sp_poly_to_s above and the
     `puts` poly arm earlier in this file; without it, a Range / Time

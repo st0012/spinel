@@ -568,19 +568,25 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
   }
   if (recv >= 0 && !sp_streq(name, "message") && !sp_streq(name, "to_s")) {
     TyKind xrt = comp_ntype(c, recv);
-    int xdef = -1, xob = ty_is_object(xrt) ? ty_object_class(xrt) : -1;
+    MethodLookup ml = { .def_class = -1 };
+    int xob = ty_is_object(xrt) ? ty_object_class(xrt) : -1;
     int xhit = xob >= 0 && class_is_exc_subclass(c, xob)
-                 ? call_target(c, id, xob, name, 0, &xdef) : -1;
+                 ? call_target(c, id, xob, name, 0, &ml) : -1;
     if (xrt == TY_EXCEPTION ||
         (xob >= 0 && class_is_exc_subclass(c, xob) &&
-         (xhit < 0 || (xdef >= 0 && is_builtin_reopen(c->classes[xdef].name))))) {
+         (xhit < 0 || (ml.def_class >= 0 && is_builtin_reopen(c->classes[ml.def_class].name))))) {
       int xr[8];
       int xn = exc_reopen_definers(c, name, xr, 8);
       if (xn > 0) {
         int xt = ++g_tmp;
         buf_printf(b, "({ sp_Exception *_t%d = (sp_Exception *)(", xt);
         emit_expr(c, recv, b);
+        /* rooted for the call where the receiver may be a fresh one
+           (`RuntimeError.new("x").tag`, operand_may_allocate): nothing else
+           holds it, and the definer it reaches may allocate before it reads
+           self (`"RT:" + super`) */
         buf_puts(b, "); ");
+        if (operand_may_allocate(c, recv)) buf_printf(b, "SP_GC_ROOT(_t%d); ", xt);
         char xcls[48]; snprintf(xcls, sizeof xcls, "_t%d->cls_name", xt);
         int pk = emit_exc_reopen_pick_head(c, xr, xn, xcls, b);
         /* a runtime class none of them is above has no such method */
@@ -795,6 +801,23 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 }
 
 /* raise / fail as an expression */
+/* The name `raise K, ...` raises a constant K by: the class it names
+   (const_node_match_class_name), so an alias raises the class it holds;
+   else the name written */
+/* Is `raise K`'s constant one a read can reach before its assignment
+   (LocalVar.const_early)? It is no class's name there: the operand is
+   evaluated as a value is, and that read raises CRuby's NameError where K
+   is not yet assigned. */
+static int raise_const_read_early(Compiler *c, int node) {
+  NodeKind k = nt_kind(c->nt, node);
+  if (k != NK_ConstantReadNode && k != NK_ConstantPathNode) return 0;
+  LocalVar *lv = comp_const_at(c, node);
+  return lv && lv->const_early;
+}
+static const char *exc_const_class_name(Compiler *c, int node) {
+  const char *n = const_node_match_class_name(c, node);
+  return n ? n : nt_str(c->nt, node, "name");
+}
 int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv) {
   /* raise */
   /* `fail` is an exact alias of `Kernel#raise`. */
@@ -862,8 +885,9 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
                       repr_of(c, cause_node).exc));
       int first_const = ac > 0 && nt_type(nt, av[0]) &&
                         comp_ntype(c, av[0]) != TY_STRING && comp_ntype(c, av[0]) != TY_STRBUF &&
-                        (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode);
-      const char *first_cn = first_const ? nt_str(nt, av[0], "name") : NULL;
+                        (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode) &&
+                        !raise_const_read_early(c, av[0]);
+      const char *first_cn = first_const ? exc_const_class_name(c, av[0]) : NULL;
       int first_xc = first_cn ? comp_class_index(c, first_cn) : -1;
       TyKind first_ty = ac > 0 && !first_const ? comp_ntype(c, av[0]) : TY_UNKNOWN;
       /* a class of the program with its own initialize is built before the
@@ -929,6 +953,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
     }
     else if (ac == 1 && nt_type(nt, av[0]) &&
              (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode) &&
+             !raise_const_read_early(c, av[0]) &&
              /* A String constant is the message, as a String variable is. */
              comp_ntype(c, av[0]) != TY_STRING && comp_ntype(c, av[0]) != TY_STRBUF &&
              /* a constant holding an exception INSTANCE (`ERR = RuntimeError.new(..)`;
@@ -940,7 +965,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
          the object (filling initialize's defaults) so its custom initialize and
          any `super`/message run. Without a custom initialize the message
          defaults to the class name, so the (cls, "") fast path is correct. */
-      const char *cn = nt_str(nt, av[0], "name");
+      const char *cn = exc_const_class_name(c, av[0]);
       int xc = cn ? comp_class_index(c, cn) : -1;
       /* a reopened builtin exception is still the builtin: raised by name,
          through the reopening's own initialize when it has one */
@@ -995,12 +1020,13 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
     }
     else if (ac >= 2 && nt_type(nt, av[0]) &&
              comp_ntype(c, av[0]) != TY_STRING && comp_ntype(c, av[0]) != TY_STRBUF &&
-             (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode)) {
+             (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode) &&
+             !raise_const_read_early(c, av[0])) {
       /* `raise Cls, arg` on a user exception subclass with an initialize is
          `raise Cls.new(arg)`: construct the object so its ivars are set and
          the message comes from the class's initialize/super, then carry it.
          A bare-string/builtin exception keeps the (cls, msg) fast path. */
-      const char *cn = nt_str(nt, av[0], "name");
+      const char *cn = exc_const_class_name(c, av[0]);
       int xc = cn ? comp_class_index(c, cn) : -1;
       /* a reopened builtin exception is still the builtin: raised by name,
          through the reopening's own initialize when it has one */

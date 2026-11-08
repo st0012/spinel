@@ -514,7 +514,10 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
        nil, force_new_line = (message.to_s !~ ...))`) reads it through a local
        each argument binds to first, as the other arms do (ctor_arm_arg) */
     Buf pdpre; memset(&pdpre, 0, sizeof pdpre);
-    if (c->scopes[mi].nparams > 0) {
+    /* the parameters are the called symbol's: a proc form's clone has
+       them where a dispatcher's own def, which nothing calls, has none */
+    Scope *cs9 = &c->scopes[pfi9 >= 0 ? pfi9 : mi];
+    if (cs9->nparams > 0) {
       const char *saved_self = g_self;
       const char *saved_deref = g_self_deref;
       char selfpbuf[320];  /* stack-local: nested inlines each need their own receiver buffer */
@@ -577,7 +580,7 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
     /* self is always the first argument here, so a zero-param method
        still needs the separator the helper only adds after a real
        parameter list. */
-    if (c->scopes[mi].nparams == 0 && c->scopes[mi].blk_param &&
+    if (cs9->nparams == 0 && c->scopes[mi].blk_param &&
         c->scopes[mi].blk_param[0] && !c->scopes[mi].yields)
       buf_puts(&cb, ", ");
     if (scope_needs_proc_form(c, mi)) {
@@ -996,8 +999,8 @@ static int poly_user_arm_n_replay(Compiler *c, int id, const char *name, const P
     if (g_plan_check && fit) pa_observe(PA_NATIVE, k, -1, TY_UNKNOWN, PC_SAME);
     return fit;
   }
-  int defcls = -1;
-  int mi = call_target(c, id, k, name, 0, &defcls);
+  MethodLookup ml = { .def_class = -1 };
+  int mi = call_target(c, id, k, name, 0, &ml), defcls = ml.def_class;
   /* an exception class with no method of its own for the name takes
      the builtin reopening's (`class Exception; def brief`) */
   if (mi < 0 && any_exc_reopen(c) && (class_has_exc_name(c, k) || class_is_exc_subclass(c, k))) {
@@ -1444,8 +1447,8 @@ static int poly_user_arm_n_decide(Compiler *c, int id, const char *name, const P
             : ret != TY_POLY && mret == TY_POLY ? PC_UNBOX : PC_SAME;
     return 1;
   }
-  int defcls = -1;
-  int mi = call_target(c, id, k, name, 0, &defcls);
+  MethodLookup ml = { .def_class = -1 };
+  int mi = call_target(c, id, k, name, 0, &ml), defcls = ml.def_class;
   if (mi < 0 && any_exc_reopen(c) && (class_has_exc_name(c, k) || class_is_exc_subclass(c, k))) {
     int xd = exc_arm_definer(c, k, name);
     if (xd >= 0) { defcls = xd; mi = call_target(c, id, xd, name, 0, NULL); }
@@ -1819,12 +1822,12 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
   int done = 0;
   { int obj_cls = comp_core_class(c, CORE_OBJECT);
     if (obj_cls >= 0) {
-      int obj_def = -1;
-      int obj_mi = call_target(c, id, obj_cls, name, 0, &obj_def);
+      MethodLookup ml = { .def_class = -1 };
+      int obj_mi = call_target(c, id, obj_cls, name, 0, &ml);
       /* A yielding one is reached with the call's block through its proc
          form: a user class's chain does not name Object, so without this
          arm an instance of it took the raise (#5101) */
-      int obj_pf = (obj_mi >= 0 && obj_def == obj_cls && argc == 0 &&
+      int obj_pf = (obj_mi >= 0 && ml.def_class == obj_cls && argc == 0 &&
                     c->scopes[obj_mi].yields && nt_ref(nt, id, "block") >= 0)
                    ? scope_proc_form_of(c, obj_mi) : -1;
       if (obj_pf >= 0 && (c->scopes[obj_pf].nparams != 0 || c->scopes[obj_pf].rest_idx >= 0))
@@ -1860,7 +1863,7 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
         done = 1;
         if (g_plan_check) pa_observe(PA_PROC_FORM, PA_KEY_DEFAULT, obj_mi, pr, pconv);
       }
-      else if (obj_mi >= 0 && obj_def == obj_cls && c->scopes[obj_mi].nrequired == 0 &&
+      else if (obj_mi >= 0 && ml.def_class == obj_cls && c->scopes[obj_mi].nrequired == 0 &&
           scope_has_callable_symbol(c, obj_mi)) {
         /* an optional parameter takes its default, spelled with the
            boxed receiver as self. What a default puts ahead of the call (a
@@ -1927,7 +1930,7 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
       }
       /* ... and one that needs arguments refuses them for any receiver */
       else { char oexp[600];
-        if (obj_def == obj_cls && poly_arm_refuses_none(c, obj_mi, oexp, sizeof oexp)) {
+        if (ml.def_class == obj_cls && poly_arm_refuses_none(c, obj_mi, oexp, sizeof oexp)) {
           buf_puts(b, " default: "); emit_poly_arity_raise(b, oexp); buf_puts(b, " break;");
           done = 1;
           if (g_plan_check) pa_observe(PA_ARITY, PA_KEY_DEFAULT, obj_mi, TY_UNKNOWN, PC_VOID);
@@ -1941,8 +1944,8 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
    them)? The dispatch key then keeps a non-object value off it. */
 int poly_key_cls0(Compiler *c, int call, const char *name, int argc, int kwh, int pos_argc, int splat_a) {
   if (argc == 0) {
-    int cls0_d = -1, cls0_rd = -1;
-    int cls0_mi = c->nclasses > 0 ? call_target(c, call, 0, name, 0, &cls0_d) : -1;
+    int cls0_rd = -1;
+    int cls0_mi = c->nclasses > 0 ? call_target(c, call, 0, name, 0, NULL) : -1;
     char cls0_exp[600];
     return ((cls0_mi >= 0 && c->scopes[cls0_mi].nrequired == 0) ||
             /* an arm refusing no arguments raises, and is a `case 0:` all the same */
@@ -2022,8 +2025,9 @@ void emit_poly_prearms0(Compiler *c, int id, const char *name, const PolySpecial
          Kernel count the program defines. A String reopening's own count
          takes its arm below instead, and so does a Symbol, which has no
          count of its own. */
-      int sci = comp_core_class(c, CORE_STRING), dc = -1;
-      int str_own = sci >= 0 && call_target(c, id, sci, name, 0, &dc) >= 0 && dc == sci;
+      MethodLookup ml = { .def_class = -1 };
+      int sci = comp_core_class(c, CORE_STRING);
+      int str_own = sci >= 0 && call_target(c, id, sci, name, 0, &ml) >= 0 && ml.def_class == sci;
       if (!str_own)
         buf_printf(b, "if (_t%d.tag == SP_TAG_STR) _t%d = %ssp_poly_count(_t%d)%s; else ", tv, tr, bopen, tv, bclose);
     } else {
@@ -4501,7 +4505,7 @@ void emit_poly_cases_n(Compiler *c, int id, const char *name, const PolySpecials
       /* nil, a number and a boolean have no include?/key?/member? at
          all: they are not user Enumerables either, so the -1 read as
          false (#4485). A String took the tag arm ahead of the switch. */
-      buf_printf(b, " default: { sp_poly_coll_chk(_t%d, \"%s\");"
+      buf_printf(b, " default: { sp_poly_enum_name_chk(_t%d, \"%s\");"
                     " int _ui%d = sp_poly_user_include(_t%d, %s);"
                     " _t%d = %s_ui%d > 0%s; break; }",
                  tv, name, tv, tv, ab5.p ? ab5.p : "sp_box_nil()", tr, ibo, tv, ibc);

@@ -1798,13 +1798,13 @@ static TyRef named_array_slot(Compiler *c, int recv) {
       return lv ? &lv->type : NULL;
     }
     case NK_ConstantReadNode: {
-      LocalVar *lv = comp_const(c, const_key_at(c, recv));
+      LocalVar *lv = comp_const_at(c, recv);
       return lv ? &lv->type : NULL;
     }
     /* `H::L` names the constant its read resolves to (infer_constant_path) */
     case NK_ConstantPathNode: {
       if (const_path_in_closed_builtin(c, recv) || const_path_misses_toplevel(c, recv)) return NULL;
-      LocalVar *lv = comp_const(c, const_key_at(c, recv));
+      LocalVar *lv = comp_const_at(c, recv);
       return lv ? &lv->type : NULL;
     }
     case NK_ClassVariableReadNode: {
@@ -1954,8 +1954,8 @@ static int join_container_alias_groups(Compiler *c) {
   /* per group root: 0 none seen, 1 arrays, 2 hashes, 3 give up; the joined parts */
   unsigned char *fam = calloc((size_t)n, 1);
   TyKind *ea = malloc(sizeof(TyKind) * (size_t)n), *ka = malloc(sizeof(TyKind) * (size_t)n),
-         *va = malloc(sizeof(TyKind) * (size_t)n);
-  if (!par || !fam || !ea || !ka || !va) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+         *va = malloc(sizeof(TyKind) * (size_t)n), *aa = malloc(sizeof(TyKind) * (size_t)n);
+  if (!par || !fam || !ea || !ka || !va || !aa) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int i = 0; i < n; i++) par[i] = i;
 /* (a local an --rbs seed types keeps the seed's kind, and the call
    converts into it, as the seed asks: it joins no group, and a site it may
@@ -1995,7 +1995,16 @@ static int join_container_alias_groups(Compiler *c) {
       TyKind t = lv->type;
       int f = ty_is_array(t) ? 1 : 2;
       if (fam[g] && fam[g] != f) { fam[g] = 3; continue; }
-      if (f == 1) { TyKind e = ty_array_elem(t); ea[g] = fam[g] ? ctr_join_kind(ea[g], e) : e; }
+      /* (and the Array kind itself, where they all hold one: an element
+         kind names no Array of its own for a table's rows or an object,
+         and ty_array_of took a table of Integer rows the group agreed on
+         for the general Array. Two kinds that differ join to TY_POLY,
+         which no Array kind is, so it marks a group that disagrees.) */
+      if (f == 1) {
+        TyKind e = ty_array_elem(t);
+        ea[g] = fam[g] ? ctr_join_kind(ea[g], e) : e;
+        aa[g] = fam[g] ? ctr_join_kind(aa[g], t) : t;
+      }
       else {
         TyKind k = ty_hash_key(t), v = ty_hash_val(t);
         if (fam[g]) { ka[g] = ctr_join_kind(ka[g], k); va[g] = ctr_join_kind(va[g], v); }
@@ -2008,7 +2017,10 @@ static int join_container_alias_groups(Compiler *c) {
   for (int g = 0; g < n; g++) {
     if (par[g] != g) continue;
     TyKind want = TY_UNKNOWN;
-    if (fam[g] == 1) { want = ty_array_of(ea[g]); if (want == TY_UNKNOWN) want = TY_POLY_ARRAY; }
+    if (fam[g] == 1) {
+      want = aa[g] != TY_POLY ? aa[g] : ty_array_of(ea[g]);
+      if (want == TY_UNKNOWN) want = TY_POLY_ARRAY;
+    }
     else if (fam[g] == 2) {
       want = ty_hash_of(ka[g], va[g]);
       if (want == TY_UNKNOWN) want = ty_hash_of(ka[g], TY_POLY);
@@ -2058,7 +2070,7 @@ static int join_container_alias_groups(Compiler *c) {
   }
 #undef CTR_JOINS_LV
 #undef CTR_FIRST
-  free(par); free(fam); free(ea); free(ka); free(va); free(excl);
+  free(par); free(fam); free(ea); free(ka); free(va); free(aa); free(excl);
   return changed;
 }
 
@@ -2492,24 +2504,27 @@ static int getter_ivar_targets(Compiler *c, int call, int cid, int cside, const 
       int mi = -1;
       defcls = -1;
       if (cside) {
-        mi = call_target(c, call, from, mname, CT_CMETHOD, &defcls);
+        MethodLookup ml = { .def_class = -1 };
+        mi = call_target(c, call, from, mname, CT_CMETHOD, &ml);
+        defcls = ml.def_class;
         if (mi < 0) break;
         niv = getter_exit_ivars(c, mi, ivs, 8);
       }
       else {
-        int mdef = -1, rdef = -1;
-        mi = call_target(c, call, from, mname, 0, &mdef);
+        MethodLookup ml = { .def_class = -1 };
+        int rdef = -1;
+        mi = call_target(c, call, from, mname, 0, &ml);
         int rd = comp_reader_in_chain(c, from, mname, &rdef);
         /* a class carries its parent's readers as its own, so a method there
            over an inherited reader is the override, not a tie */
-        int pdef = mdef >= 0 ? c->classes[mdef].parent : -1;
-        int over = mi >= 0 && rd && mdef == rdef && pdef >= 0 &&
+        int pdef = ml.def_class >= 0 ? c->classes[ml.def_class].parent : -1;
+        int over = mi >= 0 && rd && ml.def_class == rdef && pdef >= 0 &&
                    comp_reader_in_chain(c, pdef, mname, NULL);
-        if (mi >= 0 && (!rd || over || (mdef != rdef && is_descendant(c, mdef, rdef)))) {
-          defcls = mdef;
+        if (mi >= 0 && (!rd || over || (ml.def_class != rdef && is_descendant(c, ml.def_class, rdef)))) {
+          defcls = ml.def_class;
           niv = getter_exit_ivars(c, mi, ivs, 8);
         }
-        else if (rd && (mi < 0 || (mdef != rdef && is_descendant(c, rdef, mdef)))) {
+        else if (rd && (mi < 0 || (ml.def_class != rdef && is_descendant(c, rdef, ml.def_class)))) {
           snprintf(rbuf, sizeof rbuf, "@%s", comp_resolve_alias(c, from, mname));
           defcls = rdef;
           ivs[0] = rbuf;
@@ -3047,8 +3062,8 @@ static int masgn_attr_take(Compiler *c, int tgt, TyKind elem) {
   if (rt != TY_POLY && only < 0) return 0;
   for (int k = 0; k < c->nclasses; k++) {
     if (only >= 0 && k != only && !is_descendant(c, k, only)) continue;
-    int wdc = -1, mdc = -1;
-    int wmi = call_target(c, tgt, k, nm, 0, &mdc);
+    int wdc = -1;
+    int wmi = call_target(c, tgt, k, nm, 0, NULL);
     if (wmi >= 0) {
       Scope *ws = &c->scopes[wmi];
       LocalVar *wp = ws->nparams >= 1 ? scope_local(ws, ws->pnames[0]) : NULL;
@@ -4343,10 +4358,10 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
             TyKind pvt = (vt == TY_STRBUF) ? TY_STRING : vt;
             if (pvt == TY_UNKNOWN) continue;
             for (int k = 0; k < c->nclasses; k++) {
-              int kd = k;
+              MethodLookup ml = { .def_class = k };
               const char *ivn = NULL;
               char rbuf[300];
-              int gm = call_target(c, recv, k, mname, 0, &kd);
+              int gm = call_target(c, recv, k, mname, 0, &ml), kd = ml.def_class;
               if (gm >= 0) {
                 int last = scope_body_last(c, gm);
                 if (last < 0 || nt_kind(nt, last) != NK_InstanceVariableReadNode) continue;
@@ -7551,6 +7566,7 @@ static int widen_array_sources(Compiler *c, int v) {
    local assigned a method's value, the value of a method, a chain of them.
    Returns 1 on a change. */
 /* The callee parameter a reverse binding widens on behalf of (-1: none). */
+static int widen_iter_param_elems(Compiler *c, Scope *sc, const char *nm, TyKind elem, int depth);
 static int g_wcause_scope = -1;
 static const char *g_wcause_name = NULL;
 static int widen_arg_array(Compiler *c, int arg) {
@@ -7566,7 +7582,18 @@ static int widen_arg_array(Compiler *c, int arg) {
     const char *an = nt_str(nt, arg, "name");
     Scope *asc = an ? comp_scope_of(c, arg) : NULL;
     LocalVar *al = asc ? scope_local(asc, an) : NULL;
-    if (!al || !ty_is_array(al->type) || al->type == TY_POLY_ARRAY || al->is_block_param) return 0;
+    if (!al || !ty_is_array(al->type) || al->type == TY_POLY_ARRAY) return 0;
+    /* a row an element iterator binds (`t.each { |r| shl(r) }`): the arrays
+       it can be are the receiver's elements, built as the general Array
+       where they are made, so that the receiver is no typed table and the
+       row goes in by reference -- copied into a general parameter, the
+       callee's store was lost, which the binding refuses (#4480) */
+    if (al->is_block_param) {
+      if (!wbas_shared) wbas_touch();
+      int ch = widen_iter_param_elems(c, asc, an, TY_POLY, 0);
+      if (!wbas_shared) wbas_touch();
+      return ch;
+    }
     if (al->is_param) {
       if (al->rbs_seeded) return 0;
       if (g_wcause_name && al->widen_blocked) return 0;
@@ -7595,6 +7622,7 @@ static int widen_arg_array(Compiler *c, int arg) {
 
 const char *block_param_name(Compiler *c, int block, int idx);
 static int widen_boxed_elem_sources(Compiler *c, int r, TyKind elem, int depth);
+static int widen_boxed_sub_elem_sources(Compiler *c, int r, int k, TyKind elem, int depth);
 
 /* The calls whose literal block names a positional parameter, keyed by the
    name and the block's scope: the calls a block parameter is bound by.
@@ -8118,6 +8146,43 @@ static int widen_boxed_array_sources(Compiler *c, int v, TyKind elem, int depth)
   if (depth == 0 && !wbas_shared) wbas_touch();
   return ch;
 }
+/* What an element iterator hands block parameter `nm` of scope `sc`: an
+   element of the receiver, or a Hash's value. Widens the arrays among the
+   receiver's elements where they are built (widen_boxed_elem_sources). */
+static int widen_iter_param_elems(Compiler *c, Scope *sc, const char *nm, TyKind elem, int depth) {
+  const NodeTable *nt = c->nt;
+  int si = (int)(sc - c->scopes), ch = 0;
+  for (int e = bp_ix_first(c, nm, si); e >= 0; e = bp_ix.next[e]) {
+    if (bp_ix.scope[e] != si || !sp_streq(bp_ix.name[e], nm)) continue;
+    int call = bp_ix.call[e], bi = bp_ix.idx[e];
+    int r = nt_ref(nt, call, "receiver");
+    const char *cn = nt_str(nt, call, "name");
+    /* an iterator moved onto its copy iterates its first argument */
+    char ibuf[64];
+    if (r < 0 && cn && pivs_enum_iter(cn, ibuf, sizeof ibuf)) {
+      int a = nt_ref(nt, call, "arguments"), an = 0;
+      const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+      if (an >= 1) { r = av[0]; cn = ibuf; }
+    }
+    if (r < 0 || !cn) continue;
+    TyKind rt = infer_type(c, r), yt[2];
+    int elem_at = -1, ny = 0;
+    if (ty_is_hash(rt))
+      elem_at = sp_streq(cn, "each_value") ? 0 : is_each_or_pair(cn) ? 1 : -1;
+    else if ((ty_is_array(rt) || rt == TY_POLY) && (ny = ty_block_yield(TY_POLY_ARRAY, cn, yt, 2)) > 0) {
+      /* not each_index, whose block takes an index */
+      const IterRow *ir = iter_row(BOP_ANY_ARRAY, cn, -1, IRF_GAP_FWD);
+      if (!ir || ir->yield[0] != YS_INDEX) elem_at = 0;
+    }
+    /* one element yielded to a block of several parameters is taken apart
+       over them: parameter bi is the element's bi-th (`t.each { |k, row| }`) */
+    int np = 0;
+    while (block_param_name(c, nt_ref(nt, call, "block"), np)) np++;
+    if (elem_at == 0 && ny == 1 && np > 1) ch |= widen_boxed_sub_elem_sources(c, r, bi, elem, depth + 1);
+    else if (bi == elem_at) ch |= widen_boxed_elem_sources(c, r, elem, depth + 1);
+  }
+  return ch;
+}
 /* The read of boxed local `nm` of scope `sc` (widen_boxed_array_sources):
    what it is written, bound or handed. The same for every read of it. */
 static int widen_boxed_local_sources(Compiler *c, Scope *sc, const char *nm, LocalVar *lv,
@@ -8125,26 +8190,7 @@ static int widen_boxed_local_sources(Compiler *c, Scope *sc, const char *nm, Loc
   const NodeTable *nt = c->nt;
   int ch = 0;
   if (lv->is_block_param) {
-    /* what an element iterator hands its block: an element of the
-       receiver, or a Hash's value */
-    int si = (int)(sc - c->scopes);
-    for (int e = bp_ix_first(c, nm, si); e >= 0; e = bp_ix.next[e]) {
-      if (bp_ix.scope[e] != si || !sp_streq(bp_ix.name[e], nm)) continue;
-      int call = bp_ix.call[e], bi = bp_ix.idx[e];
-      int r = nt_ref(nt, call, "receiver");
-      const char *cn = nt_str(nt, call, "name");
-      if (r < 0 || !cn) continue;
-      TyKind rt = infer_type(c, r), yt[2];
-      int elem_at = -1;
-      if (ty_is_hash(rt))
-        elem_at = sp_streq(cn, "each_value") ? 0 : is_each_or_pair(cn) ? 1 : -1;
-      else if ((ty_is_array(rt) || rt == TY_POLY) && ty_block_yield(TY_POLY_ARRAY, cn, yt, 2) > 0) {
-        /* not each_index, whose block takes an index */
-        const IterRow *ir = iter_row(BOP_ANY_ARRAY, cn, -1, IRF_GAP_FWD);
-        if (!ir || ir->yield[0] != YS_INDEX) elem_at = 0;
-      }
-      if (bi == elem_at) ch |= widen_boxed_elem_sources(c, r, elem, depth + 1);
-    }
+    ch |= widen_iter_param_elems(c, sc, nm, elem, depth);
     /* a proc or lambda literal's parameter: what its calls pass there */
     int lit = local_proc_literal_param_of(c, sc, nm);
     if (lit >= 0) ch |= widen_proc_call_args(c, lit, nm, elem, depth + 1);
@@ -8328,6 +8374,31 @@ static int widen_boxed_elem_sources_1(Compiler *c, int r, TyKind elem, int depth
       int el = nt_kind(nt, ev[e]) == NK_AssocNode ? nt_ref(nt, ev[e], "value") : ev[e];
       if (el >= 0 && nt_kind(nt, el) != NK_SplatNode && nt_kind(nt, el) != NK_AssocSplatNode)
         ch |= widen_boxed_array_sources(c, el, elem, depth + 1);
+    }
+  }
+  return ch;
+}
+
+/* The arrays at index k of the elements of the container `r`, as far as
+   the literals show them, the elements' own included (`pair = [0, [1]];
+   t = [pair]`): what a block taking each element apart binds to its k-th
+   parameter (`t.each { |key, row| }`). */
+static int widen_boxed_sub_elem_sources(Compiler *c, int r, int k, TyKind elem, int depth) {
+  if (depth > 6) return 0;
+  const NodeTable *nt = c->nt;
+  int lits[32], ch = 0;
+  int nl = container_literals(c, r, lits, 0, 32, 0);
+  for (int q = 0; q < nl; q++) {
+    int en = 0; const int *ev = nt_arr(nt, lits[q], "elements", &en);
+    for (int e = 0; e < en; e++) {
+      int subs[16];
+      int ns = nt_kind(nt, ev[e]) == NK_SplatNode ? 0 : container_literals(c, ev[e], subs, 0, 16, 0);
+      for (int u = 0; u < ns; u++) {
+        if (nt_kind(nt, subs[u]) != NK_ArrayNode) continue;
+        int sn = 0, splat = 0; const int *sv = nt_arr(nt, subs[u], "elements", &sn);
+        for (int j = 0; j <= k && j < sn; j++) if (nt_kind(nt, sv[j]) == NK_SplatNode) splat = 1;
+        if (!splat && k < sn) ch |= widen_boxed_array_sources(c, sv[k], elem, depth + 1);
+      }
     }
   }
   return ch;
@@ -11719,9 +11790,9 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
          receiver's class so its params get the call-site arg types. */
       int iec = ie_class_of(c, id);
       if (iec >= 0) {
-        int def_cid = -1;
-        mi = call_target(c, id, iec, name, 0, &def_cid);
-        if (mi >= 0) caller_cid = def_cid >= 0 ? def_cid : iec;
+        MethodLookup ml = { .def_class = -1 };
+        mi = call_target(c, id, iec, name, 0, &ml);
+        if (mi >= 0) caller_cid = ml.def_class >= 0 ? ml.def_class : iec;
       }
       { int pk[64], npk = ie_poly_classes_at(c, id, pk, 64);
         for (int i = 0; i < npk; i++) changed |= bind_call_params(c, id, call_target(c, id, pk[i], name, 0, NULL)); }
@@ -11736,15 +11807,15 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
         Scope *self = comp_scope_of(c, id);
         if (self->class_id >= 0) {
           caller_cid = self->class_id;
-          int def_cid = -1;
+          MethodLookup ml = { .def_class = -1 };
           if (self->is_cmethod) {
-            mi = call_target(c, id, self->class_id, name, CT_CMETHOD, &def_cid);
-            if (mi >= 0 && def_cid >= 0) caller_cid = def_cid;
+            mi = call_target(c, id, self->class_id, name, CT_CMETHOD, &ml);
+            if (mi >= 0 && ml.def_class >= 0) caller_cid = ml.def_class;
           }
           if (mi < 0) {
-            def_cid = -1;
-            mi = call_target(c, id, self->class_id, name, 0, &def_cid);
-            if (mi >= 0 && def_cid >= 0) caller_cid = def_cid;
+            ml.def_class = -1;
+            mi = call_target(c, id, self->class_id, name, 0, &ml);
+            if (mi >= 0 && ml.def_class >= 0) caller_cid = ml.def_class;
           }
         }
         else mi = comp_cbody_call_mi(c, id, name);
@@ -13024,6 +13095,26 @@ static void bs_splat(Compiler *c, int x, int np, TyKind *e, char *flags, int *nm
    value takes its default. A keyword takes the value its key names, the
    values of every `**` operand and of a computed key (either may name it),
    and its default when it may be absent -- never a positional's. */
+/* Can an object of type t answer a to_ary of the program's that takes no
+   argument: its class, or a subclass of it, defines one? Such a value
+   yielded alone to a block that auto-splats is taken apart through it
+   (CRuby's rb_check_array_type), so the parameters may take its
+   elements. */
+static int bs_object_to_ary(Compiler *c, TyKind t) {
+  if (!ty_is_object(t)) return 0;
+  int oc = ty_object_class(t), np = 0;
+  /* the classes codegen converts (cplan_boxed_to_ary_classes): a program
+     to_ary of no parameter on a class that can have instances (the early
+     census; `instantiated` is unset while the fixpoint runs) */
+  const PolyCand *pc = comp_poly_candidates(c, "to_ary", &np);
+  for (int i = 0; i < np; i++) {
+    int k = pc[i].cls, mi = comp_implicit_to_ary_mi(c, k);
+    if (pc[i].native || mi < 0 || mi != pc[i].mi || c->scopes[mi].nparams != 0) continue;
+    if (!(c->classes[k].ctor_reachable || c->classes[k].instantiated)) continue;
+    if (k == oc || is_descendant(c, k, oc)) return 1;
+  }
+  return 0;
+}
 void block_site_types(Compiler *c, const BlockSig *s, const int *av, int ac,
                       TyKind *pos, char *absent, TyKind *kws) {
   const NodeTable *nt = c->nt;
@@ -13069,7 +13160,7 @@ void block_site_types(Compiler *c, const BlockSig *s, const int *av, int ac,
   int kw_spreads = kwh >= 0 && kwh_only_spreads(nt, kwh);
   if (!s->lambda && (kwh < 0 || kw_spreads) && block_auto_splats(P, O, Q, s->R) &&
       (gather ? nmin <= 1 : ac == 1) &&
-      (ty_is_array(e) || e == TY_POLY || e == TY_POLY_ARRAY)) {
+      (ty_is_array(e) || e == TY_POLY || e == TY_POLY_ARRAY || (!gather && bs_object_to_ary(c, e)))) {
     /* spread across the parameters: an element, or (gathered, or boxed)
        possibly the value itself */
     TyKind et = ty_is_array(e) ? ty_array_elem(e) : TY_POLY;
@@ -20638,7 +20729,8 @@ void cr_collect_calls(Compiler *c, const NodeTable *nt, int id,
   if (k0 == NK_CallNode && nm && names[0] == nm && nt_int(nt, id, "dyn_arm", 0) > 0) {
     int r = nt_ref(nt, id, "receiver");
     NodeKind rk = r >= 0 ? nt_kind(nt, r) : NK_NONE;
-    if (rk == NK_SelfNode || r < 0) { Scope *ss = comp_scope_of(c, id); class_arm = ss && ss->is_cmethod; }
+    /* (self in a class or module body is that class too) */
+    if (rk == NK_SelfNode || r < 0) { Scope *ss = comp_scope_of(c, id); class_arm = (ss && ss->is_cmethod) || (rk == NK_SelfNode && class_body_self_ci(c, r) >= 0); }
     else if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode)
       class_arm = nt_str(nt, r, "name") && const_node_class_index(c, r) >= 0;
   }

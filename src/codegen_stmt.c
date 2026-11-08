@@ -228,6 +228,15 @@ void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
                ti, ti, ta, ti, ta, ti);
     free(ab.p);
   }
+  else if (t == TY_INT_ARRAY_ARRAY || t == TY_FLOAT_ARRAY_ARRAY) {
+    /* a table of rows, boxed by reference with what its rows are, which
+       sp_poly_puts prints one per line (#4486). Rooted for the call: a
+       method's fresh table is held nowhere else, and a Float row's render
+       allocates. */
+    int tb = ++g_tmp;
+    buf_printf(b, "{ sp_RbVal _t%d = ", tb); emit_boxed(c, arg, b);
+    buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_poly_puts(_t%d); }\n", tb, tb);
+  }
   else if (ty_is_hash(t) &&
            !(nt_kind(c->nt, arg) == NK_KeywordHashNode &&
              ({ int _n = 0, _s = 0; const int *_e = nt_arr(c->nt, arg, "elements", &_n);
@@ -443,6 +452,15 @@ void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
   if (emit_splat_io(c, arg, "sp_splat_p(", b, indent)) return;
   Repr tr = repr_of(c, arg);
   TyKind t = tr.as_ty;
+  /* an Array where the program reopens Array#inspect: printed boxed, which
+     runs that method (sp_array_user_inspect), rooted for the call */
+  if ((ty_is_array(t) || ty_is_ptr_array(t)) && array_user_inspect_mi(c) >= 0) {
+    int tb = ++g_tmp;
+    emit_indent(b, indent);
+    buf_printf(b, "{ sp_RbVal _t%d = ", tb); emit_boxed(c, arg, b);
+    buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_puts_line(sp_poly_inspect(_t%d)); }\n", tb, tb);
+    return;
+  }
   /* an element-less hash construct ({} / Hash.new / Hash.new(default)) that no
      key usage narrowed stays TY_UNKNOWN; box it (emit_boxed carries the
      default) and inspect through the poly path. */
@@ -472,7 +490,10 @@ void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
       ({ int _a = nt_ref(c->nt, arg, "arguments"); int _n = 0;
          if (_a >= 0) nt_arr(c->nt, _a, "arguments", &_n); _n == 0; })) {
     emit_indent(b, indent);
-    buf_puts(b, "fputs(\"[]\\n\", stdout);\n");
+    /* (the program's own Array#inspect prints it, as for any Array) */
+    if (array_user_inspect_mi(c) >= 0)
+      buf_puts(b, "{ sp_RbVal _ea = sp_box_poly_array(sp_PolyArray_new()); SP_GC_ROOT_RBVAL(_ea); sp_puts_line(sp_poly_inspect(_ea)); }\n");
+    else buf_puts(b, "fputs(\"[]\\n\", stdout);\n");
     return;
   }
   /* `p x.class` prints the class name bare (it is a Class, not a String) --
@@ -6650,9 +6671,9 @@ static void emit_op_assign_lv(Compiler *c, int id, Buf *b, int indent,
       return;
   }
   if (ty_is_object(t)) {
-    int defcls2 = -1;
+    MethodLookup ml = { .def_class = -1 };
     int cid2 = ty_object_class(t);
-    int mi2 = call_target(c, id, cid2, op, 0, &defcls2);
+    int mi2 = call_target(c, id, cid2, op, 0, &ml);
     if (mi2 >= 0) {
       Scope *ms2 = &c->scopes[mi2];
       LocalVar *p2 = ms2->nparams >= 1 ? scope_local(ms2, ms2->pnames[0]) : NULL;
@@ -6668,7 +6689,7 @@ static void emit_op_assign_lv(Compiler *c, int id, Buf *b, int indent,
       buf_puts(g_pre, ";\n");
       buf_printf(b, "%s = %s((sp_%s *)%s, _t%d);\n",
                  lval, mc_method(c, ms2),
-                 c->classes[defcls2].c_name, rd, atmp2);
+                 c->classes[ml.def_class].c_name, rd, atmp2);
       return;
     }
   }
@@ -7369,7 +7390,7 @@ static int emit_poly_class_when_value(Compiler *c, int cond_id, const char *tmp,
   /* a qualified path naming a known builtin (exception) class matches by its
      FULL name -- raised exceptions carry "Errno::ENOENT", not "ENOENT" */
   char qbuf[160];
-  { const char *q = isa_match_name(nt, cond_id, qbuf, sizeof qbuf); if (q) cn = q; }
+  { const char *q = isa_match_class_name(c, cond_id, qbuf, sizeof qbuf); if (q) cn = q; }
   /* a class-aliasing constant (Alias = SomeClass) tests the aliased class */
   { const char *_ra = resolve_class_alias(c, cn); if (_ra) cn = _ra; }
   /* a Bignum is an Integer too */
@@ -7441,6 +7462,7 @@ static int emit_poly_class_when_value(Compiler *c, int cond_id, const char *tmp,
           first = 0;
         }
       }
+      emit_exc_box_isa_arms(c, cid, tmp, 0, &first, b);
       if (first) buf_puts(b, "0");
       buf_puts(b, "))");
       /* a module a builtin's reopening includes (`class Hash; include M;
@@ -7916,7 +7938,7 @@ static int g_pm_sentinel_t = -1;
    skipped (#3373). Resolve through the class table and use the name the
    exception actually has. */
 static const char *exc_when_cls_name(Compiler *c, int pat, char *buf, size_t bufsz) {
-  const char *cn = isa_match_name(c->nt, pat, buf, bufsz);
+  const char *cn = isa_match_class_name(c, pat, buf, bufsz);
   int ci = cn ? comp_class_index(c, cn) : -1;
   const char *q = ci >= 0 ? class_ruby_name(c, ci) : NULL;
   return q ? q : cn;
@@ -11806,7 +11828,7 @@ static void emit_case_expr_in(Compiler *c, int id, Buf *b) {
         NodeKind cty2_k = nt_kind(nt, conds[j]);
         char cq2[192];
         const char *cn2 = (cty2_k == NK_ConstantReadNode || cty2_k == NK_ConstantPathNode)
-                         ? isa_match_name(nt, conds[j], cq2, sizeof cq2) : NULL;
+                         ? isa_match_class_name(c, conds[j], cq2, sizeof cq2) : NULL;
         /* value constant in `when`: equality, not a class test (see above) */
         if (cn2 && pm_value_const(c, conds[j], cn2)) cn2 = NULL;
         /* a class whose own class method `===` (or an ancestor's) answers
@@ -13592,6 +13614,9 @@ int hv_emit(Compiler *c, int id, const char *count, Buf *b, int indent, char *st
 }
 
 static void emit_for_poly_lefts(Compiler *c, int idx, int tv, int indent, Buf *b) {
+  /* the element converts as the targets' implied to_ary of it (its row):
+     an object of the program's takes apart the Array its to_ary answers */
+  tv = emit_boxed_to_ary(c, idx, NTI_YIELDED, tv, b, indent);
   int ln = 0;
   const int *lefts = nt_arr(c->nt, idx, "lefts", &ln);
   for (int i = 0; i < ln; i++) {
@@ -15004,8 +15029,9 @@ static int rescue_operand_is_class_name(Compiler *c, int op) {
   if (k != NK_ConstantReadNode && k != NK_ConstantPathNode) return 0;
   const char *n = nt_str(c->nt, op, "name");
   if (!n || !comp_const(c, n)) return 1;
+  /* (a class alias no read reaches before its assignment names its class) */
   return comp_class_index(c, n) >= 0 || is_builtin_class_name(n) || is_builtin_module_name(n) ||
-         is_builtin_exception_name(n);
+         is_builtin_exception_name(n) || const_node_match_class_name(c, op);
 }
 /* A rescue operand that names a constant defined nowhere (`rescue
    Missing::Thing`): CRuby evaluates it when an exception reaches the
@@ -15181,6 +15207,11 @@ void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr, const char *re
       int effect = emit_const_read_prefix(c, exc[i], b);
       first = 0;
       const char *ename = nt_str(nt, exc[i], "name");
+      /* a class alias matches as the class it names */
+      if (ename && comp_class_index(c, ename) < 0 && comp_const(c, ename)) {
+        const char *an = const_node_match_class_name(c, exc[i]);
+        if (an) ename = an;
+      }
       /* A builtin namespaced exception (e.g. StringScanner::Error) is raised
          under its qualified name. Map the path to that form only when it
          names a known builtin exception, so user classes like M::Err keep
@@ -16971,8 +17002,9 @@ static int masgn_writer_takes_nil(Compiler *c, int tgt) {
   int recv = nm ? nt_ref(nt, tgt, "receiver") : -1;
   TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
   if (!ty_is_object(rt)) return 1;
-  int crc = ty_object_class(rt), cdef = -1;
-  int wmi = call_target(c, tgt, crc, nm, 0, &cdef);
+  MethodLookup ml = { .def_class = -1 };
+  int crc = ty_object_class(rt);
+  int wmi = call_target(c, tgt, crc, nm, 0, &ml);
   if (wmi >= 0) {
     const LocalVar *wp = c->scopes[wmi].nparams >= 1 ? scope_local(&c->scopes[wmi], c->scopes[wmi].pnames[0]) : NULL;
     return !wp || slot_is_oint(wp) || wp->type == TY_POLY;
@@ -17574,8 +17606,8 @@ static int masgn_store(Compiler *c, int id, const MasgnTmps *mt, int tgt, const 
     }
     if (!ty_is_object(crt)) { unsupported(c, id, "multiple assignment call target non-object"); return 1; }
     int crc = ty_object_class(crt);
-    int cdef = -1;
-    int wmi = call_target(c, tgt, crc, nm, 0, &cdef);
+    MethodLookup ml = { .def_class = -1 };
+    int wmi = call_target(c, tgt, crc, nm, 0, &ml);
     masgn_recv_guard(c, crecv, recv_tmp, nm, indent, b);
     emit_indent(b, indent);
     /* a writer a native class binds (`native_method :x=, [:float], ...`):
@@ -17593,9 +17625,9 @@ static int masgn_store(Compiler *c, int id, const MasgnTmps *mt, int tgt, const 
       buf_puts(b, ");\n");
       return 1;
     }
-    if (wmi >= 0 && cdef >= 0) {
+    if (wmi >= 0 && ml.def_class >= 0) {
       LocalVar *wp = c->scopes[wmi].nparams >= 1 ? scope_local(&c->scopes[wmi], c->scopes[wmi].pnames[0]) : NULL;
-      buf_printf(b, "%s((sp_%s *)", mc_method(c, &c->scopes[wmi]), c->classes[cdef].c_name);
+      buf_printf(b, "%s((sp_%s *)", mc_method(c, &c->scopes[wmi]), c->classes[ml.def_class].c_name);
       emit_node_or_tmp(c, crecv, recv_tmp, b); buf_puts(b, ", ");
       masgn_conv_param(c, id, wp, vt, val, b);
       buf_puts(b, ");\n");
@@ -17883,7 +17915,12 @@ static void emit_class_body_stmts(Compiler *c, int ci, int body, Buf *b, int ind
         emit_stmt_or_defer(c, stmts[k], b, indent);
       continue;
     }
-    if (sk == NK_AliasMethodNode) continue;
+    /* (an alias of a method nothing answers is skipped for what it makes, not
+       for what it does: it raises where it runs) */
+    if (sk == NK_AliasMethodNode) {
+      if (nt_str(nt, stmts[k], "alias_absent")) emit_stmt_or_defer(c, stmts[k], b, indent);
+      continue;
+    }
     /* `class << self`: its defs are the class's own, but the constants it
        assigns are assigned where it stands (#5996); so are the statements of
        a `class << Const` naming a class or module, as at the top level */
@@ -17931,6 +17968,8 @@ static void emit_class_body_stmts(Compiler *c, int ci, int body, Buf *b, int ind
       /* a mixin naming a class (`include K`, the load record's mark):
          CRuby's TypeError where the statement runs, not a declaration */
       if (nt_int(nt, stmts[k], "mixin_class_arg", 0)) { emit_stmt_or_defer(c, stmts[k], b, indent); continue; }
+      /* an alias_method of a method nothing answers: NameError where it runs */
+      if (nt_str(nt, stmts[k], "alias_absent")) { emit_stmt_or_defer(c, stmts[k], b, indent); continue; }
       int executable = prog_stmt_call_executable(c, stmts[k], ci);
       /* A name nothing defines -- no method of any class or module in the
          program, no Module or Object method, no declaration the analysis
@@ -19709,10 +19748,106 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
   return 0;
 }
 
+/* Does definition n (a def, or a define_method call with its block) hold
+   something that may reach a builtin mixin: a super, a call of include,
+   prepend, extend or append_features, a bound Module method (instance_method,
+   bind_call), send, an alias? A bare or self call of a singleton alias of a
+   mixin counts, and a bare or self call of a class method of the program is
+   followed into that method's body (seen: the scopes already followed). A
+   nested def or class body is its own. */
+static int own_mixin_reach(Compiler *c, int n, unsigned char *seen, int depth) {
+  const NodeTable *nt = c->nt;
+  if (n < 0 || depth > 64) return n >= 0;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_SuperNode || k == NK_ForwardingSuperNode || k == NK_AliasMethodNode) return 1;
+  if (k == NK_CallNode) {
+    static const char *const names[] = { "include", "prepend", "extend", "append_features", "prepend_features",
+      "extend_object", "instance_method", "bind_call", "bind", "alias_method", "send", "__send__",
+      "public_send", "method", NULL };
+    const char *nm = nt_str(nt, n, "name");
+    for (int i = 0; nm && names[i]; i++) if (sp_streq(nm, names[i])) return 1;
+    int recv = nt_ref(nt, n, "receiver");
+    if (nm && (recv < 0 || nt_kind(nt, recv) == NK_SelfNode)) {
+      /* `alias orig_include include` in `class << self`, called by its new name */
+      for (int ci = 0; ci < c->nclasses; ci++) {
+        const ClassInfo *ki = &c->classes[ci];
+        for (int a = 0; a < ki->naliases; a++)
+          if (ki->alias_sg && ki->alias_sg[a] && sp_streq(ki->alias_new[a], nm) && is_mixin_call(ki->alias_old[a])) return 1;
+      }
+      /* a class method of the program's by that name: its body runs too */
+      for (int si = 0; si < c->nscopes; si++) {
+        const Scope *sc = &c->scopes[si];
+        if (seen[si] || !sc->is_cmethod || !sc->name || !sp_streq(sc->name, nm) || sc->def_node < 0) continue;
+        seen[si] = 1;
+        if (own_mixin_reach(c, sc->def_node, seen, depth + 1)) return 1;
+      }
+    }
+  }
+  int nr = nt_num_refs(nt, n), na = nt_num_arrs(nt, n);
+  for (int i = 0; i < nr; i++) {
+    int ch = nt_ref_at(nt, n, i);
+    NodeKind ck = ch >= 0 ? nt_kind(nt, ch) : NK_NilNode;
+    if (ck == NK_DefNode || ck == NK_ClassNode || ck == NK_ModuleNode || ck == NK_SingletonClassNode) continue;
+    if (own_mixin_reach(c, ch, seen, depth)) return 1;
+  }
+  for (int i = 0; i < na; i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int j = 0; j < an; j++) {
+      NodeKind ck = nt_kind(nt, av[j]);
+      if (ck == NK_DefNode || ck == NK_ClassNode || ck == NK_ModuleNode || ck == NK_SingletonClassNode) continue;
+      if (own_mixin_reach(c, av[j], seen, depth)) return 1;
+    }
+  }
+  return 0;
+}
+static int own_mixin_body_reaches_builtin(Compiler *c, int dn) {
+  unsigned char *seen = calloc((size_t)c->nscopes + 1, 1);
+  if (!seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  int r = own_mixin_reach(c, dn, seen, 0);
+  free(seen);
+  return r;
+}
+
+/* An alias or alias_method of a method nothing answers where it runs
+   (elab_absent_aliases) makes no method and raises NameError there, with the
+   message the record made for the statement. Is id one? Then emit the raise. */
+static int emit_alias_absent(Compiler *c, int id, Buf *b, int indent) {
+  const char *msg = nt_str(c->nt, id, "alias_absent");
+  if (!msg) return 0;
+  emit_indent(b, indent);
+  buf_puts(b, "sp_raise_cls(\"NameError\", \"");
+  emit_c_escaped(b, msg);
+  buf_puts(b, "\");\n");
+  return 1;
+}
+
 /* A CallNode statement: the statement-level fast paths ahead of emit_expr (emit_stmt_inner's arms, in their order) */
 static int emit_call_stmt(Compiler *c, int id, Buf *b, int indent, const NodeTable *nt, const char *ty) {
   refuse_prepass_at_emit(c, id);
   if (!(sp_streq(ty, "CallNode"))) return 0;
+  /* `include M` that runs the class's own `def self.include` (the load
+     record marks it, with the definition it finds there): a method that
+     may reach a builtin mixin itself (a super, another mixin call, a bound
+     Module method, a condition's untaken branch, an alias of the builtin)
+     would mix a module in as the program runs, and a class's ancestors are
+     fixed at compile time */
+  { int own = (int)nt_int(nt, id, "mixin_own_call", 0);
+    const char *mnm = own > 0 ? nt_str(nt, id, "name") : NULL;
+    int dn = own - 1;
+    const char *why = !mnm ? NULL : nt_int(nt, dn, "cond_dispatch", 0) ? "a condition defines"
+                    : own_mixin_body_reaches_builtin(c, dn) ? "may call super or a builtin mixin" : NULL;
+    if (why) {
+      char msg[600];
+      snprintf(msg, sizeof msg, "a class method `%s` of the program that %s is not supported by AOT "
+               "compilation: the builtin mixin would add a module as the program runs, and a class's "
+               "ancestors are fixed at compile time. Mix the module in with the builtin form, or define "
+               "the method without it (see docs/limitations.md)", mnm, why);
+      unsupported_feature(c, id, msg);
+    }
+  }
+  /* an alias_method of a method nothing answers (elab_absent_aliases): it makes
+     no method and raises NameError where it runs */
+  if (emit_alias_absent(c, id, b, indent)) return 1;
   if (emit_arysub_call_stmt(c, id, b, indent)) return 1;   /* #7449 */
   /* --share-strings: a safe-navigation bang on an attribute assignment's
      handle changes that handle: its route, run for its effect (the bang's
@@ -19744,7 +19879,7 @@ static int emit_call_stmt(Compiler *c, int id, Buf *b, int indent, const NodeTab
     /* `singleton_class.attr_reader :x`: an attr of the body's singleton,
        registered from the load record as `class << self`'s are */
     int sc_attr = recv >= 0 && (nt_int(nt, id, "sg_attr_decl", 0) || nt_int(nt, id, "mixin_by_record", 0));
-    if ((recv < 0 || sc_attr) && nm && (sp_streq(nm, "include") || sp_streq(nm, "extend") ||
+    if ((recv < 0 || sc_attr) && nm && !nt_int(nt, id, "mixin_own_call", 0) && (sp_streq(nm, "include") || sp_streq(nm, "extend") ||
                            sp_streq(nm, "prepend") || sp_streq(nm, "module_function") ||
                            sp_streq(nm, "private") || sp_streq(nm, "protected") ||
                            sp_streq(nm, "public") || sp_streq(nm, "attr_reader") ||
@@ -20657,9 +20792,9 @@ static int emit_ivar_cvar_write_stmt(Compiler *c, int id, Buf *b, int indent, co
     }
     else if (emit_array_op_assign(c, ref, vt, op, nt_ref(nt, id, "value"), b)) { }
     else if (op && ty_is_object(vt)) {
-      int idefcls = -1;
+      MethodLookup ml = { .def_class = -1 };
       int icid = ty_object_class(vt);
-      int imi = call_target(c, id, icid, op, 0, &idefcls);
+      int imi = call_target(c, id, icid, op, 0, &ml);
       if (imi >= 0) {
         Scope *ims = &c->scopes[imi];
         LocalVar *ip = ims->nparams >= 1 ? scope_local(ims, ims->pnames[0]) : NULL;
@@ -20680,7 +20815,7 @@ static int emit_ivar_cvar_write_stmt(Compiler *c, int id, Buf *b, int indent, co
         free(irv.p);
         buf_printf(b, "%s = %s((sp_%s *)%s, _t%d);\n",
                    ref, mc_method(c, ims),
-                   c->classes[idefcls].c_name, ref, iatmp);
+                   c->classes[ml.def_class].c_name, ref, iatmp);
       }
       else {
         buf_printf(b, "%s %s= ", ref, op);
@@ -20697,9 +20832,9 @@ static int emit_ivar_cvar_write_stmt(Compiler *c, int id, Buf *b, int indent, co
            defined (#10902). The other arm's sp_poly_add still reaches a
            user operator through the binop hook. */
         if (!c->classes[_ci].instantiated) continue;
-        int _di = -1;
-        int _mi2 = call_target(c, id, _ci, op, 0, &_di);
-        if (_mi2 >= 0) { poly_mi = _mi2; poly_defcls = _di; break; }
+        MethodLookup ml = { .def_class = -1 };
+        int _mi2 = call_target(c, id, _ci, op, 0, &ml);
+        if (_mi2 >= 0) { poly_mi = _mi2; poly_defcls = ml.def_class; break; }
       }
       if (poly_mi >= 0 && poly_defcls >= 0) {
         int ival = nt_ref(nt, id, "value");
@@ -20940,8 +21075,7 @@ static int const_name_owner(Compiler *c, int tgt, int *owner) {
 static void emit_const_target_class_name(Compiler *c, int tgt, const char *nm, Buf *b, int indent) {
   int owner;
   if (!const_name_owner(c, tgt, &owner)) return;
-  const char *wn = nt_str(c->nt, tgt, "qc_orig_name");
-  emit_class_const_name(c, nm, wn ? wn : nt_str(c->nt, tgt, "name"), owner, b, indent);
+  emit_class_const_name(c, nm, nt_str(c->nt, tgt, "name"), owner, b, indent);
 }
 
 /* After the value is evaluated, before it is stored: a receiver that is not a
@@ -21980,7 +22114,10 @@ static void emit_stmt_node(Compiler *c, int id, Buf *b, int indent) {
      satisfied, so a constant-false guard creates nothing here and a non-constant
      guard leaves the name unresolved (it rejects loudly at the use site). The
      node itself emits no runtime code. */
-  if (ty_k == NK_AliasMethodNode) return;
+  if (ty_k == NK_AliasMethodNode) {
+    emit_alias_absent(c, id, b, indent);
+    return;
+  }
 
   if (ty_k == NK_YieldNode) {
     if (g_current_scope_is_lowered) {
@@ -22279,11 +22416,12 @@ static void emit_stmt_node(Compiler *c, int id, Buf *b, int indent) {
       const int *stmts = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
       for (int k = 0; k < n; k++) {
         NodeKind sk = nt_kind(nt, stmts[k]);
-        if (sk == NK_DefNode || sk == NK_AliasMethodNode || sk == NK_InstanceVariableWriteNode ||
+        if (sk == NK_DefNode || (sk == NK_AliasMethodNode && !nt_str(nt, stmts[k], "alias_absent")) ||
+            sk == NK_InstanceVariableWriteNode ||
             sk == NK_InstanceVariableOrWriteNode || sk == NK_InstanceVariableAndWriteNode ||
             sk == NK_InstanceVariableOperatorWriteNode)
           continue;
-        if (sk == NK_CallNode && nt_ref(nt, stmts[k], "receiver") < 0 &&
+        if (sk == NK_CallNode && nt_ref(nt, stmts[k], "receiver") < 0 && !nt_str(nt, stmts[k], "alias_absent") &&
             !prog_sclass_call_executable(c, stmts[k])) continue;
         emit_stmt(c, stmts[k], b, indent);
       }
@@ -23725,21 +23863,21 @@ void emit_stmts(Compiler *c, int id, Buf *b, int indent) {
    Without the switch, or outside a collect unit, it is emit_stmt. Answers
    whether the statement was emitted as written. */
 int g_stmt_deferrals = 0;
-void defer_mark(DeferMark *m, Buf *b) {
+void defer_mark(Compiler *c, DeferMark *m, Buf *b) {
   memcpy(m->outer, g_unsup_recover, sizeof m->outer);
   m->b = b; m->len = b->len;
   m->pre = g_pre; m->pre_len = g_pre ? g_pre->len : 0;
   m->hold = g_conv_hold;
-  m->state = emit_state_snapshot();
+  m->state = emit_state_snapshot(c);
   m->ndiag0 = g_ndiags;
 }
 /* after the longjmp: the text and state back to the mark, and the
    refusal's message (file:line: what) in msg */
-void defer_rollback(DeferMark *m, char *msg, size_t msz) {
+void defer_rollback(Compiler *c, DeferMark *m, char *msg, size_t msz) {
   g_stmt_deferrals++;
   if (g_ndiags > m->ndiag0) g_deferred_diags++;
   g_conv_hold = m->hold;
-  emit_state_release(m->state, 1); m->state = NULL;
+  emit_state_release(c, m->state, 1); m->state = NULL;
   g_pre = m->pre;
   if (g_pre && g_pre->len > m->pre_len) { g_pre->len = m->pre_len; if (g_pre->p) g_pre->p[m->pre_len] = '\0'; }
   m->b->len = m->len; if (m->b->p) m->b->p[m->len] = '\0';
@@ -23751,8 +23889,8 @@ void defer_rollback(DeferMark *m, char *msg, size_t msz) {
   }
   else snprintf(msg, msz, "refused at compile time");
 }
-void defer_done(DeferMark *m) {
-  if (m->state) emit_state_release(m->state, 0);
+void defer_done(Compiler *c, DeferMark *m) {
+  if (m->state) emit_state_release(c, m->state, 0);
   memcpy(g_unsup_recover, m->outer, sizeof m->outer);
 }
 static int emit_stmt_or_defer_as(Compiler *c, int st, Buf *b, int indent, int tail) {
@@ -23760,7 +23898,7 @@ static int emit_stmt_or_defer_as(Compiler *c, int st, Buf *b, int indent, int ta
     if (tail) emit_stmt_tail(c, st, b, indent); else emit_stmt(c, st, b, indent);
     return 1;
   }
-  DeferMark dm; defer_mark(&dm, b);
+  DeferMark dm; defer_mark(c, &dm, b);
   volatile int ok = 0;
   if (setjmp(g_unsup_recover) == 0) {
     if (tail) emit_stmt_tail(c, st, b, indent); else emit_stmt(c, st, b, indent);
@@ -23768,7 +23906,7 @@ static int emit_stmt_or_defer_as(Compiler *c, int st, Buf *b, int indent, int ta
   }
   else {
     char dmsg[2600];
-    defer_rollback(&dm, dmsg, sizeof dmsg);
+    defer_rollback(c, &dm, dmsg, sizeof dmsg);
     /* the statement may be the value of a statement expression (the last
        one of a block spliced as a find's condition), so the raise keeps a
        value of its type: void there does not compile */
@@ -23780,7 +23918,7 @@ static int emit_stmt_or_defer_as(Compiler *c, int st, Buf *b, int indent, int ta
     if (dval) buf_printf(b, "\"), %s);\n", default_value_from_compiler(c, dt));
     else buf_puts(b, "\");\n");
   }
-  defer_done(&dm);
+  defer_done(c, &dm);
   return ok;
 }
 int emit_stmt_or_defer(Compiler *c, int st, Buf *b, int indent) {

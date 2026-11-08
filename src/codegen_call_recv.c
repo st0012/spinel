@@ -13022,7 +13022,9 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
     const char *cn = isa_const_name(nt, argv[0]);
     if (cn) {
       int cid = ty_object_class(rt);
-      int target = comp_class_index(c, cn);
+      /* (the class the constant names: an alias's is the class it holds) */
+      int target = const_node_class_index(c, argv[0]);
+      if (target < 0) target = comp_class_index(c, cn);
       /* an exception-subclass instance walks its carried cls_name chain --
          the class-index fold below answers 0 for builtin targets like
          StandardError, which have no user class index. Exception class names
@@ -14666,7 +14668,7 @@ int emit_range_call(Compiler *c, int id, Buf *b) {
     if (argc == 1 && is_kind_query(name)) {
       int is_iof = sp_streq(name, "instance_of?");
       char cnq[192];
-      const char *cn = isa_match_name(nt, argv[0], cnq, sizeof cnq);
+      const char *cn = isa_match_class_name(c, argv[0], cnq, sizeof cnq);
       buf_printf(b, "({ sp_RbVal _t%d = ", tr); emit_boxed(c, recv, b); buf_puts(b, "; ");
       if (cn && is_iof) buf_printf(b, "(sp_bool)(strcmp(sp_poly_class_name(_t%d), \"%s\") == 0); })", tr, cn);
       else if (cn)      buf_printf(b, "sp_poly_kind_of_builtin(_t%d, \"%s\"); })", tr, cn);
@@ -15980,10 +15982,10 @@ static int face_probe_arm(Compiler *c, int id, unsigned kind, unsigned flags, in
      and break state an arm abandoned partway through left set: a `times`
      arm dropped inside its loop left the loop depth raised, and the next
      method's ensure emitted a `continue` with no loop round it) */
-  ArmProbe ap; arm_probe_begin(&ap, pre);
+  ArmProbe ap; arm_probe_begin(c, &ap, pre);
   if (setjmp(g_unsup_recover) == 0) *nat = emit_face_arm(c, id, kind, flags, box, val);
   else { ok = 0; arm_probe_dropped(&ap); }
-  arm_probe_end(&ap, ok);
+  arm_probe_end(c, &ap, ok);
   view_unbind(sv_argov);
   return ok;
 }
@@ -16793,8 +16795,10 @@ static int emit_poly_call0_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
         buf_puts(b, "({ sp_RbVal _ep = "); emit_boxed(c, recv, b);
         /* nil, a number and a boolean have none either, and read as empty
            through the same 0 (#4485) */
+        /* a builtin with no length (Time, Regexp, Proc, Object.new, ...), a
+           Process::Tms or a Range has no #empty? either (sp_poly_no_empty) */
         buf_puts(b, "; sp_poly_coll_chk(_ep, \"empty?\");"
-                    " sp_poly_is_user_obj(_ep) ? (sp_raise_poly_nomethod(\"empty?\", _ep), 0)"
+                    " sp_poly_no_empty(_ep) ? (sp_raise_poly_nomethod(\"empty?\", _ep), 0)"
                     " : (sp_poly_length(_ep) == 0); })");
       }
       else if (sp_streq(name, "size")) {
@@ -18946,14 +18950,15 @@ static int cbi_key_ok(Compiler *c, int k) {
   /* a boxed key: whatever the walk follows into it (cls_fact_kinds) is an
      object of a class of the program's, a Symbol, nil, true, false or a
      container, none a number or a String, and each class it names is one
-     compared by pointer */
+     compared by pointer (an OpenStruct is, and a Class value is one object;
+     the set holds them where it holds a value from anywhere) */
   if (t != TY_POLY) return 0;
   an_cls_kinds(c);   /* (the walk runs once, at the first ask) */
   if (cls_fact_kinds(c, k) != 0) return 0;
   const ClsSet *s = cls_fact_node(c, k);
-  if (!s || s->all || s->os) return 0;
+  if (!s || s->all) return 0;
   for (int oc = cls_set_next(s, -1); oc >= 0; oc = cls_set_next(s, oc))
-    if (oc >= c->nclasses || c->classes[oc].is_value_type) return 0;
+    if (oc < c->nclasses && c->classes[oc].is_value_type) return 0;
   return 1;
 }
 static const char *cbi_use_ok(Compiler *c, int use, const int *par) {

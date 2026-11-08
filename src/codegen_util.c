@@ -2479,9 +2479,10 @@ static int ivs_init_sets(Compiler *c, int cid, const char *ivn, int depth, int s
 static int ivs_super_method(Compiler *c, int node, int cid, const char *name) {
   Scope *s = comp_scope_of(c, node);
   if (!s || s->is_cmethod) return -2;
-  const char *shadow = comp_super_shadow(c, s);
-  if (shadow) { int mi = comp_method_in_class(c, s->class_id, shadow); return mi < 0 ? -2 : mi; }
-  int pc = comp_super_parent(c, cid, 0);
+  const Scope *st = comp_super_site(c, s);
+  const char *shadow = comp_super_shadow(c, st);
+  if (shadow) { int mi = comp_method_in_class(c, st->class_id, shadow); return mi < 0 ? -2 : mi; }
+  int pc = comp_super_parent(c, st == s ? cid : st->class_id, 0);
   return pc < 0 ? -1 : comp_method_in_chain(c, pc, name, NULL);
 }
 /* May code under `n`, run in a method of class cid, see the object's ivars:
@@ -6017,10 +6018,11 @@ int call_never_returns(Compiler *c, int id) {
          given the call that builtin's type, not void) */
       int any = 0;
       for (int ci = 0; ci < c->nclasses; ci++) {
-        int dc = -1, m = call_target(c, id, ci, nm, 0, &dc);
+        MethodLookup ml = { .def_class = -1 };
+        int m = call_target(c, id, ci, nm, 0, &ml);
         /* a method nothing reaches is no arm of the dispatch: the call's
            type left it out too (#10636) */
-        if (m < 0 || dc != ci || !c->scopes[m].reachable) continue;
+        if (m < 0 || ml.def_class != ci || !c->scopes[m].reachable) continue;
         if (c->scopes[m].ret != TY_VOID) return 0;
         any = 1;
       }

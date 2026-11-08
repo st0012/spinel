@@ -633,6 +633,7 @@ int builtin_cmethod_known(const char *cls, const char *name);
 int builtin_super_cmethod_known(const char *cls, const char *name);
 int builtin_instance_name_known(const char *m);
 int builtin_classes_below_object_list(const char *m, Buf *out);
+int builtin_id_below_object_answers(int id, const char *m);
 int builtin_instance_method_known(const char *cls, const char *m);
 int builtin_arity_violation(Compiler *c, int id);
 int builtin_object_method_known(const char *m);
@@ -806,8 +807,8 @@ extern const char *g_ie_next_var;
    (#3978). TY_UNKNOWN when unknown or not a container. */
 extern TyKind g_ie_next_ty;
 typedef struct EmitUnitState EmitUnitState;
-EmitUnitState *emit_state_snapshot(void);
-void emit_state_release(EmitUnitState *s, int rollback);
+EmitUnitState *emit_state_snapshot(Compiler *c);
+void emit_state_release(Compiler *c, EmitUnitState *s, int rollback);
 extern TyKind g_bv_dest_ty;
 extern int g_c_loop_depth;   /* C-loop nesting inside the current fn body */
 extern int g_in_proc_body;   /* emitting a _proc_N function body */
@@ -1681,6 +1682,8 @@ int emit_interp_append(Compiler *c, int id, const char *open, const char *open_n
 int interp_is_literal_fold(const NodeTable *nt, int id);
 int emit_regex_pat_to_buf(Compiler *c, int nid, Buf *b);
 int nameset_has(NameSet *s, const char *nm);
+/* the program's own Array#inspect (a reopened Array), or -1 (codegen.c) */
+int array_user_inspect_mi(Compiler *c);
 void emit_param_cell_publish(Compiler *c, int blk, const char *pname, Buf *b, int indent);
 void nameset_add(NameSet *s, const char *nm);
 /* Emit the C lvalue for local `name` in the current emission context: a
@@ -1840,6 +1843,10 @@ int class_is_syserr(Compiler *c, int ci);          /* codegen_call.c */
 int class_is_sysexit(Compiler *c, int ci);         /* codegen_call.c */
 int class_takes_exc_attrs(Compiler *c, int ci);    /* codegen_call.c */
 void emit_exc_attrs_call(Compiler *c, int id, const char *self_text, int argc, const int *argv, Buf *b);
+void emit_exc_args_super(Compiler *c, int id, const char *self_text, int attrs, int argc, const int *argv, Buf *b);
+int exc_init_takes_own_args(const char *name);
+int exc_reopen_super_takes_attrs(const char *name);
+void emit_exc_new_runtime_args(Compiler *c, int id, int ci, const char *builtin, int argc, const int *argv, Buf *b);
 void emit_exc_attrs_new(Compiler *c, int id, int ci, int argc, const int *argv, Buf *b);
 int emit_exc_extra_args(Compiler *c, int id, int ci, int argc, const int *argv, Buf *b);
 void emit_sysexit_new(Compiler *c, int id, int ci, int argc, const int *argv, Buf *b);
@@ -1857,6 +1864,17 @@ static inline const char *isa_match_name(const NodeTable *nt, int arg, char *buf
   if (q && l && !sp_streq(q, l) &&
       (is_builtin_exception_name(q) || builtin_class_id(q) != 0)) return q;
   return l;
+}
+/* ...the same for a constant naming a class of the program: that class's
+   name, as the load record resolves the reference (const_node_class_index),
+   so an alias (`Money = Support::Money`) tests the class it holds */
+static inline const char *isa_match_class_name(Compiler *c, int arg, char *buf, size_t bufsz) {
+  NodeKind k = arg >= 0 ? nt_kind(c->nt, arg) : NK_NONE;
+  if (k == NK_ConstantReadNode || k == NK_ConstantPathNode) {
+    int ci = const_node_class_index(c, arg);
+    if (ci >= 0 && c->classes[ci].name) return c->classes[ci].name;
+  }
+  return isa_match_name(c->nt, arg, buf, bufsz);
 }
 /* ...the same by the slot a value constant's entity keys (const_key_at) */
 static inline const char *isa_match_key(Compiler *c, int arg, char *buf, size_t bufsz) {
@@ -2443,6 +2461,7 @@ const char *class_builtin_superclass_name(Compiler *c, int i);   /* codegen.c */
 int class_builtin_parent(Compiler *c, int cid);      /* codegen.c */
 int class_includes_module(Compiler *c, int cid, int mod);
 int class_isa_user(Compiler *c, int k, int cid);  /* codegen_call.c */
+void emit_exc_box_isa_arms(Compiler *c, int cid, const char *v, int exact, int *first, Buf *b);  /* codegen_call.c */
 int dispatch_impl_count(Compiler *c, int call, int cid, const char *name);
 /* do a dispatch switch's arms bind the call's arguments differently (each
    arm then lays them out itself)? the plan's CP_PER_ARM */
@@ -3017,14 +3036,14 @@ extern ConvHold *g_conv_hold;
    written since defer_mark, g_pre's, the conversion hold, the unit state.
    The caller arms g_unsup_recover with its own setjmp in between. */
 typedef struct { jmp_buf outer; Buf *b; size_t len; Buf *pre; size_t pre_len; ConvHold *hold; EmitUnitState *state; int ndiag0; } DeferMark;
-void defer_mark(DeferMark *m, Buf *b);
-void defer_rollback(DeferMark *m, char *msg, size_t msz);
-void defer_done(DeferMark *m);
+void defer_mark(Compiler *c, DeferMark *m, Buf *b);
+void defer_rollback(Compiler *c, DeferMark *m, char *msg, size_t msz);
+void defer_done(Compiler *c, DeferMark *m);
 /* an arm emitted under a silent probe (codegen_call.c) */
 typedef struct { jmp_buf jb; Buf *pre; int probe, open_defaults, moves, views; ConvHold *hold; EmitUnitState *state; } ArmProbe;
-void arm_probe_begin(ArmProbe *p, Buf *pre);
+void arm_probe_begin(Compiler *c, ArmProbe *p, Buf *pre);
 void arm_probe_dropped(ArmProbe *p);
-void arm_probe_end(ArmProbe *p, int ok);
+void arm_probe_end(Compiler *c, ArmProbe *p, int ok);
 extern unsigned g_conv_emitted;  /* implicit conversions emitted so far; read as a delta */
 Buf *conv_hold_begin(Buf *b, int *tmp);
 void conv_hold_end(int tmp);

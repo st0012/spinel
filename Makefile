@@ -58,7 +58,7 @@ RBS_SRC      = $(wildcard $(RBS_DIR)/src/*.c) $(wildcard $(RBS_DIR)/src/util/*.c
 RBS_OBJ      = $(patsubst $(RBS_DIR)/src/%.c,build/rbs/%.o,$(RBS_SRC))
 RBS_LIB      = build/librbs.a
 
-.PHONY: ty-setter-check imemo-shadow-test imemo-shadow-corpus int-min-test all hooks share-strings-test line-map-check unit-stability-test incremental-test incremental-bench gate-tool-test regexp wasm-rt wasm-test rbs_extract rbs-test rbs-seed-test inline-rbs-test rbs-seed-extractor cident plan-check-test timing-test shadow-check signal-default-test source-marker-test magic-comment-test repr-check-test run-scale-test gate-costs arm-check-test traits-check-test poly-cold-test bop-arity-check-test bop-callbacks-test bop-share-check-test share-spec-check bop-callbacks-check arity-spec-check value-edges-check value-edges-regen implied-calls-check implied-calls-regen implied-calls-test lower-rows-check node-kinds-check node-kinds-regen package-facts-check package-facts-regen value-pos-test re-lit-test reject-test cli-opts-test link-names-test reach-test defer-refusals-test check-stores-test backtrace-test gc-minor-test thread-puts-test ext-test ext-cruby-test alloc-report-test rubyspec rubyspec-gate spin-check \ repr-diff c-costs alloc-diff \
+.PHONY: ty-setter-check imemo-shadow-test imemo-shadow-corpus int-min-test all hooks share-strings-test line-map-check unit-stability-test incremental-test incremental-bench gate-tool-test regexp wasm-rt wasm-test rbs_extract rbs-test rbs-seed-test inline-rbs-test rbs-seed-extractor cident plan-check-test method-table-check timing-test shadow-check signal-default-test source-marker-test magic-comment-test repr-check-test run-scale-test gate-costs arm-check-test traits-check-test poly-cold-test bop-arity-check-test bop-callbacks-test bop-share-check-test share-spec-check bop-callbacks-check arity-spec-check builtin-method-tables-check builtin-method-tables-regen value-edges-check value-edges-regen implied-calls-check implied-calls-regen implied-calls-test lower-rows-check node-kinds-check node-kinds-regen package-facts-check package-facts-regen value-pos-test re-lit-test reject-test cli-opts-test link-names-test reach-test defer-refusals-test check-stores-test backtrace-test gc-minor-test thread-puts-test ext-test ext-cruby-test alloc-report-test rubyspec rubyspec-gate spin-check \ repr-diff c-costs alloc-diff \
         test test-run clean-test-results regen-rbs-expected \
         regen-expected regen-expected-err bench optcarrot gate gate-full check gate-legs gate-test gate-bench gc-phases-test gc-stress-test gc-str-major-test gc-str-budget-test threaded-render-test gc-locality-test test-corpus test-corpus-summary \
         gate-optcarrot rubyboy gate-rubyboy scale-test clean install uninstall deps tools
@@ -326,7 +326,7 @@ build/rbs/%.o: $(RBS_DIR)/src/%.c
 # `spinel` is the single binary: it emits C and then drives cc to link it.
 # (SPINEL itself is defined above, just before the `all` target.)
 
-SPINEL_HDRS = src/cext_bridge.h src/builtin_ops.h src/builtin_callbacks.inc src/implied_calls.inc src/implicit_calls.h src/builtin_name_traits.inc src/core_class_methods.inc src/builtin_zero_ops.inc src/builtin_arity.inc src/builtin_share_pure.inc src/codegen_call_arms.h src/builtin_names.h src/package_facts.inc src/ty_traits.inc src/call_plan.h src/value_pos.h src/implied_calls.h src/value_pos_arms.inc src/value_pos_edges.inc src/node_kinds.inc src/codegen_poly.h src/repr.h src/holder.h src/share.h src/node_table.h src/codegen.h src/codegen_internal.h src/types.h src/compiler.h src/analyze.h src/analyze_internal.h src/ffi_spec.h src/csplit.h src/ct_value.h src/ct_eval.h $(PLATFORM_HDRS)
+SPINEL_HDRS = src/cext_bridge.h src/builtin_ops.h src/builtin_callbacks.inc src/implied_calls.inc src/implicit_calls.h src/builtin_name_traits.inc src/core_class_methods.inc src/core_singleton_methods.inc src/builtin_zero_ops.inc src/builtin_arity.inc src/builtin_method_tables.inc src/builtin_share_pure.inc src/codegen_call_arms.h src/builtin_names.h src/package_facts.inc src/ty_traits.inc src/call_plan.h src/value_pos.h src/implied_calls.h src/value_pos_arms.inc src/value_pos_edges.inc src/node_kinds.inc src/codegen_poly.h src/repr.h src/holder.h src/share.h src/node_table.h src/codegen.h src/codegen_internal.h src/types.h src/compiler.h src/analyze.h src/analyze_internal.h src/ffi_spec.h src/csplit.h src/ct_value.h src/ct_eval.h $(PLATFORM_HDRS)
 build/csrc/analyze_desugar.o build/csrc-work/analyze_desugar.o build/csrc/codegen_call.o build/csrc-work/codegen_call.o: $(wildcard src/*_method_names.inc)
 SPINEL_OBJ  = build/csrc/node_table.o build/csrc/types.o build/csrc/compiler.o \
                build/csrc/ffi_spec.o build/csrc/ct_value.o build/csrc/ct_eval.o build/csrc/analyze_ct.o \
@@ -337,6 +337,9 @@ SPINEL_OBJ  = build/csrc/node_table.o build/csrc/types.o build/csrc/compiler.o \
 # The decision registry (--decisions, --decisions-log; `make decisions-test`).
 SPINEL_HDRS += src/decide.h
 SPINEL_OBJ  += build/csrc/decide.o
+# --method-table-check: the reads of the method tables made outside call_target.
+SPINEL_HDRS += src/method_table_check.h
+SPINEL_OBJ  += build/csrc/method_table_check.o
 # --incremental: the hashes that name a unit and key its cached object.
 SPINEL_HDRS += src/sha256.h
 SPINEL_OBJ  += build/csrc/sha256.o
@@ -1712,8 +1715,9 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	fi; \
 	if [ $$ok -eq 1 ]; then \
 	  if $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/host.c "$$tmp/k.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/host" 2>"$$tmp/cc.err"; then \
-	    "$$tmp/host" > "$$tmp/out" 2>&1; \
-	    cmp -s "$$tmp/out" test/ext/expected || { echo "ext-test: FAIL (host output mismatch)"; diff -u test/ext/expected "$$tmp/out" || true; ok=0; }; \
+	    "$$tmp/host" > "$$tmp/out" 2>&1; rc=$$?; \
+	    cmp -s "$$tmp/out" test/ext/expected && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (host output mismatch, or status $$rc)"; diff -u test/ext/expected "$$tmp/out" || true; ok=0; }; \
 	  else echo "ext-test: FAIL (host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
@@ -1721,8 +1725,9 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	      --ext-entry ExtThreads.par,ExtThreads.bg -o "$$tmp/t.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (threads emission)"; ok=0; \
 	  elif $(CC) -O1 -w $(MT_DEF) -Ilib -I"$$tmp" test/ext/threads_host.c "$$tmp/t.c" $(SP_RT_MT_LIB) $(LDFLAGS) -lm -lpthread -o "$$tmp/thost" 2>"$$tmp/cc.err"; then \
-	    $(TIMEOUT10) "$$tmp/thost" > "$$tmp/out" 2>&1; \
-	    printf '60\n150\n1\n' | cmp -s - "$$tmp/out" || { echo "ext-test: FAIL (threads host output mismatch, or it hung)"; cat "$$tmp/out"; ok=0; }; \
+	    $(TIMEOUT10) "$$tmp/thost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '60\n150\n1\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (threads host output mismatch, or it hung, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
 	  else echo "ext-test: FAIL (threads host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
@@ -1740,8 +1745,9 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	      --ext-entry ExtLateNew.e -o "$$tmp/l.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (late_new emission)"; ok=0; \
 	  elif $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/late_new_host.c "$$tmp/l.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/lhost" 2>"$$tmp/cc.err"; then \
-	    "$$tmp/lhost" > "$$tmp/out" 2>&1; \
-	    printf '2\n3\n' | cmp -s - "$$tmp/out" || { echo "ext-test: FAIL (late_new host output mismatch)"; cat "$$tmp/out"; ok=0; }; \
+	    "$$tmp/lhost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '2\n3\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (late_new host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
 	  else echo "ext-test: FAIL (late_new host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	rm -rf "$$tmp"; \
@@ -1768,8 +1774,9 @@ ext-cruby-test: $(SPINEL) $(SP_RT_LIB)
 	  if $(CC) $$SOFLAGS -fPIC -O1 -w $(filter -DSP_ONE_STRING,$(COPT)) -I"$$RH" -I"$$RA" -Ilib -Ilib/regexp -Ilib/regexp/shim -I"$$tmp" \
 	       "$$tmp/extk_ext.c" "$$tmp/extk.c" $$(ls lib/*.c lib/regexp/*.c | sed 's/^/ /') \
 	       $(LDFLAGS) -lm -o "$$tmp/extk.$$DLEXT" 2>"$$tmp/cc.err"; then \
-	    ( cd "$$tmp" && cp $(CURDIR)/test/ext/driver.rb . && ruby driver.rb > out 2>&1 ); \
-	    cmp -s "$$tmp/out" test/ext/expected_cruby || { echo "ext-cruby-test: FAIL (driver output mismatch)"; diff -u test/ext/expected_cruby "$$tmp/out" || true; ok=0; }; \
+	    ( cd "$$tmp" && cp $(CURDIR)/test/ext/driver.rb . && ruby driver.rb > out 2>&1 ); rc=$$?; \
+	    cmp -s "$$tmp/out" test/ext/expected_cruby && [ $$rc -eq 0 ] || \
+	      { echo "ext-cruby-test: FAIL (driver output mismatch, or status $$rc)"; diff -u test/ext/expected_cruby "$$tmp/out" || true; ok=0; }; \
 	  else echo "ext-cruby-test: FAIL (.so did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	rm -rf "$$tmp"; \
@@ -5098,6 +5105,21 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	[ "$$(awk '/^struct sp_(Heap|Plain)_s \{/ { c = $$2 } c && /iv_heap/ { print c, $$1; c = "" }' "$$tmp/itm.c" | tr '\n' ' ')" = "sp_Heap_s sp_PtrArray sp_Plain_s sp_PtrArray " ] || { echo "infer-test: FAIL (a table of Integer rows that moves its own rows stayed boxed under a signature)"; ok=0; }; \
 	$(SPINEL) test/int_table_row_through_second_table.rb -c --no-line-map -o "$$tmp/irt.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (int_table_row_through_second_table: -c)"; ok=0; }; \
 	[ "$$(awk '/^struct sp_(Through|AllRows)_s \{/ { c = $$2 } c && /iv_rows/ { print c, $$1; c = "" }' "$$tmp/irt.c" | tr '\n' ' ')" = "sp_Through_s sp_PolyArray sp_AllRows_s sp_PtrArray " ] || { echo "infer-test: FAIL (a table filled from a boxed Array's element through a second table narrowed, or one whose every row is an Integer Array stayed boxed)"; ok=0; }; \
+	$(SPINEL) test/param_int_table_literal.rb -c --no-line-map -o "$$tmp/pitl.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (param_int_table_literal: -c)"; ok=0; }; \
+	[ "$$(awk '/^struct sp_(Grid|Holder)_s \{/ { c = $$2 } c && /iv_rows/ { print c, $$1; c = "" }' "$$tmp/pitl.c" | tr '\n' ' ')" = "sp_Grid_s sp_PtrArray sp_Holder_s sp_PtrArray " ] && grep -qE '^static inline .*sp_int sp_row_sum\(sp_PtrArray \* lv_src\);$$' "$$tmp/pitl.c" && grep -qE '^static inline .*sp_int sp_corner\(sp_PtrArray \* lv_t\);$$' "$$tmp/pitl.c" && grep -qE '^static inline .*sp_describe\(sp_PolyArray \* lv_t\);$$' "$$tmp/pitl.c" && grep -qE '^static inline .*sp_push_odd\(sp_PolyArray \* lv_t\);$$' "$$tmp/pitl.c" && grep -qE '^static inline .*sp_rb_float_sum\(sp_PtrArray \* lv_rows\);$$' "$$tmp/pitl.c" || { echo "infer-test: FAIL (a literal of Integer or Float rows passed to a method kept its parameter boxed, or one with a String row or a String pushed narrowed it)"; ok=0; }; \
+	$(SPINEL) test/table_empty_row_literal.rb -c --no-line-map -o "$$tmp/terl.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_empty_row_literal: -c)"; ok=0; }; \
+	[ "$$(grep -oE '^ +sp_[A-Za-z]+Array \* lv_[xyfwzt] = NULL;' "$$tmp/terl.c" | tr '\n' ' ' | tr -s ' ')" = " sp_PolyArray * lv_x = NULL; sp_PolyArray * lv_y = NULL; sp_PolyArray * lv_f = NULL; sp_PtrArray * lv_w = NULL; sp_PtrArray * lv_z = NULL; sp_PtrArray * lv_t = NULL; " ] && awk '/^struct sp_Grid_s \{/,/^\}/' "$$tmp/terl.c" | grep -q 'sp_PolyArray \* iv_rows;' || { echo "infer-test: FAIL (a table whose empty row was built as a general Array narrowed, or one whose empty rows are built as rows stayed boxed)"; ok=0; }; \
+	$(SPINEL) test/rbs-seed/nested_array_literal_rows.rb --rbs test/rbs-seed/sig -c --no-line-map -o "$$tmp/nalr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (nested_array_literal_rows: -c)"; ok=0; }; \
+	[ "$$(awk '/^struct sp_Table_s \{/,/^\}/' "$$tmp/nalr.c" | grep -cE 'sp_PtrArray \* iv_(ints|floats);')" = 2 ] || { echo "infer-test: FAIL (a seeded table whose empty rows are pushed into stayed boxed)"; ok=0; }; \
+	$(SPINEL) test/table_row_to_mutating_param.rb -c --no-line-map -o "$$tmp/trm.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_row_to_mutating_param: -c, a walked row handed to a method storing another kind was refused)"; ok=0; }; \
+	grep -qE '^ +sp_PolyArray \* lv_t1 = NULL;$$' "$$tmp/trm.c" && grep -qE '^ +sp_PtrArray \* lv_t10 = NULL;$$' "$$tmp/trm.c" || { echo "infer-test: FAIL (a table whose walked row a method stores another kind into narrowed, or one whose rows go to no such method stayed boxed)"; ok=0; }; \
+	$(SPINEL) test/table_printed_narrows.rb -c --no-line-map -o "$$tmp/tpn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_printed_narrows: -c)"; ok=0; }; \
+	[ "$$(grep -oE '^ +sp_[A-Za-z]+Array \* lv_([xyfbezw]|errs|pts) = NULL;' "$$tmp/tpn.c" | tr '\n' ' ' | tr -s ' ')" = " sp_PtrArray * lv_x = NULL; sp_PtrArray * lv_y = NULL; sp_PtrArray * lv_f = NULL; sp_PtrArray * lv_b = NULL; sp_PtrArray * lv_e = NULL; sp_PolyArray * lv_z = NULL; sp_PolyArray * lv_w = NULL; sp_PolyArray * lv_errs = NULL; sp_PolyArray * lv_pts = NULL; " ] && grep -qE '^static inline sp_PtrArray \* sp_bump\(sp_PtrArray \* lv_t\);$$' "$$tmp/tpn.c" && awk '/^struct sp_Grid_s \{/,/^\}/' "$$tmp/tpn.c" | grep -q 'sp_PtrArray \* iv_rows;' || { echo "infer-test: FAIL (a table handed to a printer stayed boxed, or one whose p value is used or an Array of objects narrowed)"; ok=0; }; \
+	$(SPINEL) test/table_printed_user_puts.rb -c --no-line-map -o "$$tmp/tpu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_printed_user_puts: -c)"; ok=0; }; \
+	grep -qE '^ +sp_PolyArray \* lv_x = NULL;$$' "$$tmp/tpu.c" || { echo "infer-test: FAIL (a table handed to the program's own puts narrowed)"; ok=0; }; \
+	$(SPINEL) test/table_walk_row_each_proc.rb -c --no-line-map -o "$$tmp/twr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_walk_row_each_proc: -c)"; ok=0; }; \
+	awk '/^static inline sp_PolyArray \* sp_run\(sp_PtrArray \* lv_xs\) \{$$/ { f = 1 } f && /^}/ { exit } f' "$$tmp/twr.c" | grep -qE '^ +sp_IntArray \* lv_row__bp[0-9a-z_]* = NULL;$$' || { echo "infer-test: FAIL (a walk over a parameter's table of Integer rows kept its row boxed)"; ok=0; }; \
+	awk '/^static inline sp_RbVal sp_floats\(sp_PtrArray \* lv_xs\) \{$$/ { f = 1 } f && /^}/ { exit } f' "$$tmp/twr.c" | grep -qE '^ +sp_FloatArray \* lv_row__bp[0-9a-z_]* = NULL;$$' || { echo "infer-test: FAIL (a walk over a parameter's table of Float rows kept its row boxed)"; ok=0; }; \
 	$(SPINEL) test/object_array_reader_boxed_receiver.rb -c --no-line-map -o "$$tmp/orb.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_array_reader_boxed_receiver: -c)"; ok=0; }; \
 	[ "$$(awk '/^struct sp_(Node|Box|Crate|Pile|Bin)_s \{/ { c = $$2 } c && /iv_(links|items|first|slots)/ { print c, $$1; c = "" }' "$$tmp/orb.c" | tr '\n' ' ')" = "sp_Node_s sp_PtrArray sp_Box_s sp_PolyArray sp_Crate_s sp_PolyArray sp_Pile_s sp_PolyArray sp_Bin_s sp_PolyArray " ] || { echo "infer-test: FAIL (a reader called on a boxed value of one class kept its list boxed, or one that another class, a builtin or a foreign element could reach narrowed it)"; ok=0; }; \
 	$(SPINEL) test/one_class_hash_read_local.rb -c --no-line-map -o "$$tmp/ohr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (one_class_hash_read_local: -c)"; ok=0; }; \
@@ -5653,6 +5675,11 @@ shadow-check: $(SPINEL)
 plan-check-test: $(SPINEL)
 	@tools/plan_check.sh
 
+# #10866 step 1: the reads of the method tables made outside call_target, over
+# the corpus (not part of `make gate`)
+method-table-check: $(SPINEL)
+	@tools/method_table_check.sh
+
 repr-check-test: $(SPINEL)
 	@tools/repr_check.sh
 
@@ -5832,6 +5859,21 @@ share-spec-check:
 ARITY_RUBY ?= ruby
 arity-spec-check:
 	@$(ARITY_RUBY) tools/gen_builtin_arity_spec.rb --check
+
+# CRuby's own method tables for its builtin classes and modules
+# (src/builtin_method_tables.inc) against the CRuby they were generated from:
+# regenerates them in memory and fails on any drift. It needs a CRuby 4.0 (any
+# patch release) with its default gems; point it at one with
+# `make builtin-method-tables-check TABLES_RUBY=/path/to/ruby`. The regen
+# target rewrites the file. Both run with RUBYOPT cleared, as the oracle does,
+# and take each library at the version CRuby shipped and at the newest installed
+# (the tables are the union), so a machine with other gems can drift from the
+# checked-in file: the check is not part of the gate.
+TABLES_RUBY ?= ruby
+builtin-method-tables-check:
+	@env -u RUBYOPT $(TABLES_RUBY) --enable-frozen-string-literal tools/gen_builtin_method_tables.rb --check
+builtin-method-tables-regen:
+	@env -u RUBYOPT $(TABLES_RUBY) --enable-frozen-string-literal tools/gen_builtin_method_tables.rb --write
 
 # The value-position iterator (src/value_pos.c) on one method per shape: the
 # positions --dump-value-positions lists for test/value-pos/shapes.rb are the
@@ -6035,16 +6077,16 @@ STR_CHAIN_LIMIT ?= 4.6
 # ask reads 2.00x.
 ENGINE_FOLDS_LIMIT ?= 2.2
 # N receiver uses of a constant that aliases a class, among N classes of other
-# code (test/scale/alias_receivers.sh), compiled at 400 and 800 uses.
-# rewrite_const_alias_receivers asked the load record for each use after the
-# previous use's rename, which rebuilt its point map over the whole program
+# code (test/scale/alias_receivers.sh), compiled at 400 and 800 uses. Each use
+# asks the load record for the class its node names (const_node_class_index).
+# A pass that renamed each use to the class once asked after the previous
+# use's rename, which rebuilt the record's point map over the whole program
 # each time (799 rebuilds at 800 uses): 2.35x here, against 2.07x for the same
-# program with the class named directly. The pass asks for every use before it
-# renames any one.
+# program with the class named directly.
 ALIAS_RECEIVERS_LIMIT ?= 2.2
 # N `rescue Alias` sites, each with a `raise Alias`, among N classes of other
 # code (test/scale/alias_raise_targets.sh), at 400 and 800 sites: the same
-# ask-then-rename loop in rewrite_const_alias_raise_targets.
+# question, asked by the raise and the rescue arm (const_node_match_class).
 ALIAS_RAISE_LIMIT ?= 2.2
 # Open method histories (test/scale/cond_defs.sh), compiled to C at K=200 and
 # K=400: K define_methods under a run-time condition and K defs in one
@@ -6312,10 +6354,10 @@ scale-test: $(SPINEL_WORK)
 	  { echo "scale-test: FAIL (the instance_eval forwarding walk grew superlinearly in the wrapper classes, see build_ie_map)"; exit 1; }; \
 	awk -v a="$$ra" -v b="$$rb" -v lim="$(ALIAS_RECEIVERS_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: alias receiver work at 2x the uses is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (renaming one alias receiver made the next ask rebuild the load record, see rewrite_const_alias_receivers)"; exit 1; }; \
+	  { echo "scale-test: FAIL (an alias receiver's ask rebuilt the load record, see const_node_class_index)"; exit 1; }; \
 	awk -v a="$$ta" -v b="$$tb" -v lim="$(ALIAS_RAISE_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: alias raise and rescue work at 2x the sites is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (renaming one raised or rescued alias made the next ask rebuild the load record, see rewrite_const_alias_raise_targets)"; exit 1; }; \
+	  { echo "scale-test: FAIL (a raised or rescued alias's ask rebuilt the load record, see const_node_match_class)"; exit 1; }; \
 	awk -v a="$$wa" -v b="$$wb" -v lim="$(SCALE_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: work at 4x the program is %.2fx (linear 4.00, limit %.2f)\n", r, lim; exit (r > lim) }' || \
 	  { echo "scale-test: FAIL (the front end grew superlinearly: some pass rescans per node; profile per pass, see rubys/roundhouse#72)"; exit 1; }; \

@@ -159,7 +159,7 @@ src/analyze.c dyn_site_may_reach a scope's own name
 src/analyze.c dyn_site_misses a scope's own name
 src/analyze.c inline_replacing_def a scope's own name
 src/analyze.c iter_disc_self_targets =cur->name a scope's own name
-src/analyze.c mark_nullable_int_locals =sn super, by its def's name
+src/analyze.c super_parent_method =sn super, by its def's name
 src/analyze.c pf_in_class_dispatch a scope's own name
 src/analyze.c pf_scope_named a scope's own name
 src/analyze.c pf_wanted a scope's own name
@@ -175,7 +175,7 @@ src/analyze_infer.c an_poly_object_methods_listable whether a class the receiver
 src/analyze_pass.c infer_param_types_ex =s->name super, by its def's name
 src/analyze_pass.c propagate_prep_params a prepended method's own name
 src/analyze_scope.c cmethod_reaches_class_ivar_walk =c->scopes[mi].name a scope's own name
-src/analyze_scope.c forwarding_target_scan =s->name a scope's own name
+src/analyze_scope.c forwarding_target_scan =st->name the super site scope's own name
 src/analyze_scope.c mixin_presence_unguarded =m->name a scope's own name
 src/analyze_scope.c mixin_rebrought_behind =m->name a scope's own name
 src/analyze_scope.c mixin_meets_plain_late =m->name a scope's own name
@@ -227,6 +227,7 @@ src/codegen_call_class.c emit_refl_im_params a reflected method's name
 src/codegen_call_class.c obj_defines_own whether the receiver's class defines the reflection method itself
 src/codegen_call_class.c emit_refl_method_defined a reflected method's name
 src/codegen_call_method.c emit_method_obj_target =disp arity metadata for a boxed receiver's method, not an invocation target
+src/codegen_call_method.c emit_method_params_by_recv parameters metadata for a boxed receiver's method, as its arity, not an invocation target
 src/codegen_call_method.c emit_op_method_arity a Symbol argument's method
 src/codegen_call_method.c emit_method_source_target a Symbol argument's method
 src/codegen_call_object.c emit_blank_slate_defined_ask a Symbol argument's method
@@ -236,6 +237,7 @@ src/analyze.c desugar_builtin_method_obj a Symbol argument's method, and its wra
 src/analyze.c desugar_missing_method_obj a Symbol argument's helpers, found by their hidden names
 src/analyze.c desugar_kernel_method_block_arg a Symbol argument's method
 src/analyze.c dyn_method_prints a Symbol argument's method
+src/analyze.c oa_printer_takes_args whether the program defines a method of a printer's name
 src/analyze.c dyn_reach_value a String argument's method
 
 # a method, alias, member or mixin being registered, by its own name (an

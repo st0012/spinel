@@ -46,6 +46,7 @@
 #include <limits.h>
 #include "builtin_names.h"
 #include "call_plan.h"
+#include "method_table_check.h"
 
 int class_has_exc_name(Compiler *c, int ci);   /* codegen.c */
 
@@ -174,6 +175,19 @@ typedef struct CF {
      kdone per node, which of those it has recorded */
   int kon, knoall;   /* knoall: an every-class set added for a container's sake, no value's */
   unsigned char *kseed, *kdone;
+  /* ...and a Hash read like a record (#11078): contents kept per literal
+     Symbol key. kld[v] the Symbol a read v names (`h[:k]`), kst[e] the one
+     a store of e names (`h[:k] = e`, `{ k: e }`); an object's field F(o, k)
+     flows into its contents as a whole, and everything else its contents
+     take also reaches krest[o], so `h[:k]` holds F(o, k) and krest[o] and
+     every other reader the whole. A key `h[k] = v` stores (CF_KKEY) reaches
+     the whole alone, and a read by a key the walk does not know (CF_KVAL)
+     holds kval[o], all but the keys: the element a store under any key
+     puts, not the key itself. kown[contents element] is its object + 1;
+     kraw marks an edge that reaches the contents without the others. */
+  const char **kld, **kst;
+  int *kown, *krest, *kval, kraw;
+  const char *knm;   /* the name of the builtin call cf_builtin_rule is at */
   int *knarrow;   /* per node: cf_knarrow's answer, -2 not yet asked */
   /* the receiver flows a read or an iteration left out (cf_kskip): pairs,
      the call and the receiver; knoskip per node, the calls a rerun keeps
@@ -201,6 +215,10 @@ static void cf_oom(void) { fprintf(stderr, "spinel: out of memory\n"); exit(1); 
 /* a value from anywhere: of any kind, and maybe a container the walk does
    not track */
 #define CF_KANY (CK_UNSAFE | CF_KPTOP)
+/* the cf_entry owner of object o's fields, apart from those of the nodes */
+#define CF_KFIELD_OWNER(o) (-(1 << 29) - (o))
+/* the two names kst and kld hold besides a Symbol's: a key, and any key's read */
+static const char CF_KKEY[] = "#key", CF_KVAL[] = "#val";
 /* (cf_solve 2) the names a send of a computed name can call, per such
    send, from the walk before (cf_knames). While cf_kn_ready, the walk takes
    them (none for a send not listed) as the program's dynamic names: the
@@ -488,7 +506,10 @@ static void cf_grow_directed(CF *f) {
   CF_GROW(f->st); CF_GROW(f->nst); CF_GROW(f->cst);
   CF_GROW(f->oe_out); CF_GROW(f->oe_in);
   CF_GROW(f->ptop); CF_GROW(f->esc); CF_GROW(f->elobj); CF_GROW(f->summ); CF_GROW(f->smc);
-  if (f->kon) { CF_GROW(f->kseed); memset(f->kseed + f->dcap, 0, (size_t)(ncap - f->dcap)); }
+  if (f->kon) {
+    CF_GROW(f->kseed); memset(f->kseed + f->dcap, 0, (size_t)(ncap - f->dcap));
+    CF_GROW(f->kown); memset(f->kown + f->dcap, 0, sizeof(int) * (size_t)(ncap - f->dcap));
+  }
 #undef CF_GROW
   for (int i = f->dcap; i < ncap; i++) {
     f->succ[i] = NULL; f->nsucc[i] = 0; f->csucc[i] = 0;
@@ -619,10 +640,18 @@ static int cf_new_obj(CF *f) {
     f->cobj = f->cobj ? f->cobj * 2 : 1024;
     if (!(f->obj_cont = realloc(f->obj_cont, sizeof(int) * (size_t)f->cobj))) cf_oom();
     if (!(f->obj_str = realloc(f->obj_str, (size_t)f->cobj))) cf_oom();
+    if (f->kon && !(f->krest = realloc(f->krest, sizeof(int) * (size_t)f->cobj))) cf_oom();
+    if (f->kon && !(f->kval = realloc(f->kval, sizeof(int) * (size_t)f->cobj))) cf_oom();
   }
   int o = f->nobj++;
   f->obj_cont[o] = k;
   f->obj_str[o] = 0;
+  if (f->kon) {
+    int r = cf_new_el(f), w = cf_new_el(f);
+    f->krest[o] = r;
+    f->kval[o] = w;
+    f->kown[k] = o + 1;
+  }
   return o;
 }
 /* Is node x a String: a literal, an interpolation, or a builtin's answer
@@ -756,8 +785,14 @@ static void cf_kick(CF *f, int src) {
 }
 /* an edge src -> dst, once */
 static void cf_edge(CF *f, int src, int dst) {
+  int raw = f->kraw;
+  f->kraw = 0;
   if (src < 0 || dst < 0 || src == dst) return;
   if (!cf_mark(f, CF_KEY(src, dst, 0))) return;
+  if (f->kon && !raw && f->kown[dst]) {
+    cf_edge(f, src, f->krest[f->kown[dst] - 1]);
+    cf_edge(f, src, f->kval[f->kown[dst] - 1]);
+  }
   cf_push_int(&f->succ[src], &f->nsucc[src], &f->csucc[src], dst);
   f->st_edges++;
   f->changed = 1;
@@ -777,6 +812,10 @@ static void cf_edge(CF *f, int src, int dst) {
 static void cf_pedge(CF *f, int src, int dst) {
   if (src < 0 || dst < 0 || src == dst) return;
   if (!cf_mark(f, CF_KEY(src, dst, 1))) return;
+  if (f->kon && f->kown[dst]) {
+    cf_pedge(f, src, f->krest[f->kown[dst] - 1]);
+    cf_pedge(f, src, f->kval[f->kown[dst] - 1]);
+  }
   cf_push_int(&f->psucc[src], &f->npsucc[src], &f->cpsucc[src], dst);
   f->changed = 1;
   if (f->npts[src]) { cf_push_int(&f->fs, &f->nfs, &f->cfs, src); cf_push_int(&f->fs, &f->nfs, &f->cfs, dst); }
@@ -791,12 +830,52 @@ static void cf_pedge(CF *f, int src, int dst) {
    allocation kinds) asked the key table a few hundred million times for a
    few hundred thousand edges. A bit per element and object below 64
    remembers that cf_edge was asked, which is all a second ask would do. */
+static int cf_entry(CF *f, int cls, const char *name);
+/* The member a pattern's capture v binds, `in K[m:]` or `in K[m: v]`, K a
+   Struct or a Data whose deconstruct_keys is its own: that member's element,
+   or -1 for any other capture */
+static int cf_kpattern_member(CF *f, int v) {
+  const NodeTable *nt = f->nt;
+  Compiler *c = f->c;
+  int p = f->par ? f->par[v] : -1;
+  if (p >= 0 && nt_kind(nt, p) == NK_ImplicitNode) p = f->par[p];
+  if (p < 0 || nt_kind(nt, p) != NK_AssocNode) return -1;
+  int key = nt_ref(nt, p, "key"), hp = f->par[p];
+  if (key < 0 || nt_kind(nt, key) != NK_SymbolNode || hp < 0 || nt_kind(nt, hp) != NK_HashPatternNode) return -1;
+  int cons = nt_ref(nt, hp, "constant");
+  int k = cons >= 0 ? const_node_class_index(c, cons) : -1;
+  if (k < 0 || k >= c->nclasses || !(c->classes[k].is_struct || c->classes[k].is_data)) return -1;
+  if (comp_method_in_chain(c, k, "deconstruct_keys", NULL) >= 0) return -1;
+  const char *nm = nt_str(nt, key, "value");
+  for (int r = 0; nm && r < c->classes[k].nreaders; r++) {
+    if (!sp_streq(c->classes[k].readers[r], nm)) continue;
+    char ivn[256]; snprintf(ivn, sizeof ivn, "@%s", nm);
+    return cf_entry(f, f->fam[k], ivn);
+  }
+  return -1;
+}
 static void cf_obj_edge(CF *f, int x, int o, int out) {
   if (x < 0) return;
   if (o < 64) {
     unsigned long long *b = out ? &f->oe_out[x] : &f->oe_in[x], m = 1ULL << o;
     if (*b & m) return;
     *b |= m;
+  }
+  /* (the kinds' walk) a store or a read by a literal Symbol key */
+  const char *sym = f->kon && x < f->nnodes ? (out ? f->kst[x] : f->kld[x]) : NULL;
+  if (sym && sym == CF_KVAL) {
+    cf_edge(f, f->kval[o], x);
+    return;
+  }
+  if (sym) {
+    int fe = cf_entry(f, CF_KFIELD_OWNER(o), sym);
+    f->kraw = 1;
+    cf_edge(f, fe, f->obj_cont[o]);
+    f->kraw = 0;
+    if (sym != CF_KKEY) cf_edge(f, fe, f->kval[o]);
+    if (out) cf_edge(f, x, fe);
+    else { cf_edge(f, fe, x); cf_edge(f, f->krest[o], x); }
+    return;
   }
   if (out) cf_edge(f, x, f->obj_cont[o]);
   else cf_edge(f, f->obj_cont[o], x);
@@ -1938,6 +2017,11 @@ static void cf_bind_args(CF *f, int mi, const int *argv, int argc) {
   /* a keyword hash the method takes as a positional Hash */
   int kw_as_hash = kwh >= 0 && (!has_kw || (f->exc_kw && f->exc_kw[kwh] && m->name && is_initialize_name(m->name)));
   if (kw_as_hash && npos < 256) { pos[npos++] = kwh; kwh = -1; }
+  /* (the kinds' walk) more arguments than the method can take: the call
+     raises ArgumentError and binds nothing. A call on a receiver the walk
+     does not bound names every method of the name, `klass.new(a, b, c)`
+     every initialize. */
+  if (f->kon && !splat && m->rest_idx < 0 && npos > np) return;
   /* (the kinds' walk) no splat, a rest parameter after required ones only:
      the leading arguments are those parameters, the others the rest's
      elements */
@@ -2208,6 +2292,9 @@ static void cf_each_yields(CF *f, int recv_el, int pe) {
 /* the class-fact rule of one share kind (bop_share_kinds): what the
    call's value is made of; known cleared for a kind with no rule */
 static void cf_share_kind_rule(CF *f, int sh, int v, int recv_el, const int *pos, int npos, int blk, int has_blk, int *known) {
+  /* (the kinds' walk) a builtin's `x[k] = v` is a store whichever the other
+     rows of the name say of their receivers, and it answers v */
+  if (f->kon && f->knm && (sp_streq(f->knm, "[]=") || sp_streq(f->knm, "store")) && sh != BSH_STORE_LAST) return;
   switch (sh) {
   case BSH_PURE: case BSH_ITER_FRESH:
     cf_add_set(f, v, cf_bv_set(f));
@@ -2220,7 +2307,9 @@ static void cf_share_kind_rule(CF *f, int sh, int v, int recv_el, const int *pos
     /* (the rows tell the String a store keeps from the index or the key it
        copies; a class fact keeps the key as an element too, `h[k] = v`, so
        every argument is stored) */
-    cf_flow(f, recv_el, v);
+    /* (the kinds' walk) `h[k] = v` answers v, not the container */
+    if (f->kon && npos > 0 && f->knm && (sp_streq(f->knm, "[]=") || sp_streq(f->knm, "store"))) cf_flow(f, pos[npos - 1], v);
+    else cf_flow(f, recv_el, v);
     for (int i = 0; i < npos; i++) {
       if (sh == BSH_MERGE) { cf_share(f, recv_el, pos[i]); cf_share(f, v, pos[i]); }
       else cf_store(f, recv_el, pos[i]);
@@ -2352,6 +2441,23 @@ static void cf_resume_args(CF *f, const int *argv, int argc) {
 }
 static void cf_builtin_rule(CF *f, int v, int recv_el, const int *argv, int argc, int blk, const char *nm) {
   const NodeTable *nt = f->nt;
+  f->knm = nm;
+  /* (the kinds' walk) a read or a store by a literal Symbol key: cf_obj_edge */
+  if (f->kon && nm && argc >= 1) {
+    NodeKind k0 = nt_kind(nt, argv[0]);
+    int plain0 = k0 != NK_SplatNode && k0 != NK_BlockArgumentNode && k0 != NK_KeywordHashNode;
+    const char *sym = k0 == NK_SymbolNode ? nt_str(nt, argv[0], "value") : NULL;
+    /* (a read answers an element, whichever the key) */
+    if (v >= 0 && v < f->nnodes && plain0 && !f->kld[v]) {
+      if (argc == 1 && sp_streq(nm, "[]")) f->kld[v] = sym ? sym : CF_KVAL;
+      else if (sp_streq(nm, "fetch") || sp_streq(nm, "dig") || sp_streq(nm, "delete")) f->kld[v] = CF_KVAL;
+    }
+    if (argc == 2 && plain0 && (sp_streq(nm, "[]=") || sp_streq(nm, "store"))) {
+      NodeKind ak = nt_kind(nt, argv[1]);
+      if (argv[0] >= 0 && argv[0] < f->nnodes) f->kst[argv[0]] = CF_KKEY;
+      if (sym && argv[1] >= 0 && argv[1] < f->nnodes && ak != NK_SplatNode && ak != NK_BlockArgumentNode && ak != NK_KeywordHashNode) f->kst[argv[1]] = sym;
+    }
+  }
   /* a builtin that answers a Proc: a conversion, a currying, a Hash's
      default proc, and a composition of a Proc */
   if (v >= 0 && nm) {
@@ -2527,6 +2633,17 @@ static void cf_builtin_rule(CF *f, int v, int recv_el, const int *argv, int argc
     }
     kfresh = 1;   /* (no other note) */
   }
+  /* (the kinds' walk) `x[:k]`: of the builtins only a Hash takes a Symbol
+     there (an Integer's, a String's and an Array's raise TypeError), and it
+     answers an element, not a value of its own as the other rows of the name
+     do. A Proc's is its call, and a receiver the walk does not bound may be
+     anything. */
+  if (f->kon && !kfresh && v >= 0 && v < f->nnodes && f->kld[v] && f->kld[v] != CF_KVAL) {
+    int rs = recv_el >= 0 ? cf_set_of(f, recv_el) : CF_ALL;
+    if (rs != CF_ALL && !(rs != CF_EMPTY && f->pool[rs].pr)) kfresh = 1;   /* (no other note) */
+  }
+  /* (and a builtin's store answers what it stored: cf_share_kind_rule) */
+  if (f->kon && !kfresh && (sp_streq(nm, "[]=") || sp_streq(nm, "store"))) kfresh = 1;
   if (!kfresh) {
     int bargs = blk >= 0 && nt_kind(nt, blk) == NK_BlockArgumentNode;
     for (int i = 0; i < argc && !bargs; i++) bargs = nt_kind(nt, argv[i]) == NK_BlockArgumentNode || nt_kind(nt, argv[i]) == NK_SymbolNode;
@@ -2811,6 +2928,24 @@ static void cf_construct(CF *f, int v, int x, const int *argv, int argc, int blk
   if (init >= 0) { cf_user_target(f, -1, init, argv, argc, blk); return; }
   if (k->is_struct || k->is_data) cf_member_args(f, x, argv, argc);
   if (blk >= 0 && nt_kind(nt, blk) == NK_BlockNode) cf_all_block_params(f, blk);
+}
+
+/* `self.new` (or `allocate`) at v in a class method of class cid: an
+   instance of cid or of a class below it, the one the method runs for, each
+   built as `X.new` builds it. A bare super that builds so (zsuper_of, its
+   method) hands initialize that method's parameters, by position */
+static void cf_self_new(CF *f, int v, int cid, const int *argv, int argc, int blk, const char *nm, int zsuper_of) {
+  Compiler *c = f->c;
+  int dsi = f->desc[cid];   /* (by index: a construction adds sets, and the pool moves) */
+  cf_add_set(f, v, dsi);
+  if (f->pool[dsi].all) { for (int i = 0; i < argc; i++) cf_all(f, argv[i]); return; }
+  for (int i = cls_set_next(&f->pool[dsi], -1); i >= 0; i = cls_set_next(&f->pool[dsi], i)) {
+    cf_construct(f, -1, i, argv, argc, blk, nm);
+    int init = zsuper_of >= 0 ? comp_method_in_chain(c, i, "initialize", NULL) : -1;
+    if (init < 0) continue;
+    const Scope *s = &c->scopes[zsuper_of], *ts = &c->scopes[init];
+    for (int p = 0; p < s->nparams && p < ts->nparams; p++) cf_flow(f, cf_param_el(f, zsuper_of, p), cf_param_el(f, init, p));
+  }
 }
 
 /* `d.with(k: v)` on a Data x: a new instance, initialized as `new`
@@ -3269,7 +3404,13 @@ static void cf_call_any_at(CF *f, int v, const char *nm, const int *argv, int ar
     for (int k = 0; k < c->nclasses; k++)
       if (c->classes[k].is_data && comp_method_in_chain(c, k, "with", NULL) < 0) cf_data_with(f, -1, k, argv, argc);
   /* the block's parameters and the arguments may go anywhere */
-  if (blk >= 0 && nt_kind(f->nt, blk) == NK_BlockNode) { cf_all_block_params(f, blk); cf_flow(f, blk, v); }
+  if (blk >= 0 && nt_kind(f->nt, blk) == NK_BlockNode) {
+    cf_all_block_params(f, blk);
+    /* (the kinds' walk) an iteration of a name that drops its block's values
+       answers none of them: a builtin's does not, and a method of the
+       program's of the name returns its own through the walk (cf_bind_block) */
+    if (!(f->kon && cf_drops_block_value(nm))) cf_flow(f, blk, v);
+  }
   /* (the kinds: code the walk does not see may store into an argument's
      containers, but a query stores nothing) */
   int kesc = f->kon && cf_kfills_of(f, nm);
@@ -3966,10 +4107,7 @@ static void cf_call(CF *f, int v) {
     int si = cf_scope_of(f, v);
     Scope *s = &c->scopes[si];
     if (s->def_node >= 0 && s->is_cmethod && s->class_id >= 0 && call_target(c, v, s->class_id, nm, CT_CMETHOD, NULL) < 0) {
-      int dsi = f->desc[s->class_id];   /* (by index: a construction adds sets, and the pool moves) */
-      cf_add_set(f, v, dsi);
-      if (f->pool[dsi].all) { for (int i = 0; i < argc; i++) cf_all(f, argv[i]); return; }
-      for (int i = cls_set_next(&f->pool[dsi], -1); i >= 0; i = cls_set_next(&f->pool[dsi], i)) cf_construct(f, -1, i, argv, argc, blk, nm);
+      cf_self_new(f, v, s->class_id, argv, argc, blk, nm, -1);
       return;
     }
   }
@@ -4319,9 +4457,17 @@ static void cf_node(CF *f, int v) {
     if (f->directed) cf_el_obj(f, v);
     int n = 0; const int *els = nt_arr(nt, v, "elements", &n);
     for (int i = 0; i < n; i++) {
-      if (nt_kind(nt, els[i]) == NK_AssocNode) cf_store(f, v, nt_ref(nt, els[i], "key"));
+      if (nt_kind(nt, els[i]) == NK_AssocNode) {
+        int kn = nt_ref(nt, els[i], "key");
+        if (f->kon && kn >= 0 && kn < f->nnodes) f->kst[kn] = CF_KKEY;
+        cf_store(f, v, kn);
+      }
       if (nt_kind(nt, els[i]) == NK_AssocSplatNode) cf_share(f, v, nt_ref(nt, els[i], "value"));
-      else cf_store(f, v, nt_ref(nt, els[i], "value"));
+      else {
+        int key = nt_ref(nt, els[i], "key"), val = nt_ref(nt, els[i], "value");
+        if (f->kon && key >= 0 && nt_kind(nt, key) == NK_SymbolNode && val >= 0 && val < f->nnodes) f->kst[val] = nt_str(nt, key, "value");
+        cf_store(f, v, val);
+      }
     }
     return;
   }
@@ -4397,6 +4543,11 @@ static void cf_node(CF *f, int v) {
     if (p >= 0 && (nt_kind(nt, p) == NK_RescueNode || nt_kind(nt, p) == NK_ForNode)) return;
     if (cf_destructured_block_param(f, v)) return;   /* bound with the block's parameters */
     if (cf_masgn_target(f, v)) return;               /* bound by its multiple assignment */
+    /* (the kinds' walk) a capture of a Struct's or a Data's member */
+    if (f->kon) {
+      int me = cf_kpattern_member(f, v);
+      if (me >= 0) { cf_flow(f, me, cf_lv(f, v, nt_str(nt, v, "name"))); return; }
+    }
     cf_all(f, cf_lv(f, v, nt_str(nt, v, "name")));
     return;
   }
@@ -4675,6 +4826,13 @@ static void cf_node(CF *f, int v) {
         int md = ci->included_mods[m];
         if (md >= 0 && md < c->nclasses && comp_method_in_chain(c, md, s->name, NULL) >= 0) anc_user = 1;
       }
+    }
+    /* a super in a class's own `exception` that reaches Exception's builds
+       the receiving class as `new` does (desugar_exception_super_new, which
+       runs after these facts, spells it `self.new`) */
+    if (!anc_user && s->is_cmethod && s->class_id >= 0 && exc_super_in_exception_cmethod(c, v)) {
+      cf_self_new(f, v, s->class_id, argv2, argc2, blk, "new", k == NK_ForwardingSuperNode ? mi : -1);
+      return;
     }
     if (!anc_user && !(s->is_cmethod && sp_streq(s->name, "new"))) {
       int ik = s->is_cmethod ? -1 : cf_inst_class(f, mi);
@@ -5302,12 +5460,14 @@ static void cf_kinds(CF *f) {
     km[x] = f->kseed[x];
     if (x < f->nnodes) km[x] |= (unsigned char)cf_knode(f, x);
   }
+  /* (what is marked on a container's contents as a whole is every field's) */
+  for (int o = 0; o < f->nobj; o++) { km[f->krest[o]] |= km[f->obj_cont[o]]; km[f->kval[o]] |= km[f->obj_cont[o]]; }
   for (int x = 0; x < n; x++)
     if (f->nld[x] && cf_kholds_str(f, x))
       for (int i = 0; i < f->nld[x]; i++) km[f->ld[x][i]] |= CK_UNSAFE;
   for (int i = 0; i < f->nkcu; i++) {
     int r = f->kcu[i];
-    for (int j = 0; j < f->npts[r]; j++) km[f->obj_cont[f->pts[r][j]]] |= CF_KANY;
+    for (int j = 0; j < f->npts[r]; j++) { km[f->obj_cont[f->pts[r][j]]] |= CF_KANY; km[f->krest[f->pts[r][j]]] |= CF_KANY; km[f->kval[f->pts[r][j]]] |= CF_KANY; }
   }
   for (int i = 0; i < f->nkesc; i++) escd[f->kesc[i]] = 1;
   /* the stores a query's argument makes into an every-class receiver, which
@@ -5318,7 +5478,7 @@ static void cf_kinds(CF *f) {
   for (int i = 0; i < nq; i++) qk[i] = ((unsigned long long)(unsigned)f->kqs[2 * i] << 32) | (unsigned)f->kqs[2 * i + 1];
   qsort(qk, (size_t)nq, sizeof *qk, cf_kcmp);
   for (int x = 0; x < n; x++)
-    if (escd[x]) for (int j = 0; j < f->npts[x]; j++) km[f->obj_cont[f->pts[x][j]]] |= CF_KANY;
+    if (escd[x]) for (int j = 0; j < f->npts[x]; j++) { km[f->obj_cont[f->pts[x][j]]] |= CF_KANY; km[f->krest[f->pts[x][j]]] |= CF_KANY; km[f->kval[f->pts[x][j]]] |= CF_KANY; }
   int nw = 0;
   for (int x = 0; x < n; x++) if (km[x]) { wl[nw++] = x; in[x] = 1; }
   for (int again = 1; again; ) {
@@ -5339,7 +5499,11 @@ static void cf_kinds(CF *f) {
             if (bsearch(&key, qk, (size_t)nq, sizeof *qk, cf_kcmp)) continue;
           }
           escd[e] = 1;
-          for (int j = 0; j < f->npts[e]; j++) cf_kpush(km, wl, &nw, in, f->obj_cont[f->pts[e][j]], CF_KANY);
+          for (int j = 0; j < f->npts[e]; j++) {
+            cf_kpush(km, wl, &nw, in, f->obj_cont[f->pts[e][j]], CF_KANY);
+            cf_kpush(km, wl, &nw, in, f->krest[f->pts[e][j]], CF_KANY);
+            cf_kpush(km, wl, &nw, in, f->kval[f->pts[e][j]], CF_KANY);
+          }
         }
     }
     again = 0;
@@ -5474,6 +5638,7 @@ static void cf_alias_groups(CF *f) {
 static void cf_solve(Compiler *c, int directed, int dump_facts) {
   const NodeTable *nt = c->nt;
   CF f;
+  mtab_enter(c);   /* (the class facts ask every class, as the candidates do) */
   memset(&f, 0, sizeof f);
   f.rt_obj = f.rtc = f.rvis = f.dynarg = f.every = -1;   /* (made below, in directed mode: none until then) */
   /* directed 2: the walk of the kinds alone (cf_kinds), whose classes are
@@ -5521,6 +5686,8 @@ static void cf_solve(Compiler *c, int directed, int dump_facts) {
   if (f.kon) {
     f.knoskip = cf_knoskip_arg;
     f.kdone = calloc((size_t)nt->count + 1, 1);
+    f.kld = calloc((size_t)nt->count + 1, sizeof *f.kld);
+    f.kst = calloc((size_t)nt->count + 1, sizeof *f.kst);
     f.knarrow = malloc(sizeof(int) * ((size_t)nt->count + 1));
     f.kpair = malloc(sizeof(int) * ((size_t)nt->count + 1));
     if (!f.kdone || !f.knarrow || !f.kpair) cf_oom();
@@ -5862,9 +6029,10 @@ static void cf_solve(Compiler *c, int directed, int dump_facts) {
     free(f.psucc); free(f.npsucc); free(f.cpsucc); free(f.pts); free(f.npts); free(f.cpts);
     free(f.ld); free(f.nld); free(f.cld); free(f.st); free(f.nst); free(f.cst); free(f.oe_out); free(f.oe_in);
     free(f.ptop); free(f.esc); free(f.elobj); free(f.summ); free(f.smc); free(f.obj_cont); free(f.obj_str); free(f.fs);
-    free(f.kseed); free(f.kdone); free(f.kx); free(f.kstr); free(f.kcu); free(f.kesc); free(f.kqs); free(f.kk); free(f.knarrow); free(f.kskp); free(f.kdefs); free(f.kpair); free(f.ksend); free(f.kskiparm);
+    free(f.kseed); free(f.kdone); free(f.kld); free(f.kst); free(f.kown); free(f.krest); free(f.kval); free(f.kx); free(f.kstr); free(f.kcu); free(f.kesc); free(f.kqs); free(f.kk); free(f.knarrow); free(f.kskp); free(f.kdefs); free(f.kpair); free(f.ksend); free(f.kskiparm);
   }
   free(f.exc_kw);
+  mtab_leave(c);
 }
 
 /* SPINEL_CLS_FLOW: the directed sets beside the unified ones, per call

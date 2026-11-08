@@ -48,6 +48,7 @@
 #include "analyze_internal.h"
 #include "builtin_names.h"
 #include "builtin_ops.h"
+#include "call_plan.h"
 #include "implicit_calls.h"
 #include "timing.h"
 #include <limits.h>
@@ -165,6 +166,7 @@ struct LoadRecord {
      and by node, the entity + 1 a write is of or a read names (0: none, a
      class's, or a node made since) */
   char **ckey; int nckey; int *cent; int ncent; int ckey_gen;
+  int *cwown;   /* by constant write (and its target): its class, as lr_const_owner numbers it */
   LrSlot *slot; int nslot, cslot, *slot_head, slot_builds;
   LrSlotPoint *slotp; int nslotp, cslotp; long slot_entries;
   /* lr_const_seen's and lr_const_final's facts of every written name (lr_final_index), and what they are of */
@@ -1103,14 +1105,20 @@ static LrHist *lr_hist(LoadRecord *r, int a, int b, const char *name, int make) 
   return x;
 }
 
+/* The entries changed (one made, one dropped): the by-name index, the late and
+   open bits and elab_class_surface's are of the entries before */
+static void lr_entries_changed(LoadRecord *r) {
+  r->nentries++; r->hgen++;
+  free(r->surf); free(r->surf_at); r->surf = NULL; r->surf_at = NULL;
+}
+
 static void lr_version(LoadRecord *r, int a, int b, const char *name, LrDef d) {
   LrHist *x = lr_hist(r, a, b, name, 1);
   if (!x) return;
   if (d.target && !(d.target = strdup(d.target))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   x->v = lr_grow(x->v, &x->cap, x->n, sizeof *x->v);
   x->v[x->n++] = d;
-  r->nentries++; r->hgen++;
-  free(r->surf); free(r->surf_at); r->surf = NULL; r->surf_at = NULL;   /* elab_class_surface's are of fewer entries */
+  lr_entries_changed(r);
 }
 
 /* cls's history (LR_MAIN: main's, Object's), NULL for a class the record
@@ -2264,6 +2272,8 @@ static int lr_foreign_mixin(ElabRec *x, int node, const LrMixin *m, int cls, int
 }
 
 static int lr_const_root_undefined(const NodeTable *nt, int n);
+static int lr_sg_chain_runs(Compiler *c, int cls, const char *name, LoadPoint p, const LrDef **out);
+static int lr_sg_chain_find(Compiler *c, int cls, const char *name, LoadPoint p, const LrDef **out, int *found);
 static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int fnode, int may, int nested) {
   const NodeTable *nt = x->c->nt;
   const char *nm = nt_str(nt, node, "name");
@@ -2307,6 +2317,38 @@ static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int
      `include B` then `include A` would, and so do prepend and extend: the
      arguments of a mixin are recorded last first */
   int mix = is_mixin_call(nm);
+  /* `include M` where the class's own `def self.include` (or a
+     superclass's) is what the call finds: that method runs, and it mixes
+     nothing in by itself. The call is the program's, which may do anything
+     (codegen reads the mark and emits it as a call) */
+  const LrDef *own = NULL;
+  int oc = cls;
+  if (mix && !sg && cls >= 0 && !nested && !nt_int(nt, node, "sclass_mixin", 0) &&
+      lr_sg_chain_find(x->c, cls, nm, elab_point_of(x->c, node), &own, &oc) == ELAB_YES) {
+    /* an alias (`alias include ci` in `class << self`) runs the method it
+       took: the version of its target on the class that holds the alias,
+       as it stood at the alias. An alias of the builtin itself (`alias
+       include prepend`) finds no method of the program's there, and is
+       left to the builtin's mixin, as before. */
+    for (int step = 0; own && own->kind == LR_ALIAS && own->target && step < 8; step++) {
+      /* an alias found through an extended module is that module's: its
+         target is the module's instance method, which this search does
+         not walk, so it keeps the builtin mixin as before */
+      int an = own->node;
+      if (an < 0 || an >= x->c->node_cap || x->c->node_cbody[an] != oc) { own = NULL; break; }
+      const LrDef *to = NULL;
+      int tc = oc;
+      if (lr_sg_chain_find(x->c, oc, own->target, elab_point_of(x->c, own->node), &to, &tc) != ELAB_YES) { own = NULL; break; }
+      own = to; oc = tc;
+    }
+    /* the definition the call finds there: a def or a define_method, by
+       its node (codegen reads its body) */
+    int dn = own && (own->kind == LR_DEF || own->kind == LR_DEFINE_METHOD) ? own->node : -1;
+    if (dn >= 0) {
+      nt_node_set_int((NodeTable *)nt, node, "mixin_own_call", dn + 1);
+      mix = 0; naming = 0;
+    }
+  }
   for (int j = 0; j < ac; j++) {
     int i = mix ? ac - 1 - j : j;
     const char *an_ = vis_arg_name(nt, av[i]);
@@ -3075,7 +3117,7 @@ static void lr_settle_regions(Compiler *c) {
    they stand, again once more entries have been recorded. */
 typedef struct LrVers { const char *name; int first, nver, next, pend, alias; unsigned char captured, replaced, late; } LrVers;   /* captured: elab_version_captured's memo, 1 no, 2 yes; replaced: one history holds two versions, or an alias; late: lr_late_make's, 1 no history late, 2 one is, 3 none asked; pend: the histories asked that are not late yet; alias: the first alias of the name, in LoadRecord.valias, -1 for none */
 
-static int lr_is_version(const LrDef *v) { return v->kind <= LR_REMOVE && !v->unplaced; }
+static int lr_is_version(const LrDef *v) { return v->kind <= LR_REMOVE && !v->unplaced && !v->absent; }
 
 static void lr_vers_index(LoadRecord *r) {
   if (r->vers_head && r->indexed == r->nentries) return;
@@ -3110,7 +3152,7 @@ static void lr_vers_index(LoadRecord *r) {
   for (int i = 0; i < r->nhist; i++)
     for (int j = 0; r->hist[i].a >= LR_MAIN && j < r->hist[i].n; j++) {
       const LrDef *v = &r->hist[i].v[j];
-      if (v->kind != LR_ALIAS || !v->target || v->unplaced) continue;
+      if (v->kind != LR_ALIAS || !v->target || v->unplaced || v->absent) continue;
       int k = r->vers_head[lr_hash(0, 0, v->target)];
       while (k >= 0 && !sp_streq(r->vers[k].name, v->target)) k = r->vers[k].next;
       if (k < 0) continue;
@@ -3790,7 +3832,7 @@ static int lr_last_before(Compiler *c, const LrHist *h, LoadPoint p, int late, i
   for (int i = h ? h->n - 1 : -1; i >= 0; i--) {
     const LrDef *v = &h->v[i];
     if (take && v->unplaced) r->cand_bad = 1;
-    if ((skip_vis && v->kind == LR_VIS) || v->unplaced) continue;
+    if ((skip_vis && v->kind == LR_VIS) || v->unplaced || v->absent) continue;
     int in = at && !v->body && v->node >= 0 && v->node < r->n && r->at[v->node] == p.seq;
     int o = in ? lr_run_order(c, v->node, p.node) : PROG_UNKNOWN;
     if (o == PROG_UNKNOWN) o = lr_version_order(c, v, p, late);
@@ -3995,6 +4037,26 @@ static int lr_search(Compiler *c, int cls, int sg, const char *name, int mod, Lo
   return unsure ? ELAB_UNKNOWN : o;
 }
 
+/* Does a call of `name` on class cls at p find a class method of the
+   program's: the class's own singleton methods or its extends', then its
+   superclasses' (not the instance methods of Class, Module, Object and
+   Kernel every singleton chain ends in)? *out: the definition it finds. */
+static int lr_sg_chain_find(Compiler *c, int cls, const char *name, LoadPoint p, const LrDef **out, int *found) {
+  for (int d = 0; cls >= 0 && d <= lr_chain_bound(c); d++) {
+    int unsure = 0, o = lr_search_one(c, cls, 1, name, -1, p, 0, 0, out, d, &unsure, 0);
+    if (o == LR_STOP) return ELAB_NO;
+    if (o == ELAB_YES && found) *found = cls;
+    if (o == ELAB_YES) return unsure ? ELAB_UNKNOWN : ELAB_YES;
+    if (o == ELAB_UNKNOWN || unsure) return ELAB_UNKNOWN;
+    int sup = lr_super(c, cls);
+    if (sup < 0) return ELAB_NO;
+    cls = sup;
+  }
+  return ELAB_UNKNOWN;
+}
+static int lr_sg_chain_runs(Compiler *c, int cls, const char *name, LoadPoint p, const LrDef **out) {
+  return lr_sg_chain_find(c, cls, name, p, out, NULL);
+}
 /* The versions of `name` along cls's chain (its singleton's when sg), as
    lr_search walks it: on each class, its prepends', its own, its includes'
    or extends'; then its superclass's, and where a singleton's chain ends
@@ -4731,6 +4793,23 @@ static int lr_rta_const(LrRta *t, int node) {
   return t->ncname >= 0 && (is_builtin_class_name(nm) || is_builtin_module_const_name(nm)) ? LR_CORE : LR_UNKNOWN_CLASS;
 }
 
+/* The class self is at call id, when id is a statement's of a class or
+   module body (or a builder's block) itself, as elab_self_value_at reads
+   it: a bare or `self.` call there is a call on that class.
+   LR_UNKNOWN_CLASS elsewhere (a method body, a block run later, the top
+   level, a `class << X` body). */
+static int lr_rta_self(const LrRta *t, int id) {
+  const NodeTable *nt = t->c->nt;
+  int recv = nt_ref(nt, id, "receiver");
+  if (recv >= 0 && (nt_kind(nt, recv) != NK_SelfNode || nt_int(nt, recv, "sclass_value", 0))) return LR_UNKNOWN_CLASS;
+  const LrStmt *s = lr_stmt_of(t->r, id);
+  if (!s || s->region < 0 || s->frame < 0 || s->up != s->frame) return LR_UNKNOWN_CLASS;
+  int f = t->r->st[s->frame].node;
+  if (nt_kind(nt, f) == NK_SingletonClassNode || !class_def_opens_frame(nt, f)) return LR_UNKNOWN_CLASS;
+  int cls = elab_header_class(t->c, f, NULL, NULL);
+  return cls >= 0 ? cls : LR_UNKNOWN_CLASS;
+}
+
 /* Does a call of name make an object of its receiver's class: new,
    allocate, exception, a builder's [] */
 static int lr_rta_ctor(const LrRta *t, const char *name) {
@@ -4815,7 +4894,8 @@ static void lr_rta_node(LrRta *t, int id) {
   an = nt_ref(nt, id, "arguments");
   av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
   NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : NK_SelfNode, ak;
-  int rc = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode ? lr_rta_const(t, recv) : LR_UNKNOWN_CLASS;
+  int rc = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode ? lr_rta_const(t, recv)
+         : rk == NK_SelfNode ? lr_rta_self(t, id) : LR_UNKNOWN_CLASS;
   by = nm && (is_send_family(nm) || is_method_object_maker(nm) || is_enumerator_maker(nm)) ? (ac ? vis_arg_name(nt, av[0]) : "") : nm;
   if (!by || (ac && is_code_eval_name(nm)) || is_method_bind_name(by) || is_object_loader(rk == NK_ConstantReadNode ? nt_str(nt, recv, "name") : NULL, by, ac)) {
     lr_rta_all(t, 0);
@@ -5459,6 +5539,14 @@ static int lr_live_from(Compiler *c, int cls, int sg, int region) {
   const LrClass *kc = cls >= 0 && !c->classes[cls].is_builtin_const ? lr_class(r, cls) : NULL;
   if (r->nregion > 1) return region != 0 || sg || !kc || !kc->nopen ? -1 : r->rinst[cls + 1];
   LoadPoint b = kc && kc->nopen ? elab_point_of(c, kc->open[0].node) : (LoadPoint){ -1, -1 };
+  /* (a builder's write with no block opens no body, but makes the class
+     there: a header that reopens it later is not where it opens) */
+  int d = kc ? c->classes[cls].def_node : -1;
+  NodeKind dk = d >= 0 ? nt_kind(c->nt, d) : NK_NilNode;
+  if (b.region >= 0 && (dk == NK_ConstantWriteNode || dk == NK_LocalVariableWriteNode || dk == NK_ConstantPathWriteNode)) {
+    LoadPoint wp = elab_point_of(c, d);
+    if (wp.region == b.region && wp.seq < b.seq) b = wp;
+  }
   return b.region != region ? -1 : sg || r->rinst[cls + 1] < b.seq ? b.seq : r->rinst[cls + 1];
 }
 int elab_class_live_at(Compiler *c, int cls, int sg, LoadPoint p) {
@@ -5837,14 +5925,16 @@ int elab_version_met(Compiler *c, int cls, int sg, const char *name, int def) {
    load or autoload the parse left in the tree (one it resolved it spliced
    away). A require or a load is Kernel's on no receiver or on Object or
    Kernel (`YAML.load` reads no file); an autoload on any receiver is one
-   (`Mod.autoload(:X, path)`, which the parse leaves). The files of a closed
+   (`Mod.autoload(:X, path)`, which the parse leaves); and a require the
+   inline model ignored, which no node stands for (the root's
+   dropped_require). The files of a closed
    set a computed path may name are seen: each is a region of its own.
    Read from the tree, once. */
 int elab_runs_unseen(Compiler *c) {
   LoadRecord *r = lr_get(c);
   if (!r->unseen) {
     const NodeTable *nt = c->nt;
-    int hit = 0, n = 0;
+    int hit = nt_int(nt, nt->root_id, "dropped_require", 0), n = 0;   /* (a require the inline model ignored, whose library CRuby would load) */
     const int *v = nt_nodes_of_kind(nt, NK_CallNode, &n);
     for (int i = 0; !hit && i < n; i++) {
       int recv = nt_ref(nt, v[i], "receiver");
@@ -6031,7 +6121,7 @@ int elab_record_cmethod(Compiler *c, int cls, const char *name) {
   return is_record_class_cmethod(name, class_def_record_is_data(c->nt, call >= 0 ? call : class_def_super(c->nt, d)));
 }
 
-int elab_call_method(Compiler *c, int id, int cls, const char *name, int sg) {
+int elab_call_method(Compiler *c, int id, int cls, const char *name, int sg, int mm) {
   LoadRecord *r = elab_fresh(c);
   LoadPoint p = elab_point_of(c, id);
   if (p.region < 0 || !r->recorded || r->st[p.seq].kept || lr_unplaced(c, id) || lr_chain_open(c, cls)) return ELAB_UNKNOWN;
@@ -6052,8 +6142,11 @@ int elab_call_method(Compiler *c, int id, int cls, const char *name, int sg) {
     int k = lr_core(r, i ? CORE_BASIC_OBJECT : CORE_OBJECT);
     if (k >= 0 && k != cls) o = elab_method_at(c, k, name, 1, p, NULL);
   }
+  /* an instance's chain passes Object's reopenings: a module they include */
+  int ob = o == ELAB_NO && !sg ? lr_core(r, CORE_OBJECT) : -1;
+  if (ob >= 0 && ob != cls) o = elab_method_at(c, ob, name, 0, p, NULL);
   /* a method_missing may answer the call */
-  if (o == ELAB_NO && (elab_method_versions(c, "method_missing") || elab_method_versions(c, "respond_to_missing?"))) return ELAB_UNKNOWN;
+  if (mm && o == ELAB_NO && (elab_method_versions(c, "method_missing") || elab_method_versions(c, "respond_to_missing?"))) return ELAB_UNKNOWN;
   if (o == ELAB_NO && (elab_runs_unseen(c) || lr_unordered_supply(c, cls < 0 ? LR_MAIN : cls, sg, name, p))) return ELAB_UNKNOWN;
   return o;
 }
@@ -7373,11 +7466,6 @@ int elab_rec_open(Compiler *c, int node, int cp, const char *cname, int encl) {
     int par = path ? nt_ref(c->nt, cp, "parent") : -1;
     if (par >= 0 && (nt_kind(c->nt, par) == NK_ConstantReadNode || nt_kind(c->nt, par) == NK_ConstantPathNode)) {
       header_parent_encloses(c, par, ci, cname, qrn != NULL);
-      /* a path builder's leaf the constant pass qualified (`A::B` made
-         `A__B`) is found by its Ruby path, as a header's the class pass
-         qualified is (qc_ruby_name) */
-      if (!qrn && nt_str(c->nt, cp, "qc_orig_name") && class_def_builder(c->nt, node) >= 0)
-        c->classes[ci].ruby_name_cache = strdup(class_ruby_name(c, ci));
     }
     /* `class ::B` (`::B = Class.new do ... end`) names B at the top level
        wherever it is written: no module encloses it, and its name is B */
@@ -7864,6 +7952,7 @@ int elab_method_vis_held_from(Compiler *c, int cls, const char *name, int sg, Lo
    (lr_stmt_applied, at v's point now) */
 static int lr_applied(Compiler *c, const LrDef *v) {
   LoadRecord *r = elab_fresh(c);
+  if (v->absent) return 0;
   return lr_stmt_applied(lr_stmt_of(r, v->node), v->unplaced, v->may);
 }
 
@@ -8018,6 +8107,47 @@ ElabEntry *elab_entries(Compiler *c, unsigned mask, int *n) {
   free(v);
   *n = k;
   return out;
+}
+
+/* An alias or alias_method whose original the class has no method of where
+   it runs raises NameError there, and makes no method (`undefined method 'm'
+   for class 'K'`, 'module' for a module's, `class '#<Class:K>'` for a
+   singleton's): the record answers none at the alias's point as it does for
+   a call (elab_call_method: a def after it, a name nothing defines; not an
+   undef, a name that code the record cannot follow or a version it does not
+   place may supply), and no builtin on the chain answers the name
+   (cplan_other_answers, which reads the registered accessors: asked after
+   them). Such a version is dropped from the
+   histories (LrDef.absent) and the statement carries its message, which
+   codegen raises where the statement runs. An alias made in a method body
+   runs when the body does, and one in a class that has no name, or in one the
+   record cannot follow, is not asked. */
+void elab_absent_aliases(Compiler *c) {
+  LoadRecord *r = c->lrec;
+  NodeTable *nt = (NodeTable *)c->nt;
+  int dropped = 0;
+  for (int i = 0; r && r->recorded && i < r->nhist; i++) {
+    const LrHist *h = &r->hist[i];
+    if (h->a < LR_MAIN || h->a >= c->nclasses || !lr_class(r, h->a)) continue;
+    for (int j = 0; j < h->n; j++) {
+      LrDef *v = &h->v[j];
+      if (v->kind != LR_ALIAS || !v->target || v->unplaced || v->body || v->absent) continue;
+      if (elab_call_method(c, v->node, h->a, v->target, h->b, 0) != ELAB_NO || cplan_other_answers(c, h->a, h->b, v->target, 0)) continue;
+      /* (a `class Class` reopening is registered as the module Class__reopen) */
+      int reopen = h->a != LR_MAIN && h->a == comp_core_class(c, CORE_CLASS_REOPEN);
+      const char *cn = h->a == LR_MAIN ? "Object" : reopen ? "Class" : comp_class_anonymous(c, h->a) ? NULL : class_ruby_name(c, h->a);
+      if (!cn) continue;
+      char msg[512];
+      int mod = h->a != LR_MAIN && !reopen && comp_class_is_module(c, &c->classes[h->a]);
+      if (h->b) snprintf(msg, sizeof msg, "undefined method '%s' for class '#<Class:%s>'", v->target, cn);
+      else snprintf(msg, sizeof msg, "undefined method '%s' for %s '%s'", v->target, mod ? "module" : "class", cn);
+      nt_node_set_str(nt, v->node, "alias_absent", msg);
+      v->absent = 1;
+      dropped = 1;
+    }
+  }
+  if (!dropped) return;
+  lr_entries_changed(r);
 }
 
 /* Does a class side's history hold an accessor version and end in a def? */
@@ -8427,7 +8557,7 @@ void elab_dump(Compiler *c, FILE *out) {
     for (int j = 0; j < h->n; j++) {
       const LrDef *v = &h->v[j];
       fprintf(out, " %s#%d%s%s%s", kinds[v->kind], elab_point_of(c, v->node).seq, v->may ? " may" : "", v->nil ? " nil" : "",
-              v->unplaced ? " unplaced" : "");
+              v->unplaced ? " unplaced" : v->absent ? " absent" : "");
       if (v->body) {   /* a method body's (LrDef.body): its extent, from that body's first statement on */
         lr_run_points(c);
         fprintf(out, " in def#%d", elab_point_of(c, v->body).seq);
@@ -8684,10 +8814,9 @@ static int host_id_cmp(const void *a, const void *b) {
    desugar_explicit_receiver_mixin, desugar_extend_enumerable), a class builder (desugar_class_new_blocks,
    desugar_inline_struct_blocks), const_get (desugar_literal_const_get,
    desugar_self_const_get, desugar_dynamic_const_get), a write through a
-   constant path (desugar_constant_path_self_alias, qualify_colliding_consts),
+   constant path (desugar_constant_path_self_alias, qualify_colliding_classes),
    instance_eval (desugar_instance_eval_defs), a method_defined? guard
-   (desugar_def_unless_method_defined), an alias (desugar_inherited_aliases,
-   desugar_reader_aliases_before_redef).
+   (desugar_def_unless_method_defined), an alias (desugar_inherited_aliases).
    A define_method block is the program's own code, which those steps read
    where it is written: its nodes are not asked. Code spliced in the walk
    carries none. */
@@ -8902,8 +9031,8 @@ int elab_autoload_file_defines(Compiler *c, int slot, int file) {
    takes one key: the leaf, or, for a nested entity whose leaf another
    entity writes under another owner path (or a builtin class's leaf),
    the owner's Ruby path joined by `__`, then `__` and the leaf. This is
-   qualify_colliding_consts' rule, run over the record's entities instead
-   of the lexical writes. */
+   qc_value_collisions' rule, run over the record's entities instead of the
+   lexical writes. */
 typedef struct { int h, cls_ent; char *path, *key; } LrKeyEnt;
 
 /* The Ruby path of a constant owner (lr_const_owner's numbering), its
@@ -9117,7 +9246,6 @@ void elab_const_keys(Compiler *c) {
   lr_key_hists = r->hist;
   qsort(es, (size_t)ne, sizeof *es, lr_key_ent_cmp);
   long same = 0, differ = 0;
-  unsigned char *keyed = calloc((size_t)nt->count + 1, 1);   /* the writes an entity keys */
   for (int i = 0, g0 = 0, g1 = 0; i < ne; i++) {
     const LrHist *h = &r->hist[es[i].h];
     /* the entities of the leaf, [g0, g1): es is sorted by leaf, then path */
@@ -9146,7 +9274,6 @@ void elab_const_keys(Compiler *c) {
       if (kn < 0) continue;
       const char *qn = nt_str(nt, kn, "name");
       if (!qn) continue;
-      if (kn < nt->count) keyed[kn] = 1;
       if (sp_streq(qn, key)) { same++; continue; }
       differ++;
       lr_key_queue(&q, &nq, &cq, kn, key);
@@ -9154,13 +9281,6 @@ void elab_const_keys(Compiler *c) {
                          (long long)nt_int(nt, h->v[v].node, "node_line", 0), es[i].path[0] ? es[i].path : "main", qn, key);
     }
   }
-  /* a write of an owner the record does not know keeps qualify's name
-     for it (qc_value_key, qualify_colliding_consts) */
-  for (int id = 0; id < nt->count; id++) {
-    const char *qv = keyed[id] ? NULL : nt_str(nt, id, "qc_value_key");
-    if (qv && !sp_streq(qv, nt_str(nt, id, "name") ? nt_str(nt, id, "name") : "")) lr_key_queue(&q, &nq, &cq, id, qv);
-  }
-  free(keyed);
   if (check) fprintf(stderr, "constkey: same=%ld differ=%ld\n", same, differ);
   /* the reads: the write each resolves to, by the record, and that write's key */
   int *ent = calloc((size_t)nt->count + 1, sizeof *ent);
@@ -9224,11 +9344,19 @@ void elab_const_keys(Compiler *c) {
   /* the entities and the node map, kept for the slots and the readers
      that ask by node (elab_const_node_key) */
   for (int i = 0; i < r->nckey; i++) free(r->ckey[i]);
-  free(r->ckey); free(r->cent);
+  free(r->ckey); free(r->cent); free(r->cwown);
   r->ckey = calloc((size_t)ne + 1, sizeof *r->ckey);
   r->cent = calloc((size_t)nt->count + 1, sizeof *r->cent);
-  if (!r->ckey || !r->cent) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  r->cwown = calloc((size_t)nt->count + 1, sizeof *r->cwown);
+  if (!r->ckey || !r->cent || !r->cwown) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   r->nckey = ne; r->ncent = nt->count; r->ckey_gen++;
+  /* (a class's entity too: `A::B = Class.new` is on A) */
+  for (int id = 0; id < nt->count; id++) {
+    if (!ent[id]) continue;
+    int own = r->hist[es[ent[id] - 1].h].b, kn = lr_key_node(nt, id);
+    r->cwown[id] = own;
+    if (kn >= 0 && kn < nt->count) r->cwown[kn] = own;
+  }
   for (int i = 0; i < ne; i++) r->ckey[i] = !es[i].cls_ent && es[i].key ? strdup(es[i].key) : NULL;
   for (int id = 0; id < nt->count; id++) {
     int ei = ent[id] - 1;
@@ -9245,8 +9373,7 @@ void elab_const_keys(Compiler *c) {
      its slot's key beside it ("ckey", const_key_at), which a copy a later
      pass makes of the node (a method body copied into another class)
      carries too. The entities' writes and resolved reads first, then the
-     ones the queue names (a candidate's read, a write of an owner the
-     record does not know keeping qualify's qc_value_key). */
+     ones the queue names (a candidate's read). */
   for (int id = 0; id < nt->count; id++)
     if (r->cent[id]) lr_set_ckey((NodeTable *)nt, id, r->ckey[r->cent[id] - 1]);
   for (int i = 0; i < nq; i++) { lr_set_ckey((NodeTable *)nt, q[i].node, q[i].key); free(q[i].key); }
@@ -9256,6 +9383,54 @@ void elab_const_keys(Compiler *c) {
   free(es);
 }
 
+/* Does a descendant of class cls write leaf `name` as its own value
+   constant? A read of `self::NAME` from cls's class method then goes by
+   the run-time class (const_get_recv_class_for, the switch of
+   codegen_expr.c). A class entity it writes (`class NAME`) is not one. */
+int elab_const_descendant_writes(Compiler *c, int cls, const char *name) {
+  LoadRecord *r = c->lrec;
+  if (!r || !name || cls < 0) return 0;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (k == cls) continue;
+    int anc = 0;
+    for (int x = c->classes[k].parent, d = 0; x >= 0 && d < 64 && !anc; x = c->classes[x].parent, d++) anc = x == cls;
+    const LrHist *h = anc ? lr_hist(r, LR_KEY_CONST, lr_const_owner(k), name, 0) : NULL;
+    /* (a value's write: one elab_const_keys keyed as a value entity) */
+    for (int j = 0; h && j < h->n; j++) {
+      int n = h->v[j].node, ei = n >= 0 && n < r->ncent ? r->cent[n] - 1 : -1;
+      if (ei >= 0 && ei < r->nckey && r->ckey[ei]) return 1;
+    }
+  }
+  return 0;
+}
+/* The key of the value constant class cls (LR_MAIN for Object's own) holds
+   under leaf `name`: the entity of the record's constant history of (cls,
+   name), through the key elab_const_keys gave its writes; NULL for none
+   (no write of it, or an entity it keyed as a class) */
+const char *elab_const_owned_key(Compiler *c, int cls, const char *name) {
+  LoadRecord *r = c->lrec;
+  if (!r || !r->ckey || !name) return NULL;
+  /* (the program's Object, reopened, writes main's constants) */
+  if (cls >= 0 && cls == comp_core_class(c, CORE_OBJECT)) cls = LR_MAIN;
+  const LrHist *h = lr_hist(r, LR_KEY_CONST, lr_const_owner(cls), name, 0);
+  for (int j = 0; h && j < h->n; j++) {
+    int n = h->v[j].node;
+    int ei = n >= 0 && n < r->ncent ? r->cent[n] - 1 : -1;
+    if (ei >= 0 && ei < r->nckey && r->ckey[ei]) return r->ckey[ei];
+  }
+  return NULL;
+}
+/* The class a constant write (its node or its target) puts the constant on,
+   as the record found it: Object's own is the program's reopened Object.
+   -2 for none: a singleton's, an owner the record does not know, Object
+   not reopened. */
+int elab_const_write_owner(Compiler *c, int node) {
+  const LoadRecord *r = c->lrec;
+  if (!r || !r->cwown || node < 0 || node >= r->ncent || r->cwown[node] <= 0) return -2;
+  int cls = r->cwown[node] - 2;
+  if (cls == LR_MAIN) cls = comp_core_class(c, CORE_OBJECT);
+  return cls >= 0 ? cls : -2;
+}
 /* The key of the value constant entity node is a write of or a read
    names, as elab_const_keys found it; NULL for none (a class's, one the
    record does not bind, a node made since) */

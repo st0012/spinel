@@ -1299,18 +1299,21 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       }
     }
     if (emit_isa_runtime_flag_class(c, nt, name, eff_rt, recv, argv, b)) return 1;
-    int yes = ty_matches_class(c, eff_rt, nt_str(nt, argv[0], "name"), sp_streq(name, "instance_of?"));
+    /* (the class the constant names: an alias's is the class it holds) */
+    int kcls = nt_kind(nt, argv[0]) == NK_ConstantReadNode || nt_kind(nt, argv[0]) == NK_ConstantPathNode ? const_node_class_index(c, argv[0]) : -1;
+    const char *kcn = kcls >= 0 && c->classes[kcls].name ? c->classes[kcls].name : nt_str(nt, argv[0], "name");
+    int yes = ty_matches_class(c, eff_rt, kcn, sp_streq(name, "instance_of?"));
     /* an Integer or a Float reads its nil flag at run time, as nil?
        does: the nullable-value analysis does not see every way nil reaches
        one (a method's parameter only nil is passed to, a splat of a boxed
        Array), and folded, a nil answered true to is_a?(Integer). A nullable
        String slot holds nil as NULL and answers the same way. */
-    if (emit_scalar_class_test(c, recv, eff_rt, nt_str(nt, argv[0], "name"),
+    if (emit_scalar_class_test(c, recv, eff_rt, kcn,
                                sp_streq(name, "instance_of?"), b)) return 1;
     if (yes >= 0 && oint_kind(eff_rt) && node_has_oint_form(c, recv)) {
       /* a number that can be nil: nil's own answer where it is one
          (`Integer === nil` false, `nil.is_a?(Object)` true) */
-      int nilyes = ty_matches_class(c, TY_NIL, nt_str(nt, argv[0], "name"), sp_streq(name, "instance_of?"));
+      int nilyes = ty_matches_class(c, TY_NIL, kcn, sp_streq(name, "instance_of?"));
       if (nilyes < 0) nilyes = 0;
       int tq = ++g_tmp;
       buf_printf(b, "({ %s _t%d = ", oint_ctype(eff_rt), tq); emit_oint_expr(c, recv, eff_rt, b);
@@ -1365,7 +1368,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       is_kind_query(name) && !kind_query_to_dispatch(c, id, name, rt)) {
     const char *cty = nt_type(nt, argv[0]);
     char cnq[192];
-    const char *cn = isa_match_name(nt, argv[0], cnq, sizeof cnq);
+    const char *cn = isa_match_class_name(c, argv[0], cnq, sizeof cnq);
     if (cn) {
       int t = ++g_tmp;
       /* the call typed as a box, as above (a program class's own `is_a?`
@@ -1525,8 +1528,9 @@ static int emit_poly_reopened_binop(Compiler *c, int id, const char *name, int r
   for (int i = 0; i < 2; i++) {
     int k = comp_core_class(c, cn[i]);
     if (k < 0 || !class_is_prim_reopen(c, k)) continue;
-    int def = -1, mi = call_target(c, id, k, name, 0, &def);
-    if (mi < 0 || def != k || c->scopes[mi].nparams != 1 || c->scopes[mi].rest_idx >= 0) continue;
+    MethodLookup ml = { .def_class = -1 };
+    int mi = call_target(c, id, k, name, 0, &ml);
+    if (mi < 0 || ml.def_class != k || c->scopes[mi].nparams != 1 || c->scopes[mi].rest_idx >= 0) continue;
     mis[i] = mi;
   }
   if (mis[0] < 0 && mis[1] < 0) return 0;
@@ -2023,9 +2027,9 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           /* (resolved as the dispatch resolves it, an alias of the name
              included: activesupport's `alias_method :+, :plus_with_duration`
              in Date dispatches to plus_with_duration) */
-          int dc = -1;
-          int kmi = call_target(c, id, k, name, 0, &dc);
-          if (kmi >= 0 && dc == k) ucall_observe(c, id, kmi, k, 1);
+          MethodLookup ml = { .def_class = -1 };
+          int kmi = call_target(c, id, k, name, 0, &ml);
+          if (kmi >= 0 && ml.def_class == k) ucall_observe(c, id, kmi, k, 1);
         }
       Buf pcall; memset(&pcall, 0, sizeof pcall);
       if (subtree_may_allocate(nt, argv[0])) {

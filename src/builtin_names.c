@@ -2005,6 +2005,23 @@ int builtin_every_object_answers(const char *m, int cmeth) {
   return builtin_object_method_known(m) || builtin_method_known("Kernel", m) || builtin_method_known("Object", m) ||
          (cmeth && builtin_method_known("Module", m));
 }
+/* CRuby's public methods of each core class or module as a value, beyond
+   Class's or Module's (core_singleton_methods.inc, written by
+   tools/gen_method_names.rb) */
+#define CSM(k, m) { k, m },
+static const struct { const char *cls, *m; } core_singleton_methods[] = {
+#include "core_singleton_methods.inc"
+  { NULL, NULL }
+};
+#undef CSM
+/* Does the core class or module cls answer m as a value (File.join,
+   Kernel.trap) with a public method of CRuby's? cls "Class#" or "Module#"
+   asks about every class or module (class_eval, attr_reader). */
+int core_class_value_answers(const char *cls, const char *m) {
+  for (int i = 0; cls && m && core_singleton_methods[i].cls; i++)
+    if (!strcmp(core_singleton_methods[i].cls, cls) && !strcmp(core_singleton_methods[i].m, m)) return 1;
+  return 0;
+}
 /* Does the builtin class of cls_id id (class_builtin_parent's answer), or
    a builtin class above it, answer m with a method of its own (with
    cmeth, a class method)? Every name the facts carry counts, the
@@ -2019,6 +2036,58 @@ int builtin_class_id_answers(int id, const char *m, int cmeth) {
     if (id == builtin_class_parent_id(id)) break;   /* (Object) */
   }
   return 0;
+}
+
+#include "builtin_method_tables.inc"
+static int bmt_cmp(const void *k, const void *e) { return strcmp((const char *)k, ((const BuiltinMethodTable *)e)->name); }
+static const BuiltinMethodTable *bmt_find(const char *name) {
+  return name ? bsearch(name, BUILTIN_METHOD_TABLES, sizeof BUILTIN_METHOD_TABLES / sizeof *BUILTIN_METHOD_TABLES,
+                        sizeof *BUILTIN_METHOD_TABLES, bmt_cmp) : NULL;
+}
+/* The libraries the program requires, in the table's flag bits (bit 0:
+   none needed), and whether a name's flags hold for them: a reader that
+   must be sure a method exists (must) counts only what CRuby has with no
+   library or with a required one at both versions. */
+enum { BMT_PUBLIC = 1 << 14 };   /* public in every run that has the name */
+static unsigned bmt_loaded(void) {
+  unsigned m = 1;
+  for (unsigned i = 0; i < sizeof BMT_LIBS / sizeof *BMT_LIBS; i++) if (sp_feature_required(BMT_LIBS[i])) m |= 2u << i;
+  return m;
+}
+static int bmt_has(const char *const *names, const unsigned short *flags, int n, const char *m, unsigned must) {
+  int lo = 0, hi = n;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2, c = strcmp(m, names[mid]);
+    if (!c) return !must || ((flags[mid] & must) && (flags[mid] & BMT_PUBLIC));
+    if (c < 0) hi = mid; else lo = mid + 1;
+  }
+  return 0;
+}
+/* Does an ancestor of t have m among its own instance methods (sing_side: singleton methods of a class) */
+static int bmt_ancestors_have(const BuiltinMethodTable *t, const char *m, int sing_side, unsigned must) {
+  for (int i = 0; i < t->nanc; i++) {
+    const BuiltinMethodTable *a = bmt_find(t->ancestors[i]);
+    if (!a || (must && !((t->aflags[i] & must) && (a->flags & must)))) continue;
+    if (sing_side ? !a->module && bmt_has(a->sing, a->sflags, a->nsing, m, must) : bmt_has(a->inst, a->iflags, a->ninst, m, must)) return 1;
+  }
+  return 0;
+}
+int builtin_method_answers(const char *cls, const char *name, int sg, int certain) {
+  const BuiltinMethodTable *t = bmt_find(cls);
+  unsigned must = certain ? bmt_loaded() : 0;
+  if (!name) return 0;
+  /* a name CRuby defines that has no table (left out for any reason) may
+     have the method: unknown never raises, and is no fresh program class;
+     it is no sure answer */
+  if (!t) return !certain && cls && (builtin_core_class_slot(cls) >= 0 || is_builtin_reopen_name(cls));
+  if (must && !(t->flags & must)) return 0;
+  if (!sg) return bmt_ancestors_have(t, name, 0, must);
+  /* a class's singleton chain: its own and its superclasses' singleton methods,
+     then Class's instance methods and its ancestors'; a module's own singleton
+     methods, then Module's */
+  if (bmt_has(t->sing, t->sflags, t->nsing, name, must) || (!t->module && bmt_ancestors_have(t, name, 1, must))) return 1;
+  const BuiltinMethodTable *k = bmt_find(t->module ? "Module" : "Class");
+  return k && bmt_ancestors_have(k, name, 0, must);
 }
 
 /* The names CRuby's own facts give Object, BasicObject, Kernel, Module and

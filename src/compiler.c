@@ -6,6 +6,7 @@
 #include "codegen_poly.h"
 #include "value_pos.h"
 #include "call_plan.h"
+#include "method_table_check.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,6 +134,7 @@ Compiler *comp_new(const NodeTable *nt) {
   Compiler *c = calloc(1, sizeof(Compiler));
   if (!c) return NULL;
   c->nt = nt;
+  if (g_method_table_check) c->mtab = mtab_new();
   c->toplevel_class = -1;
   int n = nt->count > 0 ? nt->count : 1;
   if ((c->nautoloads = nt->nautoloads)) {
@@ -504,6 +506,8 @@ void comp_grow_node_arrays(Compiler *c) {
 
 void comp_free(Compiler *c) {
   if (!c) return;
+  mtab_report(c);   /* (--method-table-check: the end of the program) */
+  mtab_free(c->mtab);
   for (int i = 0; i < 8; i++) free(c->mc_ring[i]);
   for (int i = 0; i < c->n_rsc_names; i++) free(c->rsc_names[i]);
   free(c->rsc_names);
@@ -1693,12 +1697,14 @@ static int sm_lookup(Compiler *c, int class_id, const char *name, int is_cm) {
 }
 
 int comp_method_in_class(Compiler *c, int class_id, const char *name) {
+  if (g_method_table_check) mtab_read(c, MT_METHOD_IN_CLASS, class_id, MTS_INST, name);
   int mi = sm_lookup(c, class_id, name, 0);
   if (mi >= 0) IMEMO_DEP_SCOPE(mi);
   return mi;
 }
 
 int comp_cmethod_in_class(Compiler *c, int class_id, const char *name) {
+  if (g_method_table_check) mtab_read(c, MT_CMETHOD_IN_CLASS, class_id, MTS_CMETH, name);
   int mi = sm_lookup(c, class_id, name, 1);
   if (mi >= 0) IMEMO_DEP_SCOPE(mi);
   return mi;
@@ -1823,18 +1829,21 @@ static int chain_lookup(Compiler *c, int class_id, const char *name, int *def_cl
 }
 /* (the method found is what the asker reads next: its value, its parameters) */
 int comp_cmethod_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  if (g_method_table_check) mtab_read(c, MT_CMETHOD_IN_CHAIN, class_id, MTS_CMETH, name);
   int mi = chain_lookup(c, class_id, name, def_class, 1);
   if (mi >= 0) IMEMO_DEP_SCOPE(mi);
   return mi;
 }
 
 int comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  if (g_method_table_check) mtab_read(c, MT_METHOD_IN_CHAIN, class_id, MTS_INST, name);
   int mi = chain_lookup(c, class_id, name, def_class, 0);
   if (mi >= 0) IMEMO_DEP_SCOPE(mi);
   return mi;
 }
 
 int comp_self_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  if (g_method_table_check) mtab_read(c, MT_SELF_METHOD_IN_CHAIN, class_id, MTS_SELF, name);
   int mi = chain_lookup(c, class_id, name, def_class, 2);
   if (mi >= 0) IMEMO_DEP_SCOPE(mi);
   return mi;
@@ -1917,12 +1926,14 @@ const int *comp_name_responders(Compiler *c, const char *name, int is_cm, int *n
   if (cmc_nresp[j] < 0) {
     int cap = 8, cnt = 0, *r = malloc(sizeof(int) * 2 * (size_t)cap);
     if (!r) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    mtab_enter(c);
     for (int k = 0; k < c->nclasses; k++) {
       int mi = chain_lookup(c, k, name, NULL, is_cm);
       if (mi < 0) continue;
       if (cnt == cap) { cap *= 2; r = realloc(r, sizeof(int) * 2 * (size_t)cap); if (!r) { fprintf(stderr, "spinel: out of memory\n"); exit(1); } }
       r[2 * cnt] = k; r[2 * cnt + 1] = mi; cnt++;
     }
+    mtab_leave(c);
     j = cmc_slot_idx(c, name, is_cm);
     if (j < 0) { free(r); *n = -1; return NULL; }
     if (cmc_nresp[j] < 0) { cmc_resp[j] = r; cmc_nresp[j] = cnt; }
@@ -1970,8 +1981,10 @@ int comp_name_reader_any(Compiler *c, const char *name) {
     j = (j + 1) & (unsigned)(rda_cap - 1);
   }
   int ans = 0;
+  mtab_enter(c);
   for (int k = 0; k < c->nclasses && !ans; k++)
     if (comp_reader_in_chain(c, k, name, NULL)) ans = 1;
+  mtab_leave(c);
   rda_name[j] = strdup(name);
   if (!rda_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   rda_ans[j] = (signed char)ans; rda_n++;
@@ -2011,6 +2024,7 @@ const int *comp_name_reader_owners(Compiler *c, const char *name, int *n) {
     j = (j + 1) & (unsigned)(rdo_cap - 1);
   }
   int cnt = 0, *list = NULL;
+  mtab_enter(c);
   for (int k = 0; k < c->nclasses; k++) {
     int dc = -1;
     if (!comp_reader_in_chain(c, k, name, &dc) || dc != k) continue;
@@ -2018,6 +2032,7 @@ const int *comp_name_reader_owners(Compiler *c, const char *name, int *n) {
     if (!g) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     list = g; list[cnt++] = k;
   }
+  mtab_leave(c);
   rdo_name[j] = strdup(name);
   if (!rdo_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   rdo_list[j] = list; rdo_n[j] = cnt; rdo_cnt++;
@@ -2368,6 +2383,7 @@ int comp_method_vis(ClassInfo *ci, const char *name) {
 }
 
 int comp_method_vis_in_chain(Compiler *c, int class_id, const char *name) {
+  if (g_method_table_check) mtab_read(c, MT_METHOD_VIS_IN_CHAIN, class_id, MTS_INST, name);
   return comp_method_vis_declared(c, class_id, name, NULL);
 }
 /* The same, reporting the class that declared the visibility in *at. A
@@ -2967,6 +2983,7 @@ void comp_add_undef(ClassInfo *ci, const char *name) {
   name_add(&ci->undefs, &ci->nundefs, &ci->cundefs, name);
 }
 int comp_is_undeffed_in_chain(Compiler *c, int class_id, const char *name) {
+  if (g_method_table_check) mtab_read(c, MT_IS_UNDEFFED_IN_CHAIN, class_id, MTS_INST, name);
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent) {
     if (name_list_has(c->classes[cid].undefs, c->classes[cid].nundefs, name)) return 1;
     if (comp_method_in_class(c, cid, name) >= 0) return 0;
@@ -3414,6 +3431,7 @@ int comp_native_method_find_typed(Compiler *c, int class_id, const char *name, i
 }
 
 int comp_reader_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  if (g_method_table_check) mtab_read(c, MT_READER_IN_CHAIN, class_id, MTS_INST, name);
   name = comp_resolve_alias(c, class_id, name);
   /* (every class asked, a miss included: a reader added to one of them
      later changes the answer) */
@@ -3439,6 +3457,7 @@ int comp_subclass_answers(Compiler *c, int class_id, const char *name) {
   return 0;
 }
 int comp_writer_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  if (g_method_table_check) mtab_read(c, MT_WRITER_IN_CHAIN, class_id, MTS_INST, name);
   /* `name` is the attribute's base, and an alias of it is the reader's:
      `alias to_s name` defines no `to_s=`, so it is not followed here */
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent)
@@ -3694,6 +3713,7 @@ static struct pc_entry *pc_memo(Compiler *c, const char *name) {
 const PolyCand *comp_poly_candidates(Compiler *c, const char *name, int *n) {
   if (!name) { *n = 0; return NULL; }
   IMEMO_DEP_GLOBAL();   /* (the candidates are read over every class) */
+  mtab_enter(c);
   struct pc_entry *e = pc_memo(c, name);
   if (!e || mv_n) {
     /* scope shape may still change: answer fresh, and keep nothing */
@@ -3702,6 +3722,7 @@ const PolyCand *comp_poly_candidates(Compiler *c, const char *name, int *n) {
     e->next = pc_retired; pc_retired = e;
   }
   else if (e->n < 0) pc_build(c, name, &e->cands, &e->n);
+  mtab_leave(c);
   *n = e->n; return e->cands;
 }
 
@@ -4107,31 +4128,37 @@ static void cc_build(Compiler *c, const char *name, PolyCand **out, int *n_out) 
 const PolyCand *comp_cmethod_candidates(Compiler *c, const char *name, int *n) {
   if (!name) { *n = 0; return NULL; }
   IMEMO_DEP_GLOBAL();   /* (the candidates are read over every class) */
+  mtab_enter(c);
+  struct pc_entry *e = NULL;
   if (!sm_frozen) {
-    struct pc_entry *e = calloc(1, sizeof *e);
+    e = calloc(1, sizeof *e);
     cc_build(c, name, &e->cands, &e->n);
     e->next = pc_retired; pc_retired = e;
-    *n = e->n; return e->cands;
   }
-  if (cc_gen_stamp != sm_gen || cc_nscopes_stamp != c->nscopes || cc_nclasses_stamp != c->nclasses || cc_table_stamp != comp_table_gen) {
-    for (int b = 0; b < PC_BUCKETS; b++) {
-      for (struct pc_entry *e = cc_tab[b]; e; ) { struct pc_entry *nx = e->next; e->next = pc_retired; pc_retired = e; e = nx; }
-      cc_tab[b] = NULL;
+  else {
+    if (cc_gen_stamp != sm_gen || cc_nscopes_stamp != c->nscopes || cc_nclasses_stamp != c->nclasses || cc_table_stamp != comp_table_gen) {
+      for (int b = 0; b < PC_BUCKETS; b++) {
+        for (struct pc_entry *o = cc_tab[b]; o; ) { struct pc_entry *nx = o->next; o->next = pc_retired; pc_retired = o; o = nx; }
+        cc_tab[b] = NULL;
+      }
+      cc_gen_stamp = sm_gen; cc_nscopes_stamp = c->nscopes; cc_nclasses_stamp = c->nclasses; cc_table_stamp = comp_table_gen;
     }
-    cc_gen_stamp = sm_gen; cc_nscopes_stamp = c->nscopes; cc_nclasses_stamp = c->nclasses; cc_table_stamp = comp_table_gen;
+    unsigned b = sp_strhash(name) % PC_BUCKETS;
+    for (e = cc_tab[b]; e && !sp_streq(e->name, name); e = e->next) {}
+    if (!e) {
+      e = calloc(1, sizeof *e);
+      if (mv_n) {   /* see comp_poly_candidates */
+        cc_build(c, name, &e->cands, &e->n);
+        e->next = pc_retired; pc_retired = e;
+      }
+      else {
+        e->name = strdup(name);
+        cc_build(c, name, &e->cands, &e->n);
+        e->next = cc_tab[b]; cc_tab[b] = e;
+      }
+    }
   }
-  unsigned b = sp_strhash(name) % PC_BUCKETS;
-  for (struct pc_entry *e = cc_tab[b]; e; e = e->next)
-    if (sp_streq(e->name, name)) { *n = e->n; return e->cands; }
-  struct pc_entry *e = calloc(1, sizeof *e);
-  if (mv_n) {   /* see comp_poly_candidates */
-    cc_build(c, name, &e->cands, &e->n);
-    e->next = pc_retired; pc_retired = e;
-    *n = e->n; return e->cands;
-  }
-  e->name = strdup(name);
-  cc_build(c, name, &e->cands, &e->n);
-  e->next = cc_tab[b]; cc_tab[b] = e;
+  mtab_leave(c);
   *n = e->n; return e->cands;
 }
 
@@ -4140,6 +4167,7 @@ const PolyCand *comp_cmethod_candidates(Compiler *c, const char *name, int *n) {
    not another descendant walk per representation query. The candidate memo's
    stamps invalidate it too; a temporarily moved scope must answer fresh. */
 int comp_method_overridden(Compiler *c, int cid, const char *name, int cmeth) {
+  if (g_method_table_check) mtab_read(c, MT_METHOD_OVERRIDDEN, cid, cmeth ? MTS_CMETH : MTS_INST, name);
   if (cid < 0 || cid >= c->nclasses || !name) return 0;
   struct pc_entry *memo = !cmeth && !mv_n ? pc_memo(c, name) : NULL;
   if (memo) {
@@ -4898,6 +4926,7 @@ int comp_bare_gets_is_argf(Compiler *c) {
 static int comp_method_index_direct(Compiler *c, const char *name);
 static int comp_method_index_1(Compiler *c, const char *name);
 int comp_method_index(Compiler *c, const char *name) {
+  if (g_method_table_check) mtab_read(c, MT_METHOD_INDEX, -1, MTS_INST, name);
   int mi = comp_method_index_1(c, name);
   if (mi >= 0) IMEMO_DEP_SCOPE(mi);   /* (the method found is what the asker reads next) */
   return mi;
@@ -4949,6 +4978,7 @@ static int comp_method_index_direct(Compiler *c, const char *name) {
   return s >= 0 ? s : sm_top_last(c, name, 1);
 }
 int comp_main_method(Compiler *c, const char *name) {
+  if (g_method_table_check) mtab_read(c, MT_MAIN_METHOD, -1, MTS_CMETH, name);
   int s = sm_top_last(c, name, 1);
   if (s >= 0) IMEMO_DEP_SCOPE(s);
   return s;
@@ -5045,6 +5075,7 @@ static int toplevel_mod_method(Compiler *c, int k, const char *name, int mf_only
 }
 static int comp_included_method_index_1(Compiler *c, const char *name, int call_id);
 int comp_included_method_index(Compiler *c, const char *name, int call_id) {
+  if (g_method_table_check) mtab_read(c, MT_INCLUDED_METHOD_INDEX, -1, MTS_INST, name);
   int mi = comp_included_method_index_1(c, name, call_id);
   if (mi >= 0) IMEMO_DEP_SCOPE(mi);   /* (the method found is what the asker reads next) */
   return mi;
@@ -5281,12 +5312,40 @@ static char *nested_class_body_marks(NodeTable *nt, const int *ids, int n) {
    parent, and past the top of an explicit chain, Object -- where a method the
    program defines on Object is every class's superclass method. A module's
    super is its includer's, and a class method's chain has no such end. */
+/* Does the program use Kernel as a value: `include Kernel` in any body,
+   `BasicObject.include(Kernel)`, `send(:include, ::Kernel)`, `K = Kernel`?
+   Every read of the constant counts but a call's receiver (`Kernel.puts`)
+   and a `module Kernel` header. A class under the program's own
+   BasicObject may then reach Kernel's methods through Object's chain, so
+   that BasicObject keeps the lookup it had. Kept until the table changes. */
+static int kernel_const_node(const NodeTable *nt, int id) {
+  if (id < 0) return 0;
+  NodeKind k = nt_kind(nt, id);
+  return (k == NK_ConstantReadNode || k == NK_ConstantPathNode) && sp_streq(nt_str(nt, id, "name"), "Kernel");
+}
+static int program_names_kernel(Compiler *c) {
+  static const NodeTable *knt; static unsigned kver; static int kcount = -1, kans;
+  const NodeTable *nt = c->nt;
+  if (knt == nt && kver == nt->version && kcount == nt->count) return kans;
+  int reads = 0, held = 0;
+  NT_FOREACH_KIND(nt, NK_ConstantReadNode, id) reads += kernel_const_node(nt, id);
+  NT_FOREACH_KIND(nt, NK_ConstantPathNode, id) reads += kernel_const_node(nt, id);
+  NT_FOREACH_KIND(nt, NK_CallNode, id) held += kernel_const_node(nt, nt_ref(nt, id, "receiver"));
+  NT_FOREACH_KIND(nt, NK_ModuleNode, id) held += kernel_const_node(nt, nt_ref(nt, id, "constant_path"));
+  kans = reads > held;
+  knt = nt; kver = nt->version; kcount = nt->count;
+  return kans;
+}
 /* Is class ci under BasicObject with no Kernel among its ancestors? The
    includes registration recorded are asked first (an `include` through a
    constant alias, in a block or a class method of the body), then the
-   bodies' text (class_lacks_kernel), which runs for such a class alone. */
+   bodies' text (class_lacks_kernel), which runs for such a class alone.
+   The program's own BasicObject (`class BasicObject; end`) is such a
+   class too, when the program passes Kernel to no call
+   (program_names_kernel): Object is not past it. */
 static int blank_slate_without_kernel(Compiler *c, int ci) {
-  int ans = class_is_blank_slate(c, ci);
+  int bo = ci >= 0 && ci == comp_core_class(c, CORE_BASIC_OBJECT);
+  int ans = bo || class_is_blank_slate(c, ci);
   int ke = comp_core_class(c, CORE_KERNEL);
   for (int k = ci, d = 0; ans && k >= 0 && k < c->nclasses && d < 64; k = c->classes[k].parent, d++) {
     const ClassInfo *ki = &c->classes[k];
@@ -5299,7 +5358,7 @@ static int blank_slate_without_kernel(Compiler *c, int ci) {
       if (m == ke || (m >= 0 && comp_module_includes(c, m, ke, 0))) ans = 0;
     }
   }
-  if (!ans || !class_lacks_kernel(c, ci)) return 0;
+  if (!ans || (bo ? program_names_kernel(c) : !class_lacks_kernel(c, ci))) return 0;
   /* an `include` the body makes another way (through a constant alias, in
      a block, in a class method it calls) may bring Kernel in: such a chain
      keeps the lookup it had */
@@ -5338,6 +5397,11 @@ int comp_super_parent(Compiler *c, int class_id, int is_cmethod) {
      Kernel reaches Kernel's methods through Object's chain, as before) */
   if (blank_slate_without_kernel(c, class_id)) return -1;
   return obj;
+}
+
+const Scope *comp_super_site(Compiler *c, const Scope *s) {
+  (void)c;
+  return s;
 }
 
 /* What a `super` that no program ancestor answers reaches when the
@@ -5741,6 +5805,27 @@ int self_class_static_ci(Compiler *c, int recv) {
   return cid;
 }
 
+/* Does call `call` (-1: any) of `allocate` on class or module ci reach a
+   class method `allocate` of the program's own: on ci, its singleton
+   class, a parent or a module it extends? Not a call the analysis made
+   for Class#new's allocation (cnew_alloc: CRuby's new does not call
+   allocate), and not one whose method calls super: that super reaches
+   Class#allocate, which has no target here, so such a call keeps
+   Class#allocate as before. */
+int comp_own_allocate(Compiler *c, int ci, int call) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  if (ci < 0 || ci >= c->nclasses) return 0;
+  if (call >= 0 && nt_int(nt, call, "cnew_alloc", 0)) return 0;
+  int mi = comp_cmethod_in_chain(c, ci, "allocate", NULL);
+  int d = mi >= 0 ? c->scopes[mi].def_node : -1;
+  if (mi < 0) return 0;
+  if (d < 0) return 1;
+  int n = 0, sup = 0, *ids = nt_subtree_ids(nt, &d, 1, &n);
+  for (int i = 0; i < n && !sup; i++)
+    sup = nt_kind(nt, ids[i]) == NK_SuperNode || nt_kind(nt, ids[i]) == NK_ForwardingSuperNode;
+  free(ids);
+  return !sup;
+}
 /* `allocate` on the class the method runs for: bare or `self.allocate` in a
    class method, `self.class.allocate` in an instance method. Returns that
    class -- the base of what it builds, since a subclass receiving the class
@@ -5756,6 +5841,8 @@ int allocate_on_own_class(Compiler *c, int id) {
   int cid = s ? s->class_id : -1;
   if (cid < 0 || cid >= c->nclasses || comp_class_is_module(c, &c->classes[cid])) return -1;
   int recv = nt_ref(nt, id, "receiver");
+  /* (a class method `allocate` of the program's own answers the call) */
+  if (comp_own_allocate(c, cid, id)) return -1;
   if (s->is_cmethod) return (recv < 0 || nt_kind(nt, recv) == NK_SelfNode) ? cid : -1;
   return self_class_base_ci(c, recv);
 }

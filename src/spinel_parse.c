@@ -448,6 +448,77 @@ static pm_node_t *flat_superclass(pm_node_t *sup) {
   return sup;
 }
 
+/* `in [Integer => a, (Integer => b)]`: parentheses around a sub-pattern
+   group it and mean nothing more, but each pass that reads a pattern (the
+   matcher, the bindings, their types) asks for its node kind. The pattern
+   is rewritten in place without them: each ParenthesesNode that holds one
+   pattern gives way to that pattern, at the root (also under an arm's
+   guard) and at every sub-pattern slot. A pinned expression `^(expr)`
+   keeps its own parentheses. */
+static pm_node_t *flat_pattern(pm_node_t *pat);
+static void flat_pattern_list(pm_node_list_t *list) {
+  for (size_t i = 0; i < list->size; i++) list->nodes[i] = flat_pattern(list->nodes[i]);
+}
+static pm_node_t *flat_pattern(pm_node_t *pat) {
+  while (pat && PM_NODE_TYPE(pat) == PM_PARENTHESES_NODE) {
+    pm_parentheses_node_t *pn = (pm_parentheses_node_t *)pat;
+    pm_node_t *pb = pn->body;
+    if (!pb) break;
+    if (PM_NODE_TYPE(pb) == PM_STATEMENTS_NODE) {
+      pm_statements_node_t *st = (pm_statements_node_t *)pb;
+      if (st->body.size != 1) break;
+      pb = st->body.nodes[0];
+      st->body.size = 0;   /* the shell goes, the pattern stays */
+    }
+    else pn->body = NULL;
+    pm_node_destroy((pm_parser_t *)g_parser, pat);
+    pat = pb;
+  }
+  if (!pat) return pat;
+  switch (PM_NODE_TYPE(pat)) {
+  case PM_ALTERNATION_PATTERN_NODE: {
+    pm_alternation_pattern_node_t *n = (pm_alternation_pattern_node_t *)pat;
+    n->left = flat_pattern(n->left);
+    n->right = flat_pattern(n->right);
+    break;
+  }
+  case PM_ARRAY_PATTERN_NODE: {
+    pm_array_pattern_node_t *n = (pm_array_pattern_node_t *)pat;
+    flat_pattern_list(&n->requireds);
+    flat_pattern_list(&n->posts);
+    break;
+  }
+  case PM_FIND_PATTERN_NODE:
+    flat_pattern_list(&((pm_find_pattern_node_t *)pat)->requireds);
+    break;
+  case PM_HASH_PATTERN_NODE: {
+    pm_hash_pattern_node_t *n = (pm_hash_pattern_node_t *)pat;
+    for (size_t i = 0; i < n->elements.size; i++) {
+      pm_node_t *e = n->elements.nodes[i];
+      if (e && PM_NODE_TYPE(e) == PM_ASSOC_NODE) {
+        pm_assoc_node_t *a = (pm_assoc_node_t *)e;
+        a->value = flat_pattern(a->value);
+      }
+    }
+    break;
+  }
+  case PM_CAPTURE_PATTERN_NODE: {
+    pm_capture_pattern_node_t *n = (pm_capture_pattern_node_t *)pat;
+    n->value = flat_pattern(n->value);
+    break;
+  }
+  case PM_IF_NODE: case PM_UNLESS_NODE: {
+    /* `in pat if guard`: the arm's pattern is the guard's one statement */
+    pm_statements_node_t *st = PM_NODE_TYPE(pat) == PM_IF_NODE ? ((pm_if_node_t *)pat)->statements
+                                                                : ((pm_unless_node_t *)pat)->statements;
+    if (st && st->body.size == 1) st->body.nodes[0] = flat_pattern(st->body.nodes[0]);
+    break;
+  }
+  default: break;
+  }
+  return pat;
+}
+
 /* A scope's own locals, joined with commas. A block's or lambda's (params +
    first-assigned-inside): Ruby scoping makes the non-param ones FRESH on
    every call, and a name the enclosing scope assigns only after the block's
@@ -1876,6 +1947,7 @@ static int flatten_node(pm_node_t *node) {
   case PM_IN_NODE: {
     pm_in_node_t *n = (pm_in_node_t *)node;
     N("InNode");
+    n->pattern = flat_pattern(n->pattern);
     R("pattern", n->pattern);
     R("statements", n->statements);
     break;
@@ -2221,6 +2293,7 @@ else if (PM_NODE_TYPE(n->parameters) != PM_NUMBERED_PARAMETERS_NODE) {
        matching (array / hash patterns, pinned vars) is out of scope
        and falls through to the unknown-node passthrough. */
     pm_match_required_node_t *n = (pm_match_required_node_t *)node;
+    n->pattern = flat_pattern(n->pattern);
     if (n->pattern && PM_NODE_TYPE_P(n->pattern, PM_LOCAL_VARIABLE_TARGET_NODE)) {
       pm_local_variable_target_node_t *t = (pm_local_variable_target_node_t *)n->pattern;
       N("LocalVariableWriteNode");
@@ -2239,6 +2312,7 @@ else {
     pm_match_predicate_node_t *n = (pm_match_predicate_node_t *)node;
     N("MatchPredicateNode");
     R("value", n->value);
+    n->pattern = flat_pattern(n->pattern);
     R("pattern", n->pattern);
     break;
   }
@@ -3787,6 +3861,8 @@ int g_require_unread = 0;
    other (sp_require_computed). */
 const char **g_required_features = NULL;
 int g_nrequired_features = 0;
+static const char **sp_boot_features = NULL;
+static int sp_nboot_features = 0;
 static void sp_note_required_feature(const char *name) {
   if (!name || !*name) return;
   for (int i = 0; i < g_nrequired_features; i++)
@@ -3797,6 +3873,18 @@ static void sp_note_required_feature(const char *name) {
   g_required_features[g_nrequired_features++] = strdup(name);
 }
 static int sp_req_written = 0, sp_req_resolved = 0;
+/* Does the program require a feature that is not a core library its start
+   loads? A core library is read like the program, so its defs are in the
+   node table; another feature can be native and define methods none sees. */
+int sp_requires_non_boot_feature(void) {
+  for (int i = 0; i < g_nrequired_features; i++) {
+    /* (builtins/: the core methods written in Ruby, read like the program) */
+    int boot = strncmp(g_required_features[i], "builtins/", 9) == 0;
+    for (int k = 0; k < sp_nboot_features && !boot; k++) boot = strcmp(sp_boot_features[k], g_required_features[i]) == 0;
+    if (!boot) return 1;
+  }
+  return 0;
+}
 
 /* The names of one file's tree that bear on g_require_unread: a call named
    load or autoload, a variable that is the load path or the loaded features
@@ -8184,6 +8272,8 @@ static int sp_graph_flatten(SpLoadGraph *g, int f, const char *source_file) {
 static int sp_graph_boot_load(SpLoadGraph *g, const SpBootLib *b) {
   sp_feature_mark(b->lib);
   sp_note_required_feature(b->lib);
+  const char **bf = realloc(sp_boot_features, sizeof(char *) * (size_t)(sp_nboot_features + 1));
+  if (bf) { sp_boot_features = bf; sp_boot_features[sp_nboot_features++] = strdup(b->lib); }
   int to = sp_load_file(g, b->path);
   if (b->tier == SP_LIB_BUILTIN) *sp_load_flags(g, to) |= SP_FILE_BUILTIN;
   sp_load_set_tier(g, to, b->tier);

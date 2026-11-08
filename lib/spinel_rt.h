@@ -1322,7 +1322,9 @@ sp_RbVal sp_File_putc(sp_File *f, sp_RbVal v);
 /* IO.copy_stream(src, dst): both path strings (#2815); returns bytes copied */
 /* IO.copy_stream(src_path, dst_path): defined out-of-line in sp_cold.c. */
 sp_int sp_io_copy_stream(const char *src, const char *dst);
+const char *sp_io_copy_stream_read(sp_File *f);
 const char *sp_slurp_stream(FILE *fp);
+const char *sp_slurp_stream_err(FILE *fp, int *err);
 sp_File *sp_File_set_encoding(sp_File *f, sp_RbVal ext, sp_RbVal in);
 static inline const char *sp_File_read(sp_File *f) {
   sp_io_check_readable(f);
@@ -1335,7 +1337,9 @@ static inline const char *sp_File_read(sp_File *f) {
      handle answers ASCII-8BIT (CRuby); a text one stays on the text side.
      This is the one read whose answer depends on the mode -- read(n), pread
      and readpartial are BINARY whatever the handle was opened as. */
-  const char *r = (f->own_buf || f->park == 2) ? sp_slurp_stream_parked(f) : sp_slurp_stream(f->fp);
+  int e = 0;
+  const char *r = (f->own_buf || f->park == 2) ? sp_slurp_stream_parked(f) : sp_slurp_stream_err(f->fp, &e);
+  if (e) { errno = e; sp_file_raise_errno("io_fread", f->path); }
   if (r && sp_File_reads_binary(f)) sp_str_mark_binary((char *)r);
   return r;
 }
@@ -1858,6 +1862,9 @@ static inline const char *sp_class_val_display(sp_RbVal v) {
    which answer NULL for any other class */
 extern const char *(*sp_class_user_to_s_fn)(sp_Class);
 extern const char *(*sp_class_user_inspect_fn)(sp_Class);
+/* the program's own Array#inspect, for an Array printed boxed (sp_poly_inspect),
+   NULL where it has none */
+extern const char *(*sp_array_user_inspect_fn)(sp_RbVal);
 static inline const char *sp_class_val_user(sp_RbVal v, const char *(*fn)(sp_Class)) {
   if (fn && v.cls_id != SP_CLASS_BY_NAME) {
     sp_Class _c = {v.v.i, NULL};
@@ -2253,7 +2260,7 @@ static sp_bool sp_poly_responds_builtin(sp_RbVal v, const char *m) {
     "abs2", "angle", "arg", "conj", "conjugate", "denominator", "div",
     "i", "imag", "imaginary", "magnitude", "modulo", "nonzero?",
     "numerator", "phase", "polar", "rationalize", "real", "real?",
-    "rect", "rectangular", "remainder", NULL };
+    "rect", "rectangular", "remainder", "+@", "quo", NULL };
   /* bop_rows has no TY_INT row at all for these seven -- confirmed by
      direct grep across src/builtin_ops.c and src/builtin_zero_ops.inc,
      and by CRuby agreeing all seven are real Integer methods (2026-10-12).
@@ -2422,6 +2429,20 @@ static sp_bool sp_poly_responds_builtin(sp_RbVal v, const char *m) {
     return 0;
   }
   return 0;
+}
+/* Does a boxed value of a builtin class lack the method m? Only for the
+   classes whose sp_poly_responds_builtin surface holds all of CRuby's
+   public and private names (a program object, a Time, a Range answer 0:
+   not known). A Kernel private name (puts), a program's own method and a
+   library's are the caller's to leave out. recv.method(:m) raises
+   NameError on a 1. */
+static sp_bool sp_poly_lacks_builtin_method(sp_RbVal v, const char *m) {
+  static const char *const known[] = {
+    "NilClass", "TrueClass", "FalseClass", "String", "Array", "Hash",
+    "Integer", "Float", NULL };
+  const char *cn = sp_poly_class_name(v);
+  if (!m || !cn || !sp_str_in_list(cn, known)) return 0;
+  return !sp_poly_responds_builtin(v, m);
 }
 /* respond_to? on a typed IO handle: the names its typed emitters call, and
    the universal ones; a name only a boxed handle calls answers false */
@@ -3786,6 +3807,20 @@ static SP_NOINLINE const char *sp_str_cmp_conv(sp_RbVal r, sp_RbVal obj) {
                           sp_poly_class_name(obj), sp_poly_class_name(obj),
                           sp_poly_class_name(r)));
   return NULL;
+}
+
+/* What a user #to_str answered where the analysis could pin its answer no
+   further than poly, converting an argument: CRuby's rb_convert_type takes
+   a String and names anything else, nil included -- "can't convert R to
+   String (R#to_str gives Integer)" -- as sp_obj_to_int_answer does for
+   #to_int. `cn` is the receiver's class name. */
+static SP_NOINLINE SP_UNUSED const char *sp_obj_to_str_answer(sp_RbVal r, const char *cn) {
+  if (r.tag == SP_TAG_STR && r.v.s) return r.v.s;
+  if (sp_poly_is_strbuf(r)) return sp_String_cstr((sp_String *)r.v.p);
+  sp_raise_cls("TypeError",
+               sp_sprintf("can't convert %s to String (%s#to_str gives %s)", cn, cn,
+                          r.tag == SP_TAG_STR ? "NilClass" : sp_poly_class_name(r)));
+  return sp_str_empty;
 }
 
 /* The strict argument forms: nil / true / false in a typed String or Integer
@@ -5157,9 +5192,37 @@ SP_NORETURN SP_COLD static void sp_raise_poly_nomethod(const char *m, sp_RbVal v
    CRuby stops at with NoMethodError (#4485). A String or Symbol is let
    through: the helper's own arms decide for those. Answers the receiver so a
    call site can wrap its receiver expression in place. */
+/* A boxed builtin whose class has neither #size nor #length (Time, Regexp,
+   Proc, Method, Exception, Thread, Mutex, Random, Rational, Complex, ...).
+   sp_poly_length reads any object it has no arm for as 0, so `v.size` on a
+   boxed Time answered 0 where CRuby raises NoMethodError. */
+static SP_INLINE int sp_poly_sizeless_builtin(sp_RbVal v) {
+  if (v.tag != SP_TAG_OBJ) return 0;
+  switch (v.cls_id) {
+    case SP_BUILTIN_PROC: case SP_BUILTIN_CURRY: case SP_BUILTIN_METHOD: case SP_BUILTIN_TIME:
+    case SP_BUILTIN_REGEX: case SP_BUILTIN_EXCEPTION: case SP_BUILTIN_THREAD: case SP_BUILTIN_MUTEX:
+    case SP_BUILTIN_CONDVAR: case SP_BUILTIN_FIBER: case SP_BUILTIN_RANDOM: case SP_BUILTIN_COMPLEX:
+    case SP_BUILTIN_RATIONAL: case SP_BUILTIN_BIG_RATIONAL: case SP_BUILTIN_DIR: case SP_BUILTIN_YIELDER:
+    case SP_BUILTIN_PROCESS_STATUS: case SP_BUILTIN_ADDRINFO: case SP_BUILTIN_SOCKOPT:
+    case SP_BUILTIN_OBJECT: case SP_BUILTIN_BASIC_OBJECT: case SP_BUILTIN_ARGF:
+      return 1;
+    default: return 0;
+  }
+}
 static SP_INLINE sp_RbVal sp_poly_coll_chk(sp_RbVal v, const char *m) {
   if (v.tag == SP_TAG_NIL || v.tag == SP_TAG_INT || v.tag == SP_TAG_FLT ||
       v.tag == SP_TAG_BIGINT || v.tag == SP_TAG_BOOL)
+    sp_raise_poly_nomethod(m, v);
+  return v;
+}
+/* An Enumerable name (count, first, include?, member?) on a boxed value:
+   nil, a number, a boolean, and a builtin with no #size that has no #each
+   either (all of sp_poly_sizeless_builtin but a Dir and ARGF, which include
+   Enumerable) raise NoMethodError. Before, a boxed Time answered its count
+   as 0 and include? as false. */
+static SP_INLINE sp_RbVal sp_poly_enum_name_chk(sp_RbVal v, const char *m) {
+  sp_poly_coll_chk(v, m);
+  if (sp_poly_sizeless_builtin(v) && v.cls_id != SP_BUILTIN_DIR && v.cls_id != SP_BUILTIN_ARGF)
     sp_raise_poly_nomethod(m, v);
   return v;
 }
@@ -5177,6 +5240,9 @@ static SP_INLINE SP_UNUSED int sp_poly_no_enum(sp_RbVal v) {
    Enumerator is left to the helper. */
 static SP_INLINE sp_RbVal sp_poly_ary_chk(sp_RbVal v, const char *m, int range_ok) {
   sp_poly_coll_chk(v, m);
+  /* a builtin with no #size has none of these (Thread#join is its own) */
+  if (sp_poly_sizeless_builtin(v) && !(v.cls_id == SP_BUILTIN_THREAD && strcmp(m, "join") == 0))
+    sp_raise_poly_nomethod(m, v);
   if (v.tag == SP_TAG_STR || v.tag == SP_TAG_SYM || sp_poly_is_strbuf(v) ||
       (v.tag == SP_TAG_OBJ && sp_poly_is_hash_kind(v.cls_id)) ||
       (!range_ok && v.tag == SP_TAG_OBJ &&
@@ -5193,18 +5259,30 @@ static sp_int sp_poly_arr_len(sp_RbVal a);           /* defined below */
 /* A Struct's size and length are its member count; a program object of any
    other class has neither. -1 when v is no Struct. */
 static sp_int sp_poly_struct_size(sp_RbVal v) {
+  /* Process::Tms is a Struct of four members (utime stime cutime cstime) */
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_TMS) return 4;
   if (!sp_poly_is_user_obj(v)) return -1;
   sp_RbVal sv = sp_poly_struct_values(v);
   return (sv.tag == SP_TAG_OBJ && sv.v.p && sp_poly_is_array_kind(sv.cls_id)) ? sp_poly_arr_len(sv) : -1;
+}
+/* A boxed value with no #empty?: a program object (its own empty? is
+   dispatched before this), a builtin with no length, a Process::Tms (a
+   Struct) or a Range of any kind. */
+static SP_INLINE SP_UNUSED int sp_poly_no_empty(sp_RbVal v) {
+  return sp_poly_is_user_obj(v) || sp_poly_sizeless_builtin(v) ||
+         (v.tag == SP_TAG_OBJ && (v.cls_id == SP_BUILTIN_TMS || v.cls_id == SP_BUILTIN_RANGE ||
+                                  v.cls_id == SP_BUILTIN_STR_RANGE || v.cls_id == SP_BUILTIN_FLOAT_RANGE ||
+                                  v.cls_id == SP_BUILTIN_TIME_RANGE || v.cls_id == SP_BUILTIN_OBJ_RANGE));
 }
 static sp_int sp_poly_length_m(sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_MATCHDATA && v.v.p) return sp_MatchData_length((sp_MatchData *)v.v.p);
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_QUEUE && v.v.p) return sp_Queue_size((sp_queue *)v.v.p);
   { sp_int n = sp_poly_struct_size(v); if (n >= 0) return n; }
   if (v.tag == SP_TAG_NIL || v.tag == SP_TAG_INT || v.tag == SP_TAG_FLT ||
-      v.tag == SP_TAG_BIGINT || v.tag == SP_TAG_BOOL || sp_poly_is_user_obj(v) ||
+      v.tag == SP_TAG_BIGINT || v.tag == SP_TAG_BOOL || sp_poly_is_user_obj(v) || sp_poly_sizeless_builtin(v) ||
       (v.tag == SP_TAG_OBJ && (v.cls_id == SP_BUILTIN_RANGE || v.cls_id == SP_BUILTIN_STR_RANGE ||
-                               v.cls_id == SP_BUILTIN_FLOAT_RANGE)))
+                               v.cls_id == SP_BUILTIN_FLOAT_RANGE || v.cls_id == SP_BUILTIN_TIME_RANGE ||
+                               v.cls_id == SP_BUILTIN_OBJ_RANGE)))
     sp_raise_poly_nomethod("length", v);
   /* String#length is CHARACTERS. sp_poly_length answers the byte count, which
      is what its container and iteration callers want and what a boxed string
@@ -5279,9 +5357,12 @@ static sp_int sp_poly_size_n(sp_RbVal v, sp_bool *none) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_MATCHDATA && v.v.p) return sp_MatchData_length((sp_MatchData *)v.v.p);
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLOAT_RANGE && v.v.p) { sp_frange_iter_raise((*(sp_FloatRange *)v.v.p), 0); return 0; }  /* a Float range has no size (TypeError) */
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_QUEUE && v.v.p) return sp_Queue_size((sp_queue *)v.v.p);
+  /* a Range of Times has no size: Time has no #succ */
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_TIME_RANGE)
+    sp_raise_cls("TypeError", v.v.p && !((sp_TimeRange *)v.v.p)->first ? "can't iterate from NilClass" : "can't iterate from Time");
   { sp_int n = sp_poly_struct_size(v); if (n >= 0) return n; }
   if (v.tag == SP_TAG_NIL || v.tag == SP_TAG_BOOL || v.tag == SP_TAG_FLT ||
-      sp_poly_is_user_obj(v))
+      sp_poly_is_user_obj(v) || sp_poly_sizeless_builtin(v))
     sp_raise_poly_nomethod("size", v);
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_IO) {
     /* a File::Stat rides the handle: its size is the stat's */
@@ -6740,11 +6821,44 @@ SP_NORETURN SP_COLD static void sp_poly_nil_nomethod(const char *op) {
    `between?` renders as two sp_poly_cmp_ck calls, and only the call site
    knows which method was written. A program object without Comparable
    raises NoMethodError here too, before the spaceship comparison. */
+/* Set at start-up (main) when the program may give a builtin value a
+   comparison it lacks: it mixes Comparable into, or defines <, <=, >, >=,
+   between? or clamp in, a builtin class, Object or Kernel, or at the top
+   level. */
+static sp_bool sp_cmp_builtin_open = 0;
+/* The program's exception classes that do so (an exception of one shares
+   the builtin exception id): a NULL-ended list, or NULL */
+static const char *const *sp_cmp_exc_open = NULL;
+/* Is v a builtin value whose class has none of <, <=, >, >=, between? and
+   clamp (no Comparable): true, false, an Array, a Range, a Proc, a Method,
+   a Regexp, a MatchData, an exception, a bare Object.new? */
+static int sp_poly_lacks_cmp(sp_RbVal v) {
+  if (sp_cmp_builtin_open) return 0;
+  if (v.tag == SP_TAG_BOOL) return 1;
+  if (v.tag != SP_TAG_OBJ || v.cls_id >= 0) return 0;
+  switch (v.cls_id) {
+    case SP_BUILTIN_PROC: case SP_BUILTIN_RANGE: case SP_BUILTIN_FLOAT_RANGE:
+    case SP_BUILTIN_STR_RANGE: case SP_BUILTIN_TIME_RANGE: case SP_BUILTIN_OBJ_RANGE:
+    case SP_BUILTIN_OBJECT: case SP_BUILTIN_METHOD:
+    case SP_BUILTIN_REGEX: case SP_BUILTIN_MATCHDATA:
+      return 1;
+    case SP_BUILTIN_EXCEPTION:
+      for (int i = 0; sp_cmp_exc_open && sp_cmp_exc_open[i]; i++)
+        if (sp_exc_is_a((volatile sp_Exception *)v.v.p, sp_cmp_exc_open[i])) return 0;
+      return 1;
+    default: break;
+  }
+  /* (an instance of a program's Array subclass is its class's to answer) */
+  if (sp_poly_is_array_kind(v.cls_id)) return !(sp_bsub_cls_fn && sp_bsub_cls_fn(v) >= 0);
+  return 0;
+}
 static void sp_poly_recv_ck(sp_RbVal v, const char *op) {
   if (SP_UNLIKELY(sp_poly_recv_nil(v))) sp_poly_nil_nomethod(op);
   if (sp_poly_is_user_obj(v)) {
     if (!sp_obj_comparable_hook || !sp_obj_comparable_hook(v.cls_id)) sp_raise_nomethod(sp_nomethod_msg(op, v));
   }
+  /* CRuby's NoMethodError, not Comparable's ArgumentError */
+  else if (SP_UNLIKELY(sp_poly_lacks_cmp(v))) sp_raise_nomethod(sp_nomethod_msg(op, v));
 }
 /* Module#< / <= / > / >= on a boxed class: ordered by the class graph, and a
    non-class operand raises as CRuby does. Two unrelated classes answer nil
@@ -15727,7 +15841,7 @@ static sp_int sp_poly_count(sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_DIR) return sp_poly_dir_count(v);
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLOAT_RANGE && v.v.p) return sp_frange_poly_count((*(sp_FloatRange *)v.v.p));
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_OBJ_RANGE && v.v.p) return SP_ORANGE_WALK((sp_ObjRange *)v.v.p)->len;
-  sp_poly_coll_chk(v, "count");
+  sp_poly_enum_name_chk(v, "count");
   /* String#count needs the character set to count */
   if (v.tag == SP_TAG_STR || sp_poly_is_strbuf(v))
     sp_raise_cls("ArgumentError", "wrong number of arguments (given 0, expected 1+)");
@@ -15930,7 +16044,7 @@ static sp_SymPolyHash *sp_time_deconstruct_all(const sp_Time *t) { return sp_tim
 static sp_RbVal sp_enum_first_boxed(sp_RbVal v);   /* fwd: an Enumerator's first item */
 static sp_RbVal sp_poly_first(sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLOAT_RANGE && v.v.p) return sp_box_float(sp_frange_first_v((*(sp_FloatRange *)v.v.p)));
-  sp_poly_coll_chk(v, "first");
+  sp_poly_enum_name_chk(v, "first");
   if (v.tag == SP_TAG_STR || v.tag == SP_TAG_SYM || sp_poly_is_strbuf(v))
     sp_raise_poly_nomethod("first", v);
   if (v.tag != SP_TAG_OBJ) return sp_box_nil();

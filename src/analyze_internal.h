@@ -172,6 +172,7 @@ int builtin_instance_name_known(const char *m);   /* codegen_call.c */
 int builtin_name_below_object(const char *m);   /* codegen_call.c */
 int builtin_object_method_known(const char *m);   /* builtin_names.c */
 int core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
+int core_method_name_any(const char *m);   /* codegen_call_class.c: an instance method of any core class */
 const char *core_class_ancestors(const char *cls);   /* codegen_call_class.c */
 int builtin_method_arity(const char *cls, const char *m, int *out);
 int builtin_cmethod_known(const char *cls, const char *name);
@@ -736,7 +737,6 @@ const char *errno_canonical_name(const char *n);   /* analyze_util.c */
 void desugar_class_reopen(Compiler *c);
 int is_class_const(const NodeTable *nt, int id);   /* a `Class` constant read */
 int desugar_def_unless_method_defined(Compiler *c);
-int desugar_class_body_self_calls(Compiler *c);
 int desugar_builtins(Compiler *c);
 int desugar_enum_walk_calls(Compiler *c);
 int desugar_index_op_write_user(Compiler *c);
@@ -777,7 +777,6 @@ int desugar_index_assign_user_recv(Compiler *c);
 int desugar_index_assign_value(Compiler *c);
 int desugar_io_console_modes(Compiler *c);
 int desugar_reader_index_write(Compiler *c);
-int desugar_body_self_call(Compiler *c);
 int desugar_body_module_eval(Compiler *c);
 int desugar_instance_eval_defs(Compiler *c);
 int enumerator_own_with_object(Compiler *c, int id);
@@ -899,6 +898,7 @@ typedef struct HostStep {
 void host_begin(HostStep *h, LowerCtx *lc);
 int host_splice(Compiler *c, HostStep *h, int owner, int body, int at, int n, const char *locals, const char *gone);   /* the n statements at body[at], in a frame of locals but gone (NULL: not known): the count they become */
 void host_end(Compiler *c, HostStep *h);
+int ct_table_loop_form(Compiler *c, int st, int list, int j);   /* analyze_ct.c: a table loop that makes no class, statement j of `list`, run under the walk (#10791): the statement now first in its place, or -1 */
 int ct_macro_form(Compiler *c, int call, int list, int j);   /* analyze_ct.c: class-body macro call `call`, statement j of `list`, run under the walk: the statement now first in its place, or -1 */
 const char *handle_attr_decl(const NodeTable *nt, int call);   /* analyze_desugar.c: Thread or Fiber for a `Thread.attr_accessor :x` declaration, else NULL */
 int handle_attr_form(Compiler *c, int call, int list, int j, int now, int file);   /* analyze_desugar.c: `Thread.attr_accessor :x` reached by the walk (statement j of list, run there when now, in file): the reopening in its place (its first statement), -2 at the file's end, -1 none */
@@ -1001,6 +1001,14 @@ int desugar_reduce_splat_args(Compiler *c);
 int desugar_block_capture_wrap(Compiler *c);
 int desugar_user_not_match(Compiler *c);
 int desugar_exception_class_ctor(Compiler *c);
+/* Is node id a super (bare or not) in a class method `exception` of an
+   Exception class (not a module)? desugar_exception_super_new spells the
+   ones that reach Exception.exception `self.new`. The class facts
+   (an_cls_facts) and the early census (compute_instantiated), which run
+   before it, count each as building its class. */
+int exc_super_in_exception_cmethod(Compiler *c, int id);
+int desugar_exception_super_new(Compiler *c);
+int desugar_raise_own_exception(Compiler *c);
 /* Does `exception` at call id on class ci build as `new` does: a class of
    Exception, with neither a class method `exception` nor a `new` of its own? */
 int exc_ctor_class(Compiler *c, int id, int ci);
@@ -1080,7 +1088,6 @@ int desugar_class_eval_ivars(Compiler *c);
 int desugar_builtin_ivars(Compiler *c);
 int desugar_inherited_aliases(Compiler *c);
 int desugar_builtin_alias_calls(Compiler *c);
-int desugar_reader_aliases_before_redef(Compiler *c);
 int desugar_readers_over_inherited_defs(Compiler *c);
 int desugar_inline_struct_blocks(Compiler *c);
 int desugar_singleton_class_meta(Compiler *c);
@@ -1198,7 +1205,6 @@ void qc_collect_writes(Compiler *c, int node, char (*path)[64], int depth, QCWri
 int qc_read_chain(const NodeTable *nt, int node, char (*chain)[64], int *abs_anchor);
 void qc_qualified_name(char *out, size_t cap, const QCWrite *w);
 void qc_rewrite_reads(Compiler *c, int node, char (*mods)[64], int mdepth, QCWrite *ws, int wn);
-void qualify_colliding_consts(Compiler *c);
 void qc_collect_class_writes(Compiler *c, int node, char (*path)[64], int depth, QCWrite **ws, int *n, int *cap);
 void qualify_colliding_classes(Compiler *c);
 void topup_forwarding_arity(Compiler *c);

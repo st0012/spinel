@@ -2,6 +2,7 @@
 #include "value_pos.h"
 #include "builtin_ops.h"
 #include "call_plan.h"
+#include "method_table_check.h"
 #include "repr.h"
 #include "holder.h"
 #include "share.h"
@@ -530,6 +531,7 @@ int an_user_defines_or_reads(Compiler *c, const char *name) {
     else memo = 0;
   }
   int ans = 0;
+  mtab_enter(c);   /* (a scan of every class, as the candidates are) */
   for (int k = 0; k < c->nclasses && !ans; k++) {
     /* comp_poly_arm_defines: a native class counts only through its
        declared bindings (#4504) -- counting its Ruby-side defs here made
@@ -538,6 +540,7 @@ int an_user_defines_or_reads(Compiler *c, const char *name) {
     if (comp_poly_arm_defines(c, k, name)) ans = 1;
     else if (!c->classes[k].is_native_class && comp_reader_in_chain(c, k, name, NULL)) ans = 1;
   }
+  mtab_leave(c);
   /* A CLASS method of the same name is deliberately not consulted: it is only
      reachable through a Class-valued receiver, so it cannot be the answer to
      an instance call. Counting it made `k.downcase` on a String bind to a
@@ -4347,7 +4350,7 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
       if (sp_streq(name, "write_nonblock")) { *out = an_poly_concrete(c, id, name, TY_INT); return 1; }
       if (sp_streq(name, "read") || sp_streq(name, "gets") ||
           sp_streq(name, "readline") || sp_streq(name, "pread") ||
-          sp_streq(name, "readpartial")) { *out = an_poly_concrete(c, id, name, TY_STRING); return 1; }
+          sp_streq(name, "readpartial") || sp_streq(name, "sysread")) { *out = an_poly_concrete(c, id, name, TY_STRING); return 1; }
       /* the descriptor surface, typed as the TY_IO arms type it: a stat is
          carried as the handle itself, the offsets and counts are ints */
       if (sp_streq(name, "stat") && argc == 0) { *out = an_poly_concrete(c, id, name, TY_IO); return 1; }
@@ -4464,7 +4467,7 @@ static int infer_new_call(Compiler *c, int id, const NodeTable *nt, const char *
     /* a namespaced class (M::Sub) or root-qualified builtin (::Array etc) */
     if (rk == NK_ConstantPathNode) {
       const char *cn = const_key_at(c, recv);
-      int ci = cn ? comp_class_index(c, cn) : -1;
+      int ci = cn ? const_node_class_index(c, recv) : -1;
       if (ci >= 0) {
         /* an exception-subclass instance keeps its concrete class (its custom
            methods must dispatch); the exception-shaped queries route through
@@ -4521,7 +4524,7 @@ static int infer_new_call(Compiler *c, int id, const NodeTable *nt, const char *
     if (rk == NK_ConstantReadNode || rk == NK_LocalVariableReadNode ||
         (rk == NK_CallNode && class_def_is_record_call(nt, recv))) {  /* inline Data.define(...).new (#2682) */
       const char *cn = rk == NK_ConstantReadNode ? const_key_at(c, recv) : NULL;
-      int ci = cn ? comp_class_index(c, cn) : class_var_static_ci(c, recv);
+      int ci = cn ? const_node_class_index(c, recv) : class_var_static_ci(c, recv);
       if (ci >= 0) {
         /* an exception-subclass instance keeps its concrete class (its custom
            methods must dispatch); the exception-shaped queries route through
@@ -6405,9 +6408,11 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
   /* Module.singleton_writer= / Module.singleton_reader */
   if (recv >= 0 && nt_type(nt, recv) &&
       (nt_kind(nt, recv) == NK_ConstantReadNode ||
-       nt_kind(nt, recv) == NK_ConstantPathNode)) {
-    const char *cn = const_key_at(c, recv);
-    int ci = cn ? comp_class_index(c, cn) : -1;
+       nt_kind(nt, recv) == NK_ConstantPathNode || class_body_self_ci(c, recv) >= 0)) {
+    /* (a class body's self names its class, as the constant would) */
+    int bci = class_body_self_ci(c, recv);
+    const char *cn = bci >= 0 ? c->classes[bci].name : const_key_at(c, recv);
+    int ci = bci >= 0 ? bci : cn ? const_node_class_index(c, recv) : -1;
     TyKind sgt;
     if (ci >= 0 && sg_accessor_type(c, id, ci, name, &sgt)) { *out = sgt; return 1; }
   }
@@ -6499,13 +6504,16 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
     NodeKind rk = nt_kind(nt, recv);
     if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) {
       int ci = const_node_class_index(c, recv);
+      /* a class method `allocate` of the program's own (on the class or
+         module, its singleton class, or a module it extends) is the call's
+         target: the user dispatch types it */
+      if (comp_own_allocate(c, ci, id)) return 0;
       /* a module's allocate raises (no instance of a module): boxed, as the
          raise's expression is (#10751) */
       if (ci >= 0 && comp_class_is_module(c, &c->classes[ci])) { *out = TY_POLY; return 1; }
-      /* Exception subclasses have a dedicated storage layout in the common
-         allocator. A user class method of their own still takes precedence. */
-      if (ci >= 0 && (!class_is_exc_subclass(c, ci) ||
-          comp_cmethod_in_chain(c, ci, "allocate", NULL) < 0)) { *out = ty_object(ci); return 1; }
+      /* (Exception subclasses have a dedicated storage layout in the common
+         allocator) */
+      if (ci >= 0) { *out = ty_object(ci); return 1; }
       const char *bcn = const_key_at(c, recv);
       if (bcn && sp_streq(bcn, "String")) { *out = TY_STRING; return 1; }
       if (bcn && sp_streq(bcn, "Array"))  { *out = TY_POLY_ARRAY; return 1; }
@@ -6713,6 +6721,13 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
 
   /* user-defined free-function call (no receiver) */
   if (recv < 0) {
+    /* in a class or module body, the body's own class method comes first,
+       as the call plan takes it (comp_cbody_call_mi); not where an
+       instance_eval block's receiver answers the name */
+    { int iec = ie_class_of(c, id);
+      int cb = nt_int(nt, id, "builtin_only", 0) || (iec >= 0 && iec < c->nclasses && call_target(c, id, iec, name, 0, NULL) >= 0)
+               ? -1 : comp_cbody_call_mi(c, id, name);
+      if (cb >= 0) { *out = an_user_call(c, id, cb, UC_CMETH, c->node_cbody[id]); return 1; } }
     int mi = nt_int(nt, id, "builtin_only", 0) ? -1 : call_target(c, id, -1, name, CT_TOP, NULL), fvia = UC_TOP;
     /* in a block run by instance_eval, the receiver's own method answers
        before a top-level def of the same name (#7213) */
@@ -6827,6 +6842,7 @@ static int infer_user_method_call(Compiler *c, int id, const NodeTable *nt, cons
   if (recv >= 0) {
     NodeKind rk = nt_kind(nt, recv);
     int sci = self_class_static_ci(c, recv);
+    if (sci < 0 && rk == NK_SelfNode) sci = class_body_self_ci(c, recv);   /* a class body's self */
     if (sci >= 0 || (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode)) {
       int ci = sci >= 0 ? sci : const_node_class_index(c, recv);
       if (ci >= 0) {
@@ -7281,7 +7297,7 @@ static int infer_universal_call(Compiler *c, int id, const NodeTable *nt, const 
     else if (cgt_k == NK_StringNode) cgn = nt_str(nt, argv[0], "content");
     /* const_get(name, false) searches only the receiver's own constants, so an
        inherited one is a NameError, not that constant's type (#3762) */
-    int cg_rk = cgn ? const_get_recv_class(c, id, recv) : CG_NONE;
+    int cg_rk = cgn ? const_get_recv_class_for(c, id, recv, cgn) : CG_NONE;
     if (cgn && argc >= 2 && nt_kind(nt, argv[1]) == NK_FalseNode) {
       if (cg_rk != CG_NONE && !const_owned_by_class(c, cg_rk, cgn)) { *out = TY_POLY; return 1; }
     }
@@ -7290,6 +7306,8 @@ static int infer_universal_call(Compiler *c, int id, const NodeTable *nt, const 
     int cg_cls = -1;
     const char *cgk = cgn ? const_get_resolve(c, cg_rk, cgn, &cg_cls) : NULL;
     if (cgn && cg_cls >= 0 && !cgk) { *out = TY_CLASS; return 1; }
+    /* a leaf the receiver does not see is a NameError (cg_flat_seen) */
+    if (cgn && !cgk && !cg_flat_seen(c, cg_rk, cgn)) { *out = TY_POLY; return 1; }
     if (cgn) {
       LocalVar *cv = comp_const(c, cgk ? cgk : cgn);
       if (cv && cv->type != TY_UNKNOWN) { *out = cv->type; return 1; }
@@ -8796,10 +8814,11 @@ static int reopen_owner_of(Compiler *c, int id, int cn, const char *name) {
     if (!ahr_any) return -1;
   }
   int aci = comp_core_class(c, cn);
-  int adc = -1, ami = aci >= 0 ? call_target(c, id, aci, name, 0, &adc) : -1;
+  MethodLookup ml = { .def_class = -1 };
+  int ami = aci >= 0 ? call_target(c, id, aci, name, 0, &ml) : -1;
   /* the reopen's own method under this very name: an alias taken before the
      reopen (`alias orig_first first`) still names the builtin */
-  if (ami < 0 || adc != aci || !c->scopes[ami].name || !sp_streq(c->scopes[ami].name, name)) return -1;
+  if (ami < 0 || ml.def_class != aci || !c->scopes[ami].name || !sp_streq(c->scopes[ami].name, name)) return -1;
   if (cplan_reopen_runs_builtin(c, id, ami)) return -1;
   if (nt_ref(c->nt, id, "block") >= 0 && builtin_method_known(core_class_name(cn), name) && c->scopes[ami].yields &&
       !(cn == CORE_ARRAY && sp_streq(name, "concat"))) return -1;
@@ -9269,6 +9288,12 @@ static TyKind infer_call_inner(Compiler *c, int id) {
   TyKind accessor_ret;
   if (infer_accessor_call(c, id, recv, name, &accessor_ret)) return accessor_ret;
 
+  /* A retargeted `x.send(:m)` that reaches a top-level def is answered here,
+     ahead of the boxed-receiver rows below: they type a builtin's answer
+     (`hash` as an Integer), which the top-level def need not give. */
+  TyKind send_ret;
+  if (infer_send_blind(c, id, recv, name, &send_ret)) return send_ret;
+
   /* The universal predicates and conversions the poly runtime answers as a RAW
      C scalar. The emitters have always known this; the TYPE did not say it, so
      `x&.frozen?` was inferred poly while its value arm rendered an sp_bool, and
@@ -9308,9 +9333,6 @@ static TyKind infer_call_inner(Compiler *c, int id) {
     if (is_poly_exc_boxed_call(name, argc)) return an_planned_call_ret(c, id, TY_POLY);
   }
 
-  TyKind send_ret;
-  if (infer_send_blind(c, id, recv, name, &send_ret)) return send_ret;
-
   /* A call with NO receiver resolves the way CRuby's ancestry does: the
      enclosing scope's own chain first, then Object -- where a top-level `def`
      lands -- and only then a Kernel builtin. The user-method arm further down
@@ -9333,6 +9355,8 @@ static TyKind infer_call_inner(Compiler *c, int id) {
                         ? call_target(c, id, bcls, name, CT_CMETHOD, NULL) >= 0
                         : (call_target(c, id, bcls, name, 0, NULL) >= 0 ||
                            comp_is_reader(&c->classes[bcls], name)));
+      /* (so is a class or module body's own class method, comp_cbody_call_mi) */
+      if (!shadowed && biec < 0 && bcls < 0 && comp_cbody_call_mi(c, id, name) >= 0) shadowed = 1;
       /* A callee that yields carries a block parameter in its C signature,
          which the arm below is what establishes: answering here left the call
          site and the definition disagreeing about the signature. */
@@ -10147,7 +10171,7 @@ static int call_may_reach_user_method(Compiler *c, int w, const char *wn) {
   NodeKind rk = nt_kind(nt, r);
   if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) {
     const char *cn = nt_str(nt, r, "name");
-    int ci = cn ? comp_class_index(c, cn) : -1;
+    int ci = cn ? const_node_class_index(c, r) : -1;
     if (ci >= 0) return call_target(c, w, ci, wn, CT_CMETHOD, NULL) >= 0;
   }
   TyKind rt = comp_ntype(c, r);
@@ -10532,33 +10556,46 @@ static int infer_constant_path(Compiler *c, int id, const NodeTable *nt, NodeKin
           comp_const(c, pn)) dyn = 1;
     }
     TyKind prt = dyn ? infer_type(c, dpar) : TY_UNKNOWN;
-    if (nm && dyn && (prt == TY_CLASS || prt == TY_POLY)) {
-      TyKind ct = TY_UNKNOWN; int nc = 0, uniform = 1;
+    /* (a leaf bound to one member's slot, const_leaf_bound, is that
+       constant's: no run-time question) */
+    if (nm && dyn && (prt == TY_CLASS || prt == TY_POLY) && !const_leaf_bound(c, id)) {
+      TyKind ct = TY_UNKNOWN; int nc = 0, uniform = 1, boxable = 1;
       int *cands, ncands = comp_const_tail_cands(c, nm, &cands);
       /* (each class's own chain, and Object's top-level one) */
       int obj_k = comp_core_class(c, CORE_OBJECT);
       /* (a constant a value's path writes is read as before: by the classes
          that hold it themselves, then by its name) */
-      int through = const_written_through_value(c, nm);
+      int through = const_written_through_value(c, nm), dyn_cls1 = -1;
       for (int k = 0; k < c->nclasses; k++) {
         if (k == obj_k) continue;
         int ci2 = through ? comp_class_owned_const(c, k, nm, cands, ncands) : const_path_value_const(c, k, nm, cands, ncands);
         if (ci2 < 0) continue;
-        if (nc == 0) ct = c->consts[ci2].type;
+        if (nc == 0) { ct = c->consts[ci2].type; dyn_cls1 = k; }
         else if (c->consts[ci2].type != ct) uniform = 0;
+        if (!ty_boxable(c->consts[ci2].type)) boxable = 0;
         nc++;
       }
       free(cands);
+      /* (`self::NM` in the body of the one class holding NM, as the emitter
+         reads it plainly, codegen_expr.c) */
+      if (nc == 1 && dpar >= 0 && dpk == NK_SelfNode && self_class_body(c, dpar) == dyn_cls1 &&
+          !elab_const_descendant_writes(c, dyn_cls1, nm)) nc = 0;
       const LocalVar *topc = through ? NULL : const_value_path_top(c, nm);
       if (topc) {
         if (nc == 0) ct = topc->type;
         else if (topc->type != ct) uniform = 0;
+        if (!ty_boxable(topc->type)) boxable = 0;
         nc++;
       }
       if (nc > 0 && uniform && ct != TY_UNKNOWN) { *out = ct; return 1; }
+      /* constants of different kinds (a holder's Float LIMIT beside a
+         subclass's Integer one): the read is their box, whichever the class
+         owns (#10787) */
+      if (nc > 1 && !uniform && boxable) { *out = TY_POLY; return 1; }
     }
   }
-  LocalVar *lv = nm && !const_path_in_closed_builtin(c, id) && !const_path_misses_toplevel(c, id) ? comp_const(c, nm) : NULL;
+  LocalVar *lv = nm ? comp_const(c, nm) : NULL;
+  if (lv && !const_path_reaches_leaf_const(c, id)) lv = NULL;
   /* Same guard the bare ConstantReadNode carries: a registered constant
      whose type never settled (Block = Struct.new(:kind), which registers
      the name before the anonymous class exists) must not shadow the
@@ -11079,7 +11116,7 @@ static int ssv_value(Compiler *c, int v, char *set, int depth) {
       int r = nt_ref(nt, v, "receiver");
       if (!un || r < 0 || nt_kind(nt, r) != NK_ConstantReadNode) return 0;
       const char *rn = nt_str(nt, r, "name");
-      int ci = rn ? comp_class_index(c, rn) : -1;
+      int ci = rn ? const_node_class_index(c, r) : -1;
       if (sp_streq(un, "new") && ci >= 0) {
         if (comp_cmethod_in_chain(c, ci, "new", NULL) >= 0) return 0;
         set[ci] = 1;
@@ -11756,8 +11793,7 @@ TyKind infer_uncached(Compiler *c, int id) {
   if (nk == NK_ConstantWriteNode) {
     /* `A = v` as a value: the constant, read back after the write. Not for a
        constant the value form leaves out (comp_const_write_valued) */
-    const char *nm = const_key_at(c, id);
-    LocalVar *lv = nm ? comp_const(c, nm) : NULL;
+    LocalVar *lv = comp_const_at(c, id);
     if (comp_const_write_valued(c, lv)) return lv->type;
   }
   if (nk == NK_ConstantReadNode) {
@@ -12146,10 +12182,10 @@ TyKind infer_uncached(Compiler *c, int id) {
        method's through the parent's CLASS-method chain, which the instance
        chain would miss `def self.x` entirely) */
     int at, mi = cplan_super_target(c, id, s, &at);
-    if (comp_super_shadow(c, s)) {
+    if (comp_super_shadow(c, comp_super_site(c, s))) {
       if (mi < 0) return TY_UNKNOWN;
       /* a yielding shadow is spliced as a parent is */
-      an_user_call_record(c, id, mi, UC_SUPER, s->class_id);
+      an_user_call_record(c, id, mi, UC_SUPER, at);
       return super_target_ret(c, s, mi, id);
     }
     /* Class#new: an instance of the receiving class, which is this one or,
@@ -12158,7 +12194,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (comp_super_is_class_new(c, id))
       return comp_super_class_new_boxed(c, id) ? TY_POLY : ty_object(s->class_id);
     int p = at;
-    const char *uname = comp_super_name(c, p, comp_scope_def_name(c, s), s->is_cmethod);
+    const char *uname = comp_super_name(c, p, comp_scope_def_name(c, comp_super_site(c, s)), s->is_cmethod);
     /* `super` in a respond_to? override no ancestor defines is Object's
        respond_to?: a boolean (see emit_super_respond_to) */
     int rto_super = !s->is_cmethod && uname &&
@@ -12467,7 +12503,7 @@ static int why_node_origin(Compiler *c, int id, TyKind t) {
       if (recv >= 0 && recv < c->node_cap && ty_is_object(c->ntype[recv])) cid = ty_object_class(c->ntype[recv]);
       else if (recv >= 0 && (nt_kind(nt, recv) == NK_ConstantReadNode || nt_kind(nt, recv) == NK_ConstantPathNode)) {
         const char *cn = nt_str(nt, recv, "name");
-        cid = cn ? comp_class_index(c, cn) : -1; want_cm = 1;
+        cid = cn ? const_node_class_index(c, recv) : -1; want_cm = 1;
       }
       else if (recv < 0) { Scope *cs = comp_scope_of(c, id); cid = cs ? cs->class_id : -1; want_cm = cs ? cs->is_cmethod : 0; }
       for (int si = 1; si < c->nscopes; si++) {
@@ -12872,6 +12908,7 @@ TyKind infer_type(Compiler *c, int id) {
     imemo_rec_add(&g_imemo_rec[rec_i], id < c->node_cap && c->nscope ? c->nscope[id] : -1);
   }
   g_infer_depth++;
+  MtabMark mt_was = mtab_push(c, id);
   TyKind t = infer_uncached(c, id);
   g_infer_depth--;
   ImemoRec rec = { -1, {0} };
@@ -12902,6 +12939,7 @@ TyKind infer_type(Compiler *c, int id) {
       an_ary_viewed_mark(c, id);
     }
   }
+  mtab_pop(c, mt_was);
   /* The builtin-only re-derivation (see an_builtin_only) asks what this call
      would be if no user class owned the name. That answer is not the node's
      real type, and neither are the child types derived under it, so the cache
@@ -13054,7 +13092,8 @@ void scope_add_param(Scope *s, const char *name, int defnode) {
    name is picked at run time from the builtin ancestry; `reopen` asks that
    none does. */
 int super_reaches_exc_text(Compiler *c, int id, int reopen) {
-  Scope *s = comp_scope_of(c, id);
+  Scope *s0 = comp_scope_of(c, id);
+  const Scope *s = s0 ? comp_super_site(c, s0) : NULL;
   if (!s || s->class_id < 0 || !s->name || s->is_cmethod || comp_super_shadow(c, s) ||
       !class_is_exc_subclass(c, s->class_id))
     return 0;

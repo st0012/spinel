@@ -25,6 +25,9 @@ extern int g_strict_require;
 extern int g_require_unread;
 extern const char **g_required_features;   /* spinel_parse.c */
 extern int g_nrequired_features;
+/* a feature in it that is not a library the program's start loads (a core
+   library CRuby has loaded before it starts): a require the program makes */
+int sp_requires_non_boot_feature(void);
 /* SPINEL_SHARE_STRINGS is on: set, not empty and not "0" (spinel_parse.c) */
 int sp_share_strings_env(void);
 void sp_feature_mark(const char *name);
@@ -501,6 +504,10 @@ typedef struct {
      (register_attr_versions), whose calls the slot stands in for
      (cplan_sg_accessor) */
   unsigned char versioned, replaced, attr_version;
+  /* the method made of an accessor an alias names
+     (alias_accessor_method): 1 + the node of the attr_* call that declares
+     it, 0 for none */
+  int accessor_of;
   enum { ENTRY_NONE, ENTRY_DISPATCH, ENTRY_TABLE, ENTRY_NAMED } entry;
   int version_n, main_n;
   unsigned char cand_bound; /* a call on a poly receiver bound its arguments
@@ -774,6 +781,13 @@ static inline int scope_on_side(const Scope *s, int cm) {
    it reach it. */
 static inline int scope_by_name_hidden(const Scope *s) {
   return s->entry == ENTRY_DISPATCH || s->attr_version;
+}
+
+/* Is s a method made of an accessor, one an alias names or one a later def
+   replaces: CRuby's Method of it has the accessor's parameter list (`_`
+   for a writer's one), not the synthesized def's */
+static inline int scope_of_accessor(const Scope *s) {
+  return s->attr_version || s->accessor_of;
 }
 
 static inline TyKind scope_set_ret(Scope *s, TyKind t) {
@@ -1863,6 +1877,9 @@ typedef struct {
      are kept, and a call that reaches a later prepend's copy binds its
      guard entry */
   int ver_built;
+  /* --method-table-check: the reads of the method tables made outside
+     call_target (method_table_check.h); NULL without the flag */
+  struct MethodTableCheck *mtab;
   /* the entries' build asks its calls (ver_entries_build), which make and
      rename no scope: scope_is_shadowed answers from its table, as where
      the scope index is frozen, not by a scan per ask */
@@ -1872,8 +1889,9 @@ typedef struct {
   int *shadow_copies, nshadow_copies, cshadow_copies;
   /* the version each call asked on a class runs, once the entries are
      made (call_plan.c, ct_version): open addressing, name (the memo's own
-     copy) NULL for a free slot; dc the class it answers, -2 for the table's */
-  struct VerMemo { char *name; int id, cls; unsigned flags; int vi, dc; } *ver_memo;
+     copy) NULL for a free slot; dc the class it answers, -2 for the table's;
+     kind, why, copies and n the rest of its MethodLookup (call_plan.h) */
+  struct VerMemo { char *name; int id, cls; unsigned flags; int vi, dc; unsigned char kind, why, copies; short n; } *ver_memo;
   int ver_memo_cap, ver_memo_n;
   /* the methods a guard entry chooses from for each scope asked once the
      entries are made (call_plan.c, guard_chain): at[mi] - 1 is where in
@@ -2158,6 +2176,9 @@ int comp_defined_reads(Compiler *c, int pred, int *reads, int cap);
 /* a constant path whose leaf is no member of the class or module its parent
    names (analyze_util.c) */
 int const_path_misses_member(Compiler *c, int id);
+int const_path_reaches_leaf_const(Compiler *c, int id);   /* the constant the leaf-keyed table holds */
+int const_node_match_class(Compiler *c, int node);   /* the class a raise or rescue operand matches by (analyze_util.c) */
+const char *const_node_match_class_name(Compiler *c, int node);   /* ...by name: a builtin class an alias holds too */
 int class_lacks_own_const(Compiler *c, int k, const char *nm);   /* private_constant :nm in k is a NameError */
 int const_visibility_call_is_builtin(Compiler *c, int call, int k);   /* ... when the call is Module's own */
 int const_node_class_index(Compiler *c, int id);
@@ -2205,7 +2226,8 @@ const char *comp_class_base_display_fn(Compiler *c);
 int cls_user_display_mi(Compiler *c, int k, const char *nm);
 int prog_has_cls_user_display(Compiler *c, const char *nm);
 int        class_var_static_ci(Compiler *c, int node);  /* local holding one class const */
-int        class_recv_static_ci(Compiler *c, int node); /* constant or local naming one class */
+int        class_recv_static_ci(Compiler *c, int node); /* constant or local naming one class, or self in a class body */
+int        class_body_self_ci(Compiler *c, int node);   /* the class a class body's self is (analyze_util.c) */
 /* The Struct or Data class a class method call's receiver names at compile
    time: as class_recv_static_ci reads it, or `self` in a class method of
    the class (a version entry's else arm); -1 for none */
@@ -2260,19 +2282,23 @@ int        hash_new_blockless(Compiler *c, int recv);  /* blockless Hash.new / {
 enum { CG_OBJECT = -1, CG_NONE = -2, CG_UNTABLED = -3 };
 int        const_owned_by_class(Compiler *c, int rk, const char *constname);
 int        const_get_recv_class(Compiler *c, int call, int recv);
+int        const_get_recv_class_for(Compiler *c, int call, int recv, const char *name);   /* ...for a read of leaf name: self in a class method a descendant overrides the leaf in is dynamic (CG_NONE) */
 enum { CS_NONE, CS_SLOT, CS_AMBIG };            /* const_set_slot's answers */
 int        const_set_slot(Compiler *c, int call, const char *n, const char **key);
 const char *const_get_resolve(Compiler *c, int rk, const char *cgn, int *cls);
+int cg_flat_seen(Compiler *c, int rk, const char *cgn);
 void       const_get_leaves_begin(Compiler *c);  /* index the class leaves while the class table holds still */
 void       const_get_leaves_end(void);
 int        const_defined_known(Compiler *c, int rk, const char *cgn);
+int        const_defined_top_level(Compiler *c, const char *n);   /* every class sees N: top-level, well-known or builtin */
+int        const_defined_basic_object_misses(Compiler *c, int recv, const char *cgn);   /* BasicObject.const_defined?(builtin name): false */
+int        is_builtin_toplevel_const(const char *n);   /* Struct, StandardError, Thread, Errno: CRuby defines it at boot */
 int        const_defined_from(Compiler *c, int rk, const char *cgn);   /* ... and seen from R: R, its ancestors, their modules, or top level (#9876) */
 int        const_seen_by_class(Compiler *c, int k, const char *cgn);
 int        const_path_value_const(Compiler *c, int k, const char *nm, const int *cands, int ncands); /* what `m::NM` reads for m = class K: K's chain, not Object's (-1: NameError) */
 const LocalVar *const_value_path_top(Compiler *c, const char *nm); /* the top-level NM `Object::NM` reads through a value, or NULL */
 int        const_path_value_class(Compiler *c, int k, const char *nm); /* the class nested as NM in K's chain, -1 for none */
 int        const_written_through_value(Compiler *c, const char *nm); /* `m::NM = v` / const_set with m a value: no chain can be read for NM */
-int        qc_const_qualified(const char *qn);
 int        qc_leaf_qualified(const char *leaf);
 const char *time_strict_parser_call(Compiler *c, int id);
 /* Class index of a `class_eval`/`module_eval { defs }` reopen, else -1.
@@ -2325,6 +2351,7 @@ int        comp_scope_moving(void);   /* a scope is moved for an instance_exec b
 int        comp_cmethod_in_class(Compiler *c, int class_id, const char *name);
 /* Find the class (singleton) method scope, walking the superclass chain. */
 int        comp_cmethod_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
+int        comp_own_allocate(Compiler *c, int ci, int call);   /* a class method allocate of the program's own answers the call */
 int        class_any_cmethod_eqq(Compiler *c, int ci);
 int        class_own_cmethod_eqq(Compiler *c, int ci);
 int        class_eqq_answers_value(Compiler *c);
@@ -2601,6 +2628,7 @@ int comp_new_receiver(Compiler *c, int k);
 int comp_new_receivers(Compiler *c, int own);
 int method_answers_receiver(Compiler *c, int mi);
 int comp_super_parent(Compiler *c, int class_id, int is_cmethod); /* super in `self.new` is Class#new */
+const Scope *comp_super_site(Compiler *c, const Scope *s);   /* the method scope a super in s resolves as: its class starts the parent chain, its def names the method asked for */
 enum { SUPER_OBJ_SAME = 1, SUPER_OBJ_FALSE, SUPER_OBJ_FROZEN, SUPER_OBJ_SELF };
 /* a super (node id) no program ancestor answers that reaches BasicObject's
    or Kernel's ==, equal?, eql?, !, nil?, frozen?, itself or

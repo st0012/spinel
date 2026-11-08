@@ -1058,14 +1058,17 @@ static void inline_target_lookup(Compiler *c, int id, const char *name, int recv
     const char *cname = ((rk == NK_ConstantReadNode ||
                                  rk == NK_ConstantPathNode))
                         ? nt_str(nt, recv, "name") : NULL;
-    int ci = cname ? comp_class_index(c, cname) : self_class_static_ci(c, recv);
+    /* (the class the node names: an alias's too) */
+  int ci = cname ? const_node_class_index(c, recv) : rk == NK_SelfNode && class_body_self_ci(c, recv) >= 0 ? class_body_self_ci(c, recv) : self_class_static_ci(c, recv);
+  if (ci < 0 && cname) ci = comp_class_index(c, cname);
     if ((t->mi = class_reopen_cmethod(c, id, recv, name)) >= 0) {
       t->cm_class = c->scopes[t->mi].class_id;
       t->cm_self_id = builtin_class_id(cname);
     }
     else if (ci >= 0) {
-      /* Cls.method with a yield block: look up as a class method */
-      t->mi = call_target(c, id, ci, name, CT_CMETHOD, NULL);
+      /* Cls.method with a yield block: look up as a class method (a
+         `new`: the one the call reaches, cplan_user_new) */
+      t->mi = is_new_name(name) ? cplan_user_new(c, id, ci) : call_target(c, id, ci, name, CT_CMETHOD, NULL);
       t->cm_class = ci;
     }
     else if (ty_is_object(rt)) {
@@ -1161,7 +1164,9 @@ static int inline_target_plan(Compiler *c, int id, const char *name, int recv, i
   const char *cname = ((rk == NK_ConstantReadNode ||
                                rk == NK_ConstantPathNode))
                       ? nt_str(nt, recv, "name") : NULL;
-  if (narrow && !cname) {
+  /* a class body's self is that class, as a constant naming it is */
+  int bci = rk == NK_SelfNode ? class_body_self_ci(c, recv) : -1;
+  if (narrow && !cname && bci < 0) {
     TyKind rt = comp_ntype(c, recv);
     if (p->via == UC_INST && p->chain && ty_is_object(rt) && p->owner_ci == ty_object_class(rt)) {
       t->mi = p->mi; t->recv_class = p->owner_ci;
@@ -1169,7 +1174,9 @@ static int inline_target_plan(Compiler *c, int id, const char *name, int recv, i
     }
     return 0;
   }
-  int ci = cname ? comp_class_index(c, cname) : self_class_static_ci(c, recv);
+  /* (the class the node names: an alias's too) */
+  int ci = cname ? const_node_class_index(c, recv) : bci >= 0 ? bci : self_class_static_ci(c, recv);
+  if (ci < 0 && cname) ci = comp_class_index(c, cname);
   if (p->via == UC_CMETH && !p->by_name && (cname || ci >= 0)) {
     if (ci >= 0 && p->owner_ci == ci) { t->mi = p->mi; t->cm_class = ci; return 1; }
     if (!narrow && cname && builtin_class_id(cname) && p->owner_ci == c->scopes[p->mi].class_id &&
@@ -2824,8 +2831,24 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
      by index, `yield(x)` with x = [1, 2, 3] into `|a, b = 5, c|` answered
      [1, 5, nil]. Leading requireds alone keep the lighter per-index read
      below. */
+  /* An object of the program's yielded alone converts through its own
+     to_ary, as a boxed one does (its parameters' row): it is boxed, and
+     the Array its to_ary answers splats */
+  int yobj_to_ary = 0;
+  if (autosplat && yc == 1 && yargs && nt_kind(nt, yargs[0]) != NK_SplatNode) {
+    Repr yr = repr_of(c, yargs[0]);
+    if (yr.kind != RK_BOXED && ty_is_object(yr.as_ty)) {
+      int oc = ty_object_class(yr.as_ty);
+      int *ks = malloc(sizeof(int) * (size_t)(c->nclasses + 1));
+      if (!ks) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      int nk = cplan_boxed_to_ary_classes(c, nt_ref(nt, blk, "parameters"), NTI_YIELDED, ks, c->nclasses + 1);
+      for (int q = 0; q < nk; q++) yobj_to_ary |= is_descendant(c, ks[q], oc);
+      free(ks);
+    }
+  }
   int boxed_spread = autosplat && yc == 1 && yargs && nt_kind(nt, yargs[0]) != NK_SplatNode &&
-                     repr_of(c, yargs[0]).kind == RK_BOXED && (O > 0 || Q > 0 || block_rest_name(c, blk));
+                     (repr_of(c, yargs[0]).kind == RK_BOXED || yobj_to_ary) &&
+                     (O > 0 || Q > 0 || block_rest_name(c, blk));
   int poly_splat_tmp = -1;   /* a boxed yielded value splatted at run time */
   TyKind self_ty = TY_UNKNOWN;
   /* One step of a boxed or Enumerator receiver, which a builtins/ method
@@ -2889,6 +2912,19 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
   else if (yargs && (ie_kw || (call_args_need_spread(nt, yargs, yc) && !lone_splat_typed) || boxed_spread)) {
     splat_at = TY_POLY_ARRAY;
     splat_tmp = emit_spread_args(c, yargs, yc);
+    /* a lone value converts as the parameters' implied to_ary of it */
+    if (boxed_spread) {
+      int e0 = ++g_tmp;
+      size_t at = g_pre->len;
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "sp_RbVal _t%d = sp_PolyArray_get(_t%d, 0); SP_GC_ROOT_RBVAL(_t%d);\n", e0, splat_tmp, e0);
+      int e1 = emit_boxed_to_ary(c, nt_ref(nt, blk, "parameters"), NTI_YIELDED, e0, g_pre, g_indent);
+      if (e1 != e0) {
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "sp_PolyArray_set(_t%d, 0, _t%d);\n", splat_tmp, e1);
+      }
+      else buf_erase(g_pre, at, g_pre->len - at);   /* no class converts: take the read back */
+    }
     if (autosplat) {
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "if (_t%d->len == 1", splat_tmp);
@@ -2916,14 +2952,16 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
       inner = yargs[0];
     Repr ar = repr_of(c, inner);
     TyKind at = ar.as_ty;
+    int obj_to_ary = yobj_to_ary && inner >= 0 && inner == yargs[0];
     /* A BOXED yielded value can be an array too, and CRuby splats it just the
        same. Only a statically typed array was splatted, so a method yielding
        what it read out of a boxed container -- Set#each over its element array
        -- bound the whole element to the first parameter and nil to the rest
        (#3944). Decide it at run time. */
-    if (ar.kind == RK_BOXED && inner >= 0) {
+    if ((ar.kind == RK_BOXED || obj_to_ary) && inner >= 0) {
       poly_splat_tmp = ++g_tmp;
-      Buf pb2; memset(&pb2, 0, sizeof pb2); emit_expr(c, inner, &pb2);
+      Buf pb2; memset(&pb2, 0, sizeof pb2);
+      if (obj_to_ary) emit_boxed(c, inner, &pb2); else emit_expr(c, inner, &pb2);
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "sp_RbVal _t%d = %s; SP_GC_ROOT_RBVAL(_t%d);\n",
                  poly_splat_tmp, pb2.p ? pb2.p : "sp_box_nil()", poly_splat_tmp);
@@ -4202,7 +4240,7 @@ static int emit_poly_recv_block_dispatch_x(Compiler *c, int id, Buf *b, int inde
     ConvHold *sv_hold = g_conv_hold;
     jmp_buf sv_jb; memcpy(sv_jb, g_unsup_recover, sizeof(jmp_buf));
     volatile int ok = 1;
-    EmitUnitState *sv_state = emit_state_snapshot();
+    EmitUnitState *sv_state = emit_state_snapshot(c);
     g_unsup_probe = 1;
     if (setjmp(g_unsup_recover) == 0) {
       /* where the call's value is used, the builtin's own answer is it */
@@ -4215,7 +4253,7 @@ static int emit_poly_recv_block_dispatch_x(Compiler *c, int id, Buf *b, int inde
       else emit_stmt(c, id, ab, indent + 1);
     }
     else ok = 0;
-    emit_state_release(sv_state, !ok);
+    emit_state_release(c, sv_state, !ok);
     memcpy(g_unsup_recover, sv_jb, sizeof(jmp_buf));
     g_conv_hold = sv_hold; g_open_defaults = sv_open_defaults;
     g_nren = sv_nren; g_block_id = sv_block;
@@ -4330,7 +4368,9 @@ int call_targets_yielding_method(Compiler *c, int id) {
     NodeKind rk = nt_kind(nt, recv);
     const char *cn = (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode)
                      ? nt_str(nt, recv, "name") : NULL;
-    int ci = cn ? comp_class_index(c, cn) : -1;
+    /* (the class the node names, as inline_target_lookup asks) */
+    int ci = cn ? const_node_class_index(c, recv) : rk == NK_SelfNode ? class_body_self_ci(c, recv) : -1;
+    if (ci < 0 && cn) ci = comp_class_index(c, cn);
     if (ci >= 0) mi = call_target(c, id, ci, name, CT_CMETHOD, NULL);
     else if (ty_is_object(rt)) mi = call_target(c, id, ty_object_class(rt), name, 0, NULL);
   }
