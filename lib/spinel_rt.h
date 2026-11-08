@@ -12881,9 +12881,12 @@ static SP_INLINE sp_int sp_poly_ary_offset(sp_RbVal v, sp_int n) {
   return (v.tag == SP_TAG_FLT || v.tag == SP_TAG_BIGINT) ? sp_oint_arg(sp_array_fill_offset_arg(v, 0))
                                                          : sp_poly_arg_int_chk_slow(v);
 }
-static sp_IntArray *sp_poly_as_int_array(sp_RbVal v) {
-  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_INT_ARRAY) return (sp_IntArray *)v.v.p;
-  if (v.tag == SP_TAG_NIL || !sp_poly_is_array_kind(v.cls_id)) return (sp_IntArray *)0;
+/* The converting copies below are out of line. Their roots take the box's
+   address, and in a reader inlined into a loop that address kept the box in
+   memory on the path that only reads the tag: the C compiler wrote the box's
+   two halves and read them back as one word, which waits for both stores
+   (a store-forwarding stall). In bm_rbs_items that was a third of the time. */
+static SP_NOINLINE sp_IntArray *sp_poly_as_int_array_conv(sp_RbVal v) {
   SP_GC_ROOT_RBVAL(v);   /* the source array is a boxed temporary; the converting pushes allocate */
   sp_IntArray *a = sp_IntArray_new(); SP_GC_ROOT(a);
   sp_int n = sp_poly_length(v);
@@ -12899,9 +12902,12 @@ static sp_IntArray *sp_poly_as_int_array(sp_RbVal v) {
   }
   return a;
 }
-static sp_FloatArray *sp_poly_as_float_array(sp_RbVal v) {
-  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLT_ARRAY) return (sp_FloatArray *)v.v.p;
-  if (v.tag == SP_TAG_NIL || !sp_poly_is_array_kind(v.cls_id)) return (sp_FloatArray *)0;
+static sp_IntArray *sp_poly_as_int_array(sp_RbVal v) {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_INT_ARRAY) return (sp_IntArray *)v.v.p;
+  if (v.tag == SP_TAG_NIL || !sp_poly_is_array_kind(v.cls_id)) return (sp_IntArray *)0;
+  return sp_poly_as_int_array_conv(v);
+}
+static SP_NOINLINE sp_FloatArray *sp_poly_as_float_array_conv(sp_RbVal v) {
   SP_GC_ROOT_RBVAL(v);   /* the source array is a boxed temporary; the converting pushes allocate */
   sp_FloatArray *a = sp_FloatArray_new(); SP_GC_ROOT(a);
   sp_int n = sp_poly_length(v);
@@ -12912,6 +12918,19 @@ static sp_FloatArray *sp_poly_as_float_array(sp_RbVal v) {
                                            sp_poly_class_name(e)));
     sp_FloatArray_push_o(a, e.tag == SP_TAG_INT ? sp_ofloat_of((sp_float)e.v.i) : sp_poly_as_float_or_nil(e));
   }
+  return a;
+}
+static sp_FloatArray *sp_poly_as_float_array(sp_RbVal v) {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLT_ARRAY) return (sp_FloatArray *)v.v.p;
+  if (v.tag == SP_TAG_NIL || !sp_poly_is_array_kind(v.cls_id)) return (sp_FloatArray *)0;
+  return sp_poly_as_float_array_conv(v);
+}
+static SP_NOINLINE sp_PtrArray *sp_poly_as_ptr_array_conv(sp_RbVal v, int kind, int cls) {
+  SP_GC_ROOT_RBVAL(v);
+  sp_PtrArray *a = sp_PtrArray_new(); SP_GC_ROOT(a);
+  a->elem_kind = kind; a->elem_cls = cls;
+  sp_int n = sp_poly_length(v);
+  for (sp_int i = 0; i < n; i++) sp_PtrArray_push(a, sp_PtrArray_elem_unbox(a, sp_poly_arr_get(v, i)));
   return a;
 }
 /* A boxed value read as a pointer array of the given kind (#4486): a pointer
@@ -12930,16 +12949,9 @@ static sp_PtrArray *sp_poly_as_ptr_array(sp_RbVal v, int kind, int cls) {
   }
   if (v.tag != SP_TAG_OBJ || !sp_poly_is_array_kind(v.cls_id))
     sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into Array", sp_poly_class_name(v)));
-  SP_GC_ROOT_RBVAL(v);
-  sp_PtrArray *a = sp_PtrArray_new(); SP_GC_ROOT(a);
-  a->elem_kind = kind; a->elem_cls = cls;
-  sp_int n = sp_poly_length(v);
-  for (sp_int i = 0; i < n; i++) sp_PtrArray_push(a, sp_PtrArray_elem_unbox(a, sp_poly_arr_get(v, i)));
-  return a;
+  return sp_poly_as_ptr_array_conv(v, kind, cls);
 }
-static sp_StrArray *sp_poly_as_str_array(sp_RbVal v) {
-  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STR_ARRAY) return (sp_StrArray *)v.v.p;
-  if (v.tag == SP_TAG_NIL || !sp_poly_is_array_kind(v.cls_id)) return (sp_StrArray *)0;
+static SP_NOINLINE sp_StrArray *sp_poly_as_str_array_conv(sp_RbVal v) {
   SP_GC_ROOT_RBVAL(v);   /* the source array is a boxed temporary; the converting pushes allocate */
   sp_StrArray *a = sp_StrArray_new(); SP_GC_ROOT(a);
   sp_int n = sp_poly_length(v);
@@ -12956,6 +12968,11 @@ static sp_StrArray *sp_poly_as_str_array(sp_RbVal v) {
 #endif
   }
   return a;
+}
+static sp_StrArray *sp_poly_as_str_array(sp_RbVal v) {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STR_ARRAY) return (sp_StrArray *)v.v.p;
+  if (v.tag == SP_TAG_NIL || !sp_poly_is_array_kind(v.cls_id)) return (sp_StrArray *)0;
+  return sp_poly_as_str_array_conv(v);
 }
 
 /* poly_arr_get/set for PolyPolyHash with integer index key. */
