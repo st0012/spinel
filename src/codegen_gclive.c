@@ -1142,6 +1142,19 @@ static void gl_live(GFn *F) {
   free(P); free(stk); free(in); free(out); free(live); free(need);
 }
 
+/* Is the root statement ending at token e the last statement of a statement
+   expression, `({ ...; sp_RbVal v = e; SP_GC_ROOT_RBVAL(v); })`? The frame
+   build turns that declaration into a store to v's frame slot, and the store
+   gives the expression its value. Without the root, the declaration stays,
+   and the expression has no value: the C does not compile. */
+static int gl_ends_stmtexpr(GFn *F, int e) {
+  int j = e + 1;
+  while (tk_is(F, j, ";")) j++;
+  if (!tk_is(F, j, "}")) return 0;
+  int open = F->mt[j];
+  return open > 0 && tk_is(F, open - 1, "(");
+}
+
 /* Takes back the roots whose variable no collection point needs, last
    first so the offsets before them hold. */
 static int gl_drop(GFn *F, const char *fname, const char *site, Buf *b, size_t base) {
@@ -1151,11 +1164,13 @@ static int gl_drop(GFn *F, const char *fname, const char *site, Buf *b, size_t b
     GVar *x = &F->v[rt->var];
     char nm[128];
     snprintf(nm, sizeof nm, "%.*s", x->len, F->m + x->off);
-    if (x->need || x->addr || x->keep || !decide_fn("root-live", site, nm)) {
+    int last = gl_ends_stmtexpr(F, rt->end);
+    if (x->need || x->addr || x->keep || last || !decide_fn("root-live", site, nm)) {
       kept++;
       if (getenv("SP_ROOT_LIVE_LOG"))
         fprintf(stderr, "root-live: %s keeps %s (%s)\n", fname, nm,
-                x->need ? "read after a collection" : x->addr ? "address taken" : x->keep ? "static" : "decision");
+                x->need ? "read after a collection" : x->addr ? "address taken" : x->keep ? "static" :
+                last ? "ends a statement expression" : "decision");
       continue;
     }
     size_t beg = base + (size_t)F->t[rt->beg].off, end = base + (size_t)F->t[rt->end].off + 1;
