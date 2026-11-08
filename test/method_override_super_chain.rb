@@ -71,3 +71,24 @@ class R2
 end
 R2.include(Tag2)
 p R2.new.method(:w)
+
+# a module that includes a module: its super reaches that module's method
+module N3; def method(n) = "N3#{n}"; end
+module M3; include N3; def method(n) = "M3:" + super; end
+class C3; include M3; end
+p C3.new.method(:x)
+
+# a module included through another module, into a class whose superclass has method
+class Base4; def method(n) = "Base4#{n}"; end
+module Hook4; def method(n) = "h4:" + super; end
+module Outer4; include Hook4; end
+class C4 < Base4; include Outer4; end
+p C4.new.method(:x)
+
+# extend adds to the singleton class only, a nested class of the same leaf
+# gets the include: the instance super is still Object#method
+module Tag5; def method(n) = "Tag5#{n}"; end
+module X5; class R5; end; end
+X5::R5.include(Tag5)
+class R5; extend Tag5; def method(n) = super; def k = 3; end
+p R5.new.method(:k).call
