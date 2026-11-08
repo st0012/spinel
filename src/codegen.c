@@ -6096,6 +6096,197 @@ static void gc_roots_take_back(Compiler *c, Scope *s, Buf *b, size_t fn_off) {
   }
 }
 
+/* ---- GC root elision for a method with no collection point (M2) ----
+
+   A root is read by a collection, and a collection starts only where the
+   program allocates, at a safe point's poll, or inside a call that can get
+   to one of those. A method whose text calls nothing but the readers and the
+   arithmetic gc_leaf_call_ok lists has no point where a collection can start
+   and the method then goes on: a raise in one of them builds its exception,
+   and may collect there, but it leaves the method for good, so nothing reads
+   the method's roots after it. So all of them go. With none left,
+   gc_frame_build builds no frame and gc_save_take_back takes back the save,
+   and the C compiler can keep the method's pointers in registers.
+   `def self.use(s, i) = s.getbyte(i % 64)` rooted `s` through a frame for a
+   call that reads one byte: a third of the time of a loop that calls it.
+
+   The list is its own, not M1''s (gc_elide_call_ok). M1' takes calls that can
+   allocate or run Ruby code, as sp_poly_to_i does through a user #to_int,
+   because the local it leaves unrooted is still held by the container it was
+   read out of. Here every pointer of the method loses its root, so a call is
+   on the list only if no path through it that returns allocates, polls or
+   runs Ruby code.
+
+   Signals and threads add no collection point. A trap's handler only records
+   the signal, and its proc runs at a poll (sp_sig_run_pending). The default
+   SIGINT / SIGTERM is raised where it lands only in a pure region or a
+   blocking call, and that raise leaves too. A collection another thread
+   starts waits for this one to park, which it does only at a poll or in a
+   blocking call.
+
+   The callers do not change. A call is a collection point for a caller
+   whatever the callee does, and the caller roots what it reads after the
+   call as before. A value only the callee holds (an argument the caller
+   built and does not keep) is the callee's parameter, and no collection
+   runs while the callee does.
+
+   Kept whenever the body catches a longjmp (`setjmp`): a raise there comes
+   back into the method, after the raise allocated, and reads its locals.
+   Kept too when the body touches the root stack's depth (`sp_gc_nroots`),
+   or calls through a pointer (`)(` or `](`), which this scan cannot name.
+   The scans read code only: the inside of every string and character literal
+   and every comment is blanked first, so a Ruby String "SP_GC_ROOT(x);" is
+   neither a root nor cut out of the String. */
+static int gc_leaf_root_stmt(const char *id, size_t n) {
+  static const char *const ROOT[] = { "SP_GC_ROOT", "SP_GC_ROOT_RBVAL", "SP_GC_ROOT_STR",
+                                      "SP_GC_ROOT_SRANGE", NULL };
+  for (int i = 0; ROOT[i]; i++) if (strlen(ROOT[i]) == n && !strncmp(id, ROOT[i], n)) return 1;
+  return 0;
+}
+static int gc_leaf_call_ok(const char *id, size_t n) {
+  static const char *const LEAF[] = {
+    /* C's keywords before a `(`, and the builtins of a statement expression */
+    "if", "while", "for", "switch", "return", "sizeof", "do", "else",
+    "__typeof__", "__extension__", "SP_LIKELY", "SP_UNLIKELY",
+    /* Integer arithmetic: the operation, and on an overflow or a zero
+       divisor a raise with a fixed message (sp_int_add, sp_imod), which
+       leaves the method */
+    "sp_int_add", "sp_int_sub", "sp_int_mul", "sp_int_neg",
+    "sp_int_add_nn", "sp_int_sub_nn", "sp_int_mul_nn", "sp_imod", "sp_idiv", "sp_int_bit",
+    /* a String's bytes (its handle's field, or the pointer itself), and one
+       byte read out of them, with a raise on nil */
+    "SP_STR_B", "sp_str_getbyte_opt",
+    /* the typed Array reads: a bounds compare, the load and a bitmap test,
+       and past the end or on a nil element a nil or a raise with a fixed
+       message (sp_IntArray_get_ck_slow) */
+    "sp_IntArray_get", "sp_FloatArray_get", "sp_PolyArray_get",
+    "sp_IntArray_oget", "sp_FloatArray_oget", "sp_IntArray_elem_nil", "sp_FloatArray_elem_nil",
+    "sp_IntArray_get_ck", "sp_FloatArray_get_ck", "sp_IntArray_get_arg", "sp_FloatArray_get_arg",
+    "sp_IntArray_length", "sp_PolyArray_length",
+    /* the nullable Integer and Float: build, compare, unwrap with a raise on nil */
+    "sp_oint_of", "sp_oint_nil", "sp_ofloat_of", "sp_ofloat_nil",
+    "sp_oint_val", "sp_ofloat_val", "sp_oint_arg", "sp_oint_arg_of", "sp_ofloat_arg",
+    "sp_oint_opnd", "sp_ofloat_opnd", "sp_oint_cmp_opnd", "sp_ofloat_cmp_opnd",
+    "sp_oint_eq", "sp_ofloat_eq",
+    /* a value into a poly slot: a tag and a word, nothing allocated */
+    "sp_box_int", "sp_box_bool", "sp_box_nil", "sp_box_sym", "sp_box_float",
+    "sp_box_obj", "sp_box_nullable_obj", "sp_box_poly_array", "sp_box_oint", "sp_box_ofloat",
+    "sp_poly_truthy",
+    /* the write barrier: the remembered set and nothing else (sp_gc_wb_slow) */
+    "sp_gc_wb", "SP_WBO",
+    NULL };
+  if (gc_leaf_root_stmt(id, n)) return 1;
+  for (int i = 0; LEAF[i]; i++) if (strlen(LEAF[i]) == n && !strncmp(id, LEAF[i], n)) return 1;
+  return 0;
+}
+/* A copy of p[from, end) with the inside of every string and character
+   literal and every comment blanked to spaces, at the same offsets and with
+   the newlines kept. */
+static char *gc_leaf_code_only(const char *p, size_t from, size_t end) {
+  size_t n = end - from;
+  char *m = malloc(n + 1);
+  if (!m) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(m, p + from, n);
+  m[n] = '\0';
+  for (size_t i = 0; i < n; i++) {
+    if (m[i] == '"' || m[i] == '\'') {
+      char q = m[i];
+      size_t j = i + 1;
+      while (j < n && m[j] != q && m[j] != '\n') {
+        if (m[j] == '\\' && j + 1 < n && m[j + 1] != '\n') m[j++] = ' ';
+        m[j++] = ' ';
+      }
+      i = j;                                     /* the closing quote stays */
+    } else if (m[i] == '/' && i + 1 < n && m[i + 1] == '*') {
+      size_t j = i + 2;
+      while (j + 1 < n && !(m[j] == '*' && m[j + 1] == '/')) j++;
+      size_t e = j + 1 < n ? j + 2 : n;
+      for (size_t k = i; k < e; k++) if (m[k] != '\n') m[k] = ' ';
+      i = e - 1;
+    } else if (m[i] == '/' && i + 1 < n && m[i + 1] == '/') {
+      while (i < n && m[i] != '\n') m[i++] = ' ';
+    }
+  }
+  return m;
+}
+/* Does the `)` at p[r] close a cast to a pointer type, as `(void *)` or
+   `(sp_PolyArray *)` do? Words, then one or more `*`: C reads no expression
+   that way, so the `(` after it groups the operand and calls nothing. */
+static int gc_leaf_ptr_cast(const char *p, size_t lo, size_t r) {
+  size_t k = r;
+  int stars = 0;
+  while (k > lo && (p[k - 1] == ' ' || p[k - 1] == '*')) { if (p[k - 1] == '*') stars++; k--; }
+  size_t w = k;
+  while (k > lo && (isalnum((unsigned char)p[k - 1]) || p[k - 1] == '_' || p[k - 1] == ' ')) k--;
+  return stars && k < w && k > lo && p[k - 1] == '(';
+}
+/* Every call in p[0, n) is one gc_leaf_call_ok passes. The line map's
+   `#line` lines are skipped: a file's name is not code. */
+static int gc_leaf_text_inert(const char *p, size_t n) {
+  for (size_t i = 0; i < n; ) {
+    const char *nl = memchr(p + i, '\n', n - i);
+    size_t le = nl ? (size_t)(nl - p) : n;
+    if (!is_line_marker(p, i, le))
+      for (size_t k = i; k < le; k++) {
+        if (p[k] != '(') continue;
+        size_t e = k;
+        while (e > i && p[e - 1] == ' ') e--;
+        if (e > i && p[e - 1] == ')' && gc_leaf_ptr_cast(p, i, e - 1)) continue;
+        if (e > i && (p[e - 1] == ')' || p[e - 1] == ']')) return 0;   /* a call through a pointer */
+        size_t s = e;
+        while (s > i && (isalnum((unsigned char)p[s - 1]) || p[s - 1] == '_')) s--;
+        if (s == e) continue;                     /* `(` after an operator: grouping or a cast */
+        if (!gc_leaf_call_ok(p + s, e - s)) return 0;
+      }
+    i = nl ? le + 1 : n;
+  }
+  return 1;
+}
+static void gc_leaf_take_back(Compiler *c, Scope *s, Buf *b, size_t from) {
+  if (from >= b->len) return;
+  if (!text_has_code(b->p, from, b->len, "SP_GC_ROOT")) return;
+  if (text_has_code(b->p, from, b->len, "setjmp") || text_has_code(b->p, from, b->len, "sp_gc_nroots")) return;
+  size_t pn = b->len - from;
+  char *p = gc_leaf_code_only(b->p, from, b->len);
+  if (!gc_leaf_text_inert(p, pn)) { free(p); return; }
+  /* each root statement is `NAME(...);`; anything else keeps them all */
+  size_t i = 0;
+  size_t *at = NULL, *len = NULL; int n = 0, cap = 0, bad = 0;
+  while (i < pn && !bad) {
+    const char *nl = memchr(p + i, '\n', pn - i);
+    size_t le = nl ? (size_t)(nl - p) : pn;
+    if (!is_line_marker(p, i, le))
+      for (size_t k = i; k < le && !bad; k++) {
+        if (p[k] != 'S' || (k > i && (isalnum((unsigned char)p[k - 1]) || p[k - 1] == '_'))) continue;
+        size_t e = k;
+        while (e < le && (isalnum((unsigned char)p[e]) || p[e] == '_')) e++;
+        if (!gc_leaf_root_stmt(p + k, e - k)) { k = e; continue; }
+        if (e >= le || p[e] != '(') { bad = 1; break; }
+        size_t q = e + 1; int d = 1;
+        while (q < le && d) { if (p[q] == '(') d++; else if (p[q] == ')') d--; q++; }
+        if (d || q >= le || p[q] != ';') { bad = 1; break; }
+        q++;
+        while (q < le && p[q] == ' ') q++;
+        size_t st = k;
+        /* a statement alone on its line goes with its line */
+        size_t ls = k;
+        while (ls > i && p[ls - 1] == ' ') ls--;
+        if (ls == i && q == le) { st = i; q = nl ? le + 1 : le; }
+        if (n == cap) {
+          cap = cap ? cap * 2 : 16;
+          at = realloc(at, sizeof *at * (size_t)cap); len = realloc(len, sizeof *len * (size_t)cap);
+          if (!at || !len) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        }
+        at[n] = st; len[n] = q - st; n++;
+        k = q - 1;
+      }
+    i = nl ? le + 1 : pn;
+  }
+  if (!bad && n && decide_fn("root-leaf", decide_method_site(c, s), NULL))
+    for (int j = n - 1; j >= 0; j--) buf_erase(b, from + at[j], len[j]);
+  free(p); free(at); free(len);
+}
+
 /* ---- root frames ----
 
    Every root the emitters write costs the C compiler three things: taking
@@ -7939,6 +8130,7 @@ void emit_method(Compiler *c, Scope *s, Buf *b) {
   g_yield_proc_ref = sv_ypr9; g_yield_slot_ty = sv_yst9; free(ypr9.p);
   buf_puts(b, "}\n");
   if (!g_no_root_elision) gc_roots_take_back(c, s, b, gc_save_off);
+  if (!g_no_root_elision) gc_leaf_take_back(c, s, b, gc_save_off + gc_save_len);
   const char *site = decide_method_site(c, s);
   if (!g_no_root_frame) gc_frame_build(c, b, gc_save_off + gc_save_len, site);
   gc_save_take_back(b, gc_save_off, gc_save_len, site);
