@@ -337,6 +337,8 @@ SPINEL_OBJ  = build/csrc/node_table.o build/csrc/types.o build/csrc/compiler.o \
 # The decision registry (--decisions, --decisions-log; `make decisions-test`).
 SPINEL_HDRS += src/decide.h
 SPINEL_OBJ  += build/csrc/decide.o
+# GC root liveness on a graph of the emitted C (the CFA prototype).
+SPINEL_OBJ  += build/csrc/codegen_gclive.o
 # --method-table-check: the reads of the method tables made outside call_target.
 SPINEL_HDRS += src/method_table_check.h
 SPINEL_OBJ  += build/csrc/method_table_check.o
@@ -1867,7 +1869,7 @@ test-run: decisions-test
 # Each kind also has its row in the table in tools/README.md.
 DECISION_TESTS = $(shell grep -l '^\# spinel: decisions$$' test/*.rb test/fixtures/decisions/*.rb)
 DECISION_KINDS = aon-get case-root fetch-inert fetch-slot gc-save index-sum inline-force masgn-root nn-inb nn-read no-alloc \
-                 pd-hoist push-slot root-elide root-frame root-leaf strbuf-raw
+                 pd-hoist push-slot root-elide root-frame root-leaf root-live strbuf-raw
 decisions-test: $(SPINEL) $(SPINEL_TIMEOUT)
 	@ok=1; tmp=$$(mktemp -d /tmp/spinel-decisions.XXXXXX); : > "$$tmp/none"; \
 	if $(SPINEL) --decisions="$$tmp/absent" test/fixtures/decisions/sites.rb -c -o "$$tmp/o.c" >"$$tmp/o.out" 2>&1; then \
@@ -1937,7 +1939,7 @@ decisions-test: $(SPINEL) $(SPINEL_TIMEOUT)
 	for k in 'root-elide@Sprites#pixel:s' 'root-elide@Lut#load:@lut' 'gc-save@Lut#load' 'root-frame@main'; do \
 	  grep -qxF "$$k" "$$t.log" || { echo "decisions-test: FAIL ($$f took no $$k)"; ok=0; }; \
 	done; \
-	grep -Ev '^(root-elide|root-leaf|root-frame|inline-force|pd-hoist)@' "$$t.log" > "$$t.allow"; \
+	grep -Ev '^(root-elide|root-leaf|root-live|root-frame|inline-force|pd-hoist)@' "$$t.log" > "$$t.allow"; \
 	$(SPINEL) --decisions="$$t.allow" $$f -c -o "$$t.c" >/dev/null 2>&1 && cp "$$t.c" "$$t.denied" && \
 	SPINEL_NO_PD_HOIST=1 $(SPINEL) --line-map --no-root-elision --no-root-frame --no-inline-hot $$f -c -o "$$t.c" >/dev/null 2>&1 && \
 	cmp -s "$$t.denied" "$$t.c" || \

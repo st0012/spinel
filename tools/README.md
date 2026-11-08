@@ -809,6 +809,7 @@ file, no compiler, a bad option). This is a contract.
 | `nn-inb` | an index read is proved in bounds, so its value is not nil; denied, likewise |
 | `root-elide` | a local or a container ivar's temp takes no GC root (`--no-root-elision` for all of them); denied, it is rooted |
 | `root-leaf` | a method that calls nothing that can allocate, poll or run Ruby code takes no GC root at all (`--no-root-elision`); denied, its roots stay |
+| `root-live` | a C variable whose value no later point that can collect reads takes no GC root (liveness on the method's C, `--no-root-elision`); denied, it is rooted |
 | `gc-save` | a method whose roots are all elided drops its root-stack save and restore; denied, it keeps them |
 | `root-frame` | a method, proc, Fiber or END body roots through one frame (`--no-root-frame`); denied, each root is pushed |
 | `inline-force` | a hot small method is forced inline (`--no-inline-hot`); denied, the C compiler decides |

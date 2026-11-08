@@ -3310,4 +3310,13 @@ int strbuf_flow_unseen(Compiler *c, int v);
 int strbuf_flow_unseen_arms(Compiler *c, int v);
 
 void emit_cext_dispatch(Compiler *c, Buf *b);
+
+/* GC root liveness on a graph of the emitted C (codegen_gclive.c, the CFA
+   prototype). The M2 helpers it shares live in codegen.c. */
+int gc_leaf_root_stmt(const char *id, size_t n);
+int gc_leaf_call_ok(const char *id, size_t n);
+char *gc_leaf_code_only(const char *p, size_t from, size_t end);
+void gc_live_take_back(Compiler *c, Buf *b, size_t from, const char *fname, const char *site);
+void gc_live_reset(void);
+
 #endif

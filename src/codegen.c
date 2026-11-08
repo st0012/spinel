@@ -6191,13 +6191,13 @@ static void gc_roots_take_back(Compiler *c, Scope *s, Buf *b, size_t fn_off) {
    The scans read code only: the inside of every string and character literal
    and every comment is blanked first, so a Ruby String "SP_GC_ROOT(x);" is
    neither a root nor cut out of the String. */
-static int gc_leaf_root_stmt(const char *id, size_t n) {
+int gc_leaf_root_stmt(const char *id, size_t n) {
   static const char *const ROOT[] = { "SP_GC_ROOT", "SP_GC_ROOT_RBVAL", "SP_GC_ROOT_STR",
                                       "SP_GC_ROOT_SRANGE", NULL };
   for (int i = 0; ROOT[i]; i++) if (strlen(ROOT[i]) == n && !strncmp(id, ROOT[i], n)) return 1;
   return 0;
 }
-static int gc_leaf_call_ok(const char *id, size_t n) {
+int gc_leaf_call_ok(const char *id, size_t n) {
   static const char *const LEAF[] = {
     /* C's keywords before a `(`, and the builtins of a statement expression */
     "if", "while", "for", "switch", "return", "sizeof", "do", "else",
@@ -6236,7 +6236,7 @@ static int gc_leaf_call_ok(const char *id, size_t n) {
 /* A copy of p[from, end) with the inside of every string and character
    literal and every comment blanked to spaces, at the same offsets and with
    the newlines kept. */
-static char *gc_leaf_code_only(const char *p, size_t from, size_t end) {
+char *gc_leaf_code_only(const char *p, size_t from, size_t end) {
   size_t n = end - from;
   char *m = malloc(n + 1);
   if (!m) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
@@ -8186,6 +8186,13 @@ void emit_method(Compiler *c, Scope *s, Buf *b) {
   if (!g_no_root_elision) gc_roots_take_back(c, s, b, gc_save_off);
   if (!g_no_root_elision) gc_leaf_take_back(c, s, b, gc_save_off + gc_save_len);
   const char *site = decide_method_site(c, s);
+  /* then the roots no collection point needs (codegen_gclive.c) */
+  if (!g_no_root_elision) {
+    char lbn[48];
+    const char *lfn = mc_method(c, s);
+    if (rh_wrap) { rbs_cont_body_cname(c, s, lbn, sizeof lbn); lfn = lbn; }
+    gc_live_take_back(c, b, gc_save_off + gc_save_len, lfn, site);
+  }
   if (!g_no_root_frame) gc_frame_build(c, b, gc_save_off + gc_save_len, site);
   gc_save_take_back(b, gc_save_off, gc_save_len, site);
   if (rh_wrap) emit_rbs_cont_ret_wrapper(c, s, rh_sig.p ? rh_sig.p : "", b);
@@ -23075,6 +23082,7 @@ static int emit_toplevel_fns(Compiler *c, Buf *body) {
 }
 
 char *codegen_program(const NodeTable *nt) {
+  gc_live_reset();   /* what the root liveness read of the functions is per program */
   char *isa_ext = NULL;  /* sp_poly_is_a's class-value arms, and where they go */
   size_t isa_ext_at = 0;
   Compiler *c = comp_new(nt);
@@ -23981,6 +23989,8 @@ char *codegen_program(const NodeTable *nt) {
     buf_puts(body, "  sp_main_stack_run(_sp_main_body);\n"
                    "  return _sp_main_rc;\n}\n");
   }
+  if (!g_no_root_elision)
+    gc_live_take_back(c, body, main_frame_ins, g_ext_init_name ? g_ext_init_name : "_sp_main_body", "main");
   if (!g_no_root_frame) gc_frame_build(c, body, main_frame_ins, "main");
   tcg = cg_phase(tcg, "cg_main");
 
