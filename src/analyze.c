@@ -56900,6 +56900,7 @@ void analyze_program(Compiler *c) {
   if (elab_check_on(c)) elab_check_visibility(c);
   /* a local split in two whose slots did not all come out plain values is
      left whole, by compiling again (analyze_cfg.c) */
+  { void ir_hints_write(Compiler *c); ir_hints_write(c); }
   ssa_check_splits(c);
   sp_timing_end(tm_an, "analysis", "");
 }

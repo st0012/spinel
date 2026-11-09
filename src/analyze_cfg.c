@@ -2234,11 +2234,112 @@ static Kd ir_class_call_kinds(Compiler *c, const char *cn, const char *m) {
   }
   return any;
 }
+/* Type hints from an earlier compile of the same program (SP_IR_HINTS):
+   the type Spinel's inference gave each parameter, and the type each of the
+   program's own methods returns. SP_IR_HINTS_OUT writes them. A hint always
+   keeps nil as a possible value. */
+typedef struct { int scope; char *name; unsigned short k; } IrHint;
+static IrHint *g_ir_hp; static int g_ir_nhp;      /* parameters */
+static IrHint *g_ir_hr; static int g_ir_nhr;      /* returns, by method name (joined) */
+static int g_ir_hints_loaded;
+static int g_ir_hint_scope = -1; static char **g_ir_hint_names;
+static unsigned short ir_ty_kinds(TyKind t) {
+  switch (t) {
+  case TY_NIL: return KN_NIL;
+  case TY_INT: case TY_BIGINT: return KN_INT | KN_BIG | KN_NIL;
+  case TY_FLOAT: return KN_FLOAT | KN_NIL;
+  case TY_STRING: case TY_STRBUF: return KN_STR | KN_NIL;
+  case TY_SYMBOL: return KN_SYM | KN_NIL;
+  case TY_BOOL: return KN_BOOL | KN_NIL;
+  case TY_INT_ARRAY: case TY_FLOAT_ARRAY: case TY_STR_ARRAY: case TY_POLY_ARRAY: case TY_INT_ARRAY_ARRAY:
+    return KN_ARR | KN_NIL;
+  case TY_STR_INT_HASH: case TY_STR_STR_HASH: case TY_INT_INT_HASH: case TY_INT_STR_HASH:
+  case TY_SYM_POLY_HASH: case TY_STR_POLY_HASH: case TY_POLY_POLY_HASH:
+    return KN_HASH | KN_NIL;
+  default: break;
+  }
+  if (ty_is_obj_array(t)) return KN_ARR | KN_NIL;
+  if (ty_is_object(t)) return KN_OBJ | KN_NIL;
+  return 0;   /* no hint */
+}
+void ir_hints_write(Compiler *c) {
+  const char *path = getenv("SP_IR_HINTS_OUT");
+  if (!path || !*path) return;
+  FILE *f = fopen(path, "w");
+  if (!f) return;
+  for (int si = 0; si < c->nscopes; si++) {
+    Scope *s = &c->scopes[si];
+    if (s->def_node < 0 || !s->name || nt_kind(c->nt, s->def_node) != NK_DefNode) continue;
+    if (nt_int(c->nt, s->def_node, "node_bi", 0)) continue;
+    for (int i = 0; i < s->nlocals; i++) {
+      LocalVar *lv = &s->locals[i];
+      if (!lv->is_param || lv->is_block_param || !lv->name) continue;
+      fprintf(f, "P %d %s %u\n", s->idx, lv->name, (unsigned)ir_ty_kinds(lv->type));
+    }
+    /* a method no call reaches has no return type to trust */
+    fprintf(f, "R %d %s %u\n", s->idx, s->name, s->reachable ? (unsigned)ir_ty_kinds(s->ret) : 0u);
+  }
+  fclose(f);
+}
+static void ir_hints_load(void) {
+  if (g_ir_hints_loaded) return;
+  g_ir_hints_loaded = 1;
+  const char *path = getenv("SP_IR_HINTS");
+  if (!path || !*path) return;
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  char kind, nm[512]; int sc; unsigned k;
+  int cp = 0, cr = 0;
+  while (fscanf(f, " %c %d %511s %u", &kind, &sc, nm, &k) == 4) {
+    if (kind == 'P') {
+      if (g_ir_nhp >= cp) { cp = cp ? cp * 2 : 256; g_ir_hp = realloc(g_ir_hp, sizeof(IrHint) * (size_t)cp); }
+      g_ir_hp[g_ir_nhp].scope = sc; g_ir_hp[g_ir_nhp].name = strdup(nm); g_ir_hp[g_ir_nhp].k = (unsigned short)k; g_ir_nhp++;
+    } else {
+      int j = 0;
+      for (; j < g_ir_nhr; j++) if (!strcmp(g_ir_hr[j].name, nm)) break;
+      if (j == g_ir_nhr) {
+        if (g_ir_nhr >= cr) { cr = cr ? cr * 2 : 256; g_ir_hr = realloc(g_ir_hr, sizeof(IrHint) * (size_t)cr); }
+        g_ir_hr[j].scope = 1; g_ir_hr[j].name = strdup(nm); g_ir_hr[j].k = (unsigned short)k; g_ir_nhr++;
+      } else if (!k || !g_ir_hr[j].scope) g_ir_hr[j].scope = 0;     /* one of them has no hint: none */
+      else g_ir_hr[j].k |= (unsigned short)k;
+      if (!k) g_ir_hr[j].scope = 0;
+    }
+  }
+  fclose(f);
+}
+static unsigned short ir_hint_param(int scope, const char *nm) {
+  ir_hints_load();
+  for (int i = 0; i < g_ir_nhp; i++)
+    if (g_ir_hp[i].scope == scope && nm && !strcmp(g_ir_hp[i].name, nm)) return g_ir_hp[i].k;
+  return 0;
+}
+static unsigned short ir_hint_ret(const char *m) {
+  ir_hints_load();
+  for (int i = 0; i < g_ir_nhr; i++)
+    if (m && !strcmp(g_ir_hr[i].name, m)) return g_ir_hr[i].scope ? g_ir_hr[i].k : 0;
+  return 0;
+}
+/* methods every object has: a class that does not define one still answers it */
+static const char *const RM_OBJECT[] = { "to_s", "inspect", "==", "!=", "!", "hash", "dup", "clone", "eql?", "equal?",
+  "class", "freeze", "frozen?", "itself", "<=>", "===", "=~", "!~", "nil?", "is_a?", "kind_of?", "instance_of?",
+  "respond_to?", "send", "__send__", "public_send", "then", "yield_self", "tap", "display", "method", "methods",
+  "object_id", "__id__", "to_enum", "enum_for", "extend", "singleton_class", "instance_variables",
+  "instance_variable_get", "instance_variable_set", "instance_eval", "instance_exec", "method_missing", NULL };
+/* more methods nil does not have (a call on nil raises NoMethodError) */
+static const char *const RM_NIL_RAISE2[] = { "abs", "upcase", "downcase", "capitalize", "strip", "lstrip", "rstrip",
+  "chomp", "chop", "split", "chars", "bytes", "lines", "codepoints", "push", "pop", "shift", "unshift", "first",
+  "last", "keys", "values", "empty?", "include?", "start_with?", "end_with?", "sub", "gsub", "tr", "join", "succ",
+  "pred", "chr", "ord", "to_sym", "to_str", "reverse", "sort", "min", "max", "sum", "count", "index", "bytesize",
+  "getbyte", "byteslice", "ljust", "rjust", "center", "floor", "ceil", "round", "truncate", "even?", "odd?",
+  "zero?", "key?", "has_key?", "fetch", "delete", "concat", "[]=", "-@", "+@", "~", "divmod", "fdiv", "slice",
+  "uniq", "compact", "flatten", "dig", "each", "map", "select", "reject", "times", "upto", "downto", "step",
+  "bit_length", "digits", "gcd", "lcm", "pow", "sqrt", "merge", "size", "length", NULL };
+
 /* the kinds a receiver-less call gives: Kernel's conversions and a few
    others, when the program defines no method of that name */
 static unsigned short ir_self_rule(const char *m, int na) {
   const unsigned short any = KN_ALL | KN_UNK;
-  if (ir_names_has(g_ir_names.all, g_ir_names.nall, m)) return any;
+  if (ir_names_has(g_ir_names.all, g_ir_names.nall, m)) { unsigned short h = ir_hint_ret(m); return h ? h : any; }
   if (na == 1 && sp_streq(m, "Integer")) return KN_INT;
   if (na == 1 && sp_streq(m, "Float")) return KN_FLOAT;
   if (na == 1 && sp_streq(m, "String")) return KN_STR;
@@ -2320,6 +2421,12 @@ static Kd ir_send_kinds(Compiler *c, const NodeTable *nt, Ir *ir, const Kd *K, i
   if (fl & SF_SAFE) { r.k |= rb & KN_NIL; rb &= (unsigned short)~KN_NIL; }   /* `a&.m` on nil is nil */
   for (int b = 0; b < 12; b++) {
     if (!(rb & (1 << b))) continue;
+    if ((1 << b) == KN_NIL && ir_m_in(m, RM_NIL_RAISE2)) continue;   /* NoMethodError */
+    if ((1 << b) == KN_OBJ && !ir_m_in(m, RM_OBJECT) && ir_names_has(g_ir_names.all, g_ir_names.nall, m)) {
+      /* one of the program's own methods: the hinted return */
+      unsigned short h = ir_hint_ret(m);
+      if (h) { r.k |= h; continue; }
+    }
     unsigned short k = ir_rule(1 << b, m, na, ak);
     if (k & KN_UNK) return any;
     r.k |= k;
@@ -2356,7 +2463,13 @@ static Kd *ir_own_kinds(CfgB *g, Ir *ir, const char *is_param) {
   for (int x = 0; x < nv; x++) {
     IrVal *v = &ir->v[x];
     K[x] = none;
-    if (v->kind == IV_ENTRY) K[x] = is_param[v->local] ? any : nil;
+    if (v->kind == IV_ENTRY) {
+      K[x] = is_param[v->local] ? any : nil;
+      if (is_param[v->local] && g_ir_hint_scope >= 0 && g_ir_hint_names) {
+        unsigned short h = ir_hint_param(g_ir_hint_scope, g_ir_hint_names[v->local]);
+        if (h) { K[x].k = h; K[x].cid = (h & KN_OBJ) ? -2 : -1; }
+      }
+    }
     else if (v->kind == IV_CONST) K[x].k = ir_const_kinds(nt, v->node);
     else if (v->kind == IV_RESCUED) { K[x].k = KN_OTHER | KN_OBJ; K[x].cid = -2; }
     else if (v->kind == IV_OTHER) {
@@ -3046,7 +3159,9 @@ static void ssa_method(Compiler *c, Scope *s) {
      and the kinds of every value from those alone */
   if (!ir_types_off()) {
     ir_add_exprs(&ir, nt, g_ssa_rd, g_ssa_wd, g_ssa_rd_cap, t.resc, t.nresc);
+    g_ir_hint_scope = s->idx; g_ir_hint_names = (char **)t.nm;
     K = ir_own_kinds(&g, &ir, is_param);
+    g_ir_hint_scope = -1; g_ir_hint_names = NULL;
     ir_dump(c, s, &g, &ir, K, "SSA rename, before typing");
   }
   /* `x += 1`, `x ||= v`: one node reads and writes, so one name */
