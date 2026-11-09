@@ -2285,13 +2285,34 @@ static Kd ir_send_kinds(Compiler *c, const NodeTable *nt, Ir *ir, const Kd *K, i
   Kd rk = K[rv];
   if (!rk.k) return r;                     /* the receiver has no value yet */
   if (rk.k & KN_UNK) {
-    /* A conversion gives one kind on every built-in receiver. When the
-       program defines no method of that name, an unknown receiver gives it
-       too. SP_IR_CONV_OFF=1 turns this rule off. */
-    if (na == 0 && !(fl & SF_SAFE) && !getenv("SP_IR_CONV_OFF") && !ir_names_has(g_ir_names.all, g_ir_names.nall, m)) {
-      if (sp_streq(m, "to_i")) { r.k = KN_INT; return r; }
-      if (sp_streq(m, "to_f")) { r.k = KN_FLOAT; return r; }
-      if (sp_streq(m, "to_sym")) { r.k = KN_SYM; return r; }
+    /* Some methods give one kind on every built-in receiver that has
+       them. When the program defines no method of that name, an unknown
+       receiver gives that kind too. SP_IR_CONV_OFF=1 turns this off. */
+    if (!(fl & SF_SAFE) && !getenv("SP_IR_CONV_OFF") && !ir_names_has(g_ir_names.all, g_ir_names.nall, m)) {
+      static const char *const N_INT0[] = { "to_i", "length", "bytesize", "hash", "ord", NULL };
+      static const char *const N_STR0[] = { "to_s", "inspect", "to_str", "strip", "lstrip", "rstrip", "chomp", "chop", "chr", NULL };
+      static const char *const N_STR1[] = { "ljust", "rjust", "center", NULL };
+      static const char *const N_ARR0[] = { "to_a", "chars", "bytes", "lines", "codepoints", "keys", "values", NULL };
+      static const char *const N_BOOL0[] = { "nil?", "!", "frozen?", "empty?", "zero?", "even?", "odd?", NULL };
+      static const char *const N_BOOL1[] = { "is_a?", "kind_of?", "instance_of?", "respond_to?", "==", "!=", "equal?", "eql?",
+        "include?", "start_with?", "end_with?", "key?", "has_key?", "member?", NULL };
+      if (na == 0) {
+        if (ir_m_in(m, N_INT0)) { r.k = KN_INT; return r; }
+        if (sp_streq(m, "to_f")) { r.k = KN_FLOAT; return r; }
+        if (sp_streq(m, "to_sym")) { r.k = KN_SYM; return r; }
+        if (ir_m_in(m, N_STR0)) { r.k = KN_STR; return r; }
+        if (ir_m_in(m, N_ARR0)) { r.k = KN_ARR; return r; }
+        if (sp_streq(m, "to_h")) { r.k = KN_HASH; return r; }
+        if (ir_m_in(m, N_BOOL0)) { r.k = KN_BOOL; return r; }
+      }
+      if (na == 1) {
+        if (ir_m_in(m, N_BOOL1)) { r.k = KN_BOOL; return r; }
+        if (ir_m_in(m, N_STR1) || sp_streq(m, "join")) { r.k = KN_STR; return r; }
+        if (sp_streq(m, "split")) { r.k = KN_ARR; return r; }
+        if (sp_streq(m, "<=>")) { r.k = KN_INT | KN_NIL; return r; }
+      }
+      if (na == 0 && sp_streq(m, "join")) { r.k = KN_STR; return r; }
+      if (na == 0 && sp_streq(m, "split")) { r.k = KN_ARR; return r; }
     }
     return any;
   }
@@ -2384,6 +2405,28 @@ static Kd *ir_own_kinds(CfgB *g, Ir *ir, const char *is_param) {
         continue;
       }
       if (r.k != K[x].k || r.cid != K[x].cid) { K[x] = r; changed = 1; }
+    }
+  }
+  if (getenv("SP_IR_ANY_LOG")) {
+    /* one line for each call value: its kinds known, or why not */
+    for (int x = 0; x < nv; x++) {
+      IrVal *v = &ir->v[x];
+      if (v->kind != IV_SEND || !ir->reached[v->block] || !K[x].k) continue;
+      int node = v->node;
+      const char *m = nt_kind(nt, node) == NK_CallNode ? nt_str(nt, node, "name") : nt_str(nt, node, "binary_operator");
+      int fl = nt_kind(nt, node) == NK_CallNode ? v->evk : 0;
+      int rv = v->op0 >= 0 ? ir->ops[v->op0] : -1;
+      const char *why;
+      unsigned rk = 0;
+      if (!(K[x].k & KN_UNK)) why = "known";
+      else if (rv < 0) why = ir_names_has(g_ir_names.all, g_ir_names.nall, m) ? "self-own-method" : "self-no-rule";
+      else if (fl & SF_BLOCK) why = "block";
+      else if (fl & SF_ODD) why = "odd-args";
+      else if (ir_names_has(g_ir_names.core, g_ir_names.ncore, m)) why = "reopened";
+      else if (ir->v[rv].kind == IV_OTHER && ir->v[rv].node >= 0 && nt_kind(nt, ir->v[rv].node) == NK_ConstantReadNode) why = "class-call";
+      else if (K[rv].k & KN_UNK) why = ir_names_has(g_ir_names.all, g_ir_names.nall, m) ? "recv-unknown-own-name" : "recv-unknown";
+      else { why = "no-rule"; rk = K[rv].k; }
+      fprintf(stderr, "spinel-ir-any: %s %s/%d rk=%x\n", why, m ? m : "?", v->nop - 1, rk);
     }
   }
   return K;
@@ -3031,8 +3074,10 @@ static void ssa_method(Compiler *c, Scope *s) {
        start a web of its own. SP_SSA_SELFREAD_OFF=1 keeps the old rule. */
     if (K && !selfread_off && K[w].k && !(K[w].k & ~(KN_NIL | KN_BOOL | KN_INT | KN_BIG | KN_FLOAT | KN_SYM))) {
       if (getenv("SP_SSA_LOG")) fprintf(stderr, "spinel-ssa: a write that reads its own local stores a plain value: not joined\n");
+      if (getenv("SP_IR_ANY_LOG")) fprintf(stderr, "spinel-ir-selfread: plain\n");
       continue;
     }
+    if (getenv("SP_IR_ANY_LOG")) fprintf(stderr, "spinel-ir-selfread: %s\n", !K ? "no-types" : !K[w].k ? "no-value" : (K[w].k & KN_UNK) ? "unknown" : "known-not-plain");
     ssa_union(uf, w, r);
   }
   for (int b = 0; b < g.nb; b++)
