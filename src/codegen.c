@@ -19648,7 +19648,8 @@ static void scan_prologue_features(Compiler *c) {
       if (nm && rv >= 0 && repr_of(c, rv).kind == RK_BOXED &&
           (sp_streq(nm, "last") || sp_streq(nm, "join") || sp_streq(nm, "sample") ||
            sp_streq(nm, "shuffle") || sp_streq(nm, "flatten") || sp_streq(nm, "pack") ||
-           nt_int(c->nt, id, "was_at", 0))) reached = 1;   /* (an `at` is `[]` by now) */
+           /* an `at` is `[]` by now, unless the program has an `at` of its own */
+           sp_streq(nm, "at") || nt_int(c->nt, id, "was_at", 0))) reached = 1;
       /* any dig: a Struct's, typed or not, can reach the runtime walk, whose
          receiver check asks this dispatch (sp_poly_dig_recv_ok) */
       if (nm && rv >= 0 && sp_streq(nm, "dig")) reached = 1;
