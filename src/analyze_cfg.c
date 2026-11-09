@@ -2284,7 +2284,17 @@ static Kd ir_send_kinds(Compiler *c, const NodeTable *nt, Ir *ir, const Kd *K, i
     return ir_class_call_kinds(c, nt_str(nt, ir->v[rv].node, "name"), m);
   Kd rk = K[rv];
   if (!rk.k) return r;                     /* the receiver has no value yet */
-  if (rk.k & KN_UNK) return any;
+  if (rk.k & KN_UNK) {
+    /* A conversion gives one kind on every built-in receiver. When the
+       program defines no method of that name, an unknown receiver gives it
+       too. SP_IR_CONV_OFF=1 turns this rule off. */
+    if (na == 0 && !(fl & SF_SAFE) && !getenv("SP_IR_CONV_OFF") && !ir_names_has(g_ir_names.all, g_ir_names.nall, m)) {
+      if (sp_streq(m, "to_i")) { r.k = KN_INT; return r; }
+      if (sp_streq(m, "to_f")) { r.k = KN_FLOAT; return r; }
+      if (sp_streq(m, "to_sym")) { r.k = KN_SYM; return r; }
+    }
+    return any;
+  }
   unsigned short rb = rk.k;
   if (fl & SF_SAFE) { r.k |= rb & KN_NIL; rb &= (unsigned short)~KN_NIL; }   /* `a&.m` on nil is nil */
   for (int b = 0; b < 12; b++) {
@@ -3010,10 +3020,20 @@ static void ssa_method(Compiler *c, Scope *s) {
   }
   /* a write whose value reads the local: the write joins the web of the
      values that read sees (ssa_value_reads) */
+  int selfread_off = getenv("SP_SSA_SELFREAD_OFF") != NULL;
   for (int q = 0; q < t.np; q++) {
     int w = t.pw[q] < g_ssa_rd_cap ? g_ssa_wd[t.pw[q]] : -1;
     int r = t.pr[q] < g_ssa_rd_cap ? g_ssa_rd[t.pr[q]] : -1;
-    if (w >= 0 && r >= 0) ssa_union(uf, w, r);
+    if (w < 0 || r < 0) continue;
+    /* The value the write stores is never the object the read saw when the
+       IR's own types say it is a number, a Symbol, true, false or nil
+       (`n = n.to_i`): nothing can be stored through it, so the write may
+       start a web of its own. SP_SSA_SELFREAD_OFF=1 keeps the old rule. */
+    if (K && !selfread_off && K[w].k && !(K[w].k & ~(KN_NIL | KN_BOOL | KN_INT | KN_BIG | KN_FLOAT | KN_SYM))) {
+      if (getenv("SP_SSA_LOG")) fprintf(stderr, "spinel-ssa: a write that reads its own local stores a plain value: not joined\n");
+      continue;
+    }
+    ssa_union(uf, w, r);
   }
   for (int b = 0; b < g.nb; b++)
     for (int e = 0; e < g.b[b].nev; e++)
