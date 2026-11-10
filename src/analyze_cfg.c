@@ -3252,7 +3252,7 @@ static void ssa_method(Compiler *c, Scope *s) {
          plain value would be undone after typing (ssa_check_splits), and
          the compile would run again. The local stays whole now. */
       { char why[128];
-        if (k && K && ssa_ir_boxed(&ir, K, uf, dl, dl_off, li, is_param[li], why, sizeof why)) {
+        if (k && K && !getenv("SP_SSA_KEEP") && ssa_ir_boxed(&ir, K, uf, dl, dl_off, li, is_param[li], why, sizeof why)) {
           for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
             int r = ssa_find(uf, dl[q]);
             free(web_name[r]); web_name[r] = NULL;
@@ -3539,7 +3539,8 @@ void ssa_check_splits(Compiler *c) {
     const char *why = NULL, *later = NULL;
     for (int q = 0; q < sp->nnames && !why; q++) {
       LocalVar *lv = scope_local(sc, sp->names[q]);
-      if (!lv || !ssa_plain(lv->type)) why = sp->names[q];
+      /* SP_SSA_KEEP=1 (experiment): a split stays whatever kind of value its slots hold */
+      if (!lv || (!ssa_plain(lv->type) && !getenv("SP_SSA_KEEP"))) why = sp->names[q];
       else if (lv->is_cell || lv->proc_rebinds || lv->cell_outlives) { why = sp->names[q]; later = "a proc shares it"; }
     }
     if (!why && later_bad[i]) { why = sp->names[0]; later = "a block that can run after its call uses it"; }
