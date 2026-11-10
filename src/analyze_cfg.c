@@ -367,16 +367,67 @@ static void cfg_emit_loc(CfgB *g, int kind, int node, int li) {
    only the forms that always make a proc are left off, and the rename's
    final check undoes a split a later-running block reads. */
 int an_block_outlives_call(Compiler *c, int id);
+/* Before the types: can a method named nm keep its block and run it after
+   the call returns? Only a def that names the block (`&blk`) or hands its
+   arguments up with super can. A def that only yields runs the block
+   inside the call. A program that takes calls with method_missing, or
+   that makes a method with define_method and a block parameter, can keep
+   a block under any name. */
+static int g_ssa_keep_any = -1;
+static int ssa_tree_has_super(const NodeTable *nt, int n, int depth) {
+  if (n < 0 || depth > 2000) return n >= 0;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_SuperNode || k == NK_ForwardingSuperNode) return 1;
+  if (k == NK_DefNode || k == NK_ClassNode || k == NK_ModuleNode) return 0;
+  for (int i = 0; i < nt_num_refs(nt, n); i++) if (ssa_tree_has_super(nt, nt_ref_at(nt, n, i), depth + 1)) return 1;
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int q = 0; q < an; q++) if (ssa_tree_has_super(nt, av[q], depth + 1)) return 1;
+  }
+  return 0;
+}
+static int ssa_params_have_block(const NodeTable *nt, int pn) {
+  if (pn < 0) return 0;
+  if (nt_kind(nt, pn) == NK_BlockParametersNode) pn = nt_ref(nt, pn, "parameters");
+  return pn >= 0 && nt_ref(nt, pn, "block") >= 0;
+}
+static int ssa_name_may_keep_block(Compiler *c, const char *nm) {
+  const NodeTable *nt = c->nt;
+  if (g_ssa_keep_any < 0) {
+    g_ssa_keep_any = 0;
+    for (int si = 0; si < c->nscopes && !g_ssa_keep_any; si++) {
+      Scope *s = &c->scopes[si];
+      if (s->def_node >= 0 && s->name && nt_kind(nt, s->def_node) == NK_DefNode && !nt_int(nt, s->def_node, "node_bi", 0) &&
+          sp_streq(s->name, "method_missing")) g_ssa_keep_any = 1;
+    }
+    NT_FOREACH_KIND(nt, NK_CallNode, id) {
+      const char *n = nt_str(nt, id, "name");
+      if (!n || (!sp_streq(n, "define_method") && !sp_streq(n, "define_singleton_method"))) continue;
+      int blk = nt_ref(nt, id, "block");
+      if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode || ssa_params_have_block(nt, nt_ref(nt, blk, "parameters"))) g_ssa_keep_any = 1;
+    }
+  }
+  if (g_ssa_keep_any) return 1;
+  for (int si = 0; si < c->nscopes; si++) {
+    Scope *s = &c->scopes[si];
+    if (s->def_node < 0 || !s->name || nt_kind(nt, s->def_node) != NK_DefNode || !sp_streq(s->name, nm)) continue;
+    if (ssa_params_have_block(nt, nt_ref(nt, s->def_node, "parameters"))) return 1;
+    if (ssa_tree_has_super(nt, nt_ref(nt, s->def_node, "body"), 0)) return 1;
+  }
+  return 0;
+}
 static int cfg_block_on_graph(Compiler *c, int call, int typed) {
   const NodeTable *nt = c->nt;
   NodeKind k = nt_kind(nt, call);
   if (k != NK_CallNode && k != NK_SuperNode && k != NK_ForwardingSuperNode) return 0;
   int blk = nt_ref(nt, call, "block");
   if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode) return 0;
+  if (!typed && !getenv("SP_SSA_KEEP_OFF") && k != NK_CallNode) return 0;   /* super's target can keep the block */
   if (k == NK_CallNode) {
     const char *nm = nt_str(nt, call, "name");
     if (!nm) return 0;
     if (is_proc_literal(c, call)) return 0;
+    if (!typed && !getenv("SP_SSA_KEEP_OFF") && ssa_name_may_keep_block(c, nm)) return 0;
     static const char *const later[] = { "at_exit", "trap", "define_method", "define_singleton_method",
       "instance_eval", "instance_exec", "class_eval", "class_exec", "module_eval", "module_exec",
       "define_finalizer", "fork", "spawn", "lazy", "to_enum", "enum_for", "set_trace_func", NULL };
@@ -3252,7 +3303,7 @@ static void ssa_method(Compiler *c, Scope *s) {
          plain value would be undone after typing (ssa_check_splits), and
          the compile would run again. The local stays whole now. */
       { char why[128];
-        if (k && K && !getenv("SP_SSA_KEEP") && ssa_ir_boxed(&ir, K, uf, dl, dl_off, li, is_param[li], why, sizeof why)) {
+        if (k && K && getenv("SP_SSA_PLAIN_ONLY") && ssa_ir_boxed(&ir, K, uf, dl, dl_off, li, is_param[li], why, sizeof why)) {
           for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
             int r = ssa_find(uf, dl[q]);
             free(web_name[r]); web_name[r] = NULL;
@@ -3264,6 +3315,31 @@ static void ssa_method(Compiler *c, Scope *s) {
             if (ir.v[dl[q]].kind == IV_DEF || is_param[li]) ir_slot_note(s->idx, t.nm[li], K[dl[q]], !(K[dl[q]].k & KN_UNK), ir.v[dl[q]].kind == IV_ENTRY);
           continue;
         } }
+      /* A read can see the local before its first write (nil). A
+         true/false slot has no nil, so the split stays only when the IR
+         shows a write to that slot that is no true/false: the types then
+         give the slot more than true/false. Decided now, before typing. */
+      if (k && !is_param[li] && ir.v[li].live && !getenv("SP_SSA_PLAIN_ONLY")) {
+        int ok = 0;
+        for (int q = dl_off[li]; K && q < dl_off[li + 1] && !ok; q++) {
+          int d = dl[q];
+          if (ssa_find(uf, d) != r0 || ir.v[d].kind != IV_DEF || !ir.reached[ir.v[d].block]) continue;
+          unsigned short kk = K[d].k;
+          if (kk && !(kk & KN_UNK) && !(kk & KN_BOOL) && (kk & ~KN_NIL)) ok = 1;
+        }
+        if (!ok) {
+          for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
+            int r = ssa_find(uf, dl[q]);
+            free(web_name[r]); web_name[r] = NULL;
+          }
+          t.bad[li] = 1;
+          st_ssa_ir_whole++;
+          if (ssa_log()) fprintf(stderr, "spinel-ssa: %s: a read can see it before its first write and the slot may be true/false: one slot, before typing\n", key);
+          { const char *lf = getenv("SP_SSA_AGAIN_LOG"); FILE *f = lf && *lf ? fopen(lf, "a") : NULL;
+            if (f) { fprintf(f, "%s\t%s\tpre: read before first write\t-\n", g_sp_argv && g_sp_argv[0] ? g_sp_argv[g_sp_argv[1] ? 1 : 0] : "?", key); fclose(f); } }
+          continue;
+        }
+      }
       if (K) for (int q = dl_off[li]; q < dl_off[li + 1]; q++) {
         int d = dl[q], r = ssa_find(uf, d);
         if (ir.v[d].kind != IV_DEF && !is_param[li]) continue;   /* (nil before the first write: Spinel's types leave it out) */
@@ -3539,9 +3615,11 @@ void ssa_check_splits(Compiler *c) {
     const char *why = NULL, *later = NULL;
     for (int q = 0; q < sp->nnames && !why; q++) {
       LocalVar *lv = scope_local(sc, sp->names[q]);
-      /* SP_SSA_KEEP=1 (experiment): a split stays whatever kind of value its slots hold */
-      if (!lv || (!ssa_plain(lv->type) && !getenv("SP_SSA_KEEP"))) why = sp->names[q];
-      else if (lv->is_cell || lv->proc_rebinds || lv->cell_outlives) { why = sp->names[q]; later = "a proc shares it"; }
+      /* A split stays whatever kind of value its slots hold (an Array, a
+         Hash and an object too). SP_SSA_PLAIN_ONLY=1 brings back the old
+         rule: every slot a plain value, or the local is left whole. */
+      if (!lv || (!ssa_plain(lv->type) && getenv("SP_SSA_PLAIN_ONLY"))) why = sp->names[q];
+      else if (lv->cell_outlives || (getenv("SP_SSA_PLAIN_ONLY") && (lv->is_cell || lv->proc_rebinds))) { why = sp->names[q]; later = "a proc shares it"; }
     }
     if (!why && later_bad[i]) { why = sp->names[0]; later = "a block that can run after its call uses it"; }
     /* a true/false slot has no nil: a read the entry reaches would see false */
@@ -3550,34 +3628,22 @@ void ssa_check_splits(Compiler *c) {
       if (lv && lv->type == TY_BOOL) { why = sp->names[0]; later = "a true/false slot that a read can see before its first write"; }
     }
     if (!why) continue;
+    { const char *lf = getenv("SP_SSA_AGAIN_LOG");   /* each split taken back, and why */
+      FILE *f = lf && *lf ? fopen(lf, "a") : NULL;
+      if (f) { LocalVar *lv = scope_local(sc, why);
+               fprintf(f, "%s\t%s\t%s\t%s\n", g_sp_argv && g_sp_argv[0] ? g_sp_argv[g_sp_argv[1] ? 1 : 0] : "?", sp->key,
+                       later ? later : "missing or not plain", lv ? ty_name(lv->type) : "missing"); fclose(f); } }
     if (ssa_log()) {
       LocalVar *lv = scope_local(sc, why);
-      if (later) fprintf(stderr, "spinel-ssa: %s: %s: one slot again\n", sp->key, later);
+      if (later) fprintf(stderr, "spinel-ssa: %s: %s: split kept, logged only\n", sp->key, later);
       else fprintf(stderr, "spinel-ssa: %s: slot `%s` is %s, not a plain value: one slot again\n",
                    sp->key, why, lv ? ty_name(lv->type) : "missing");
     }
-    size_t kl = strlen(sp->key);
-    while (len + kl + 2 > cap) cap *= 2;
-    veto = realloc(veto, cap);
-    if (!veto) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    if (len) veto[len++] = ',';
-    memcpy(veto + len, sp->key, kl + 1); len += kl;
     nveto++;
   }
-  free(later_bad);
-  if (nveto == 0) { free(veto); return; }
-  /* each round leaves more locals whole; a third round turns SSA off */
-  const char *rs = getenv("SP_SSA_ROUND");
-  int round = rs ? atoi(rs) : 0;
-  char rb[16]; snprintf(rb, sizeof rb, "%d", round + 1);
-  setenv("SP_SSA_ROUND", rb, 1);
-  setenv("SP_SSA_VETO", veto, 1);
-  if (round + 1 >= 3) setenv("SP_NO_SSA", "1", 1);
-  free(veto);
-  if (!g_sp_argv) return;   /* (no argv to run again: keep the splits) */
-  if (ssa_log()) fprintf(stderr, "spinel-ssa: compiling again with %d local(s) left whole\n", nveto);
-  fflush(stdout); fflush(stderr);
-  execv("/proc/self/exe", g_sp_argv);
-  fprintf(stderr, "spinel: cannot run the compile again for SSA\n");
-  exit(1);
+  free(later_bad); free(veto);
+  /* No second compile: each case above is decided before the split
+     (cfg_block_on_graph for the blocks, the read-before-write rule in
+     ssa_method). What still gets here is only logged. */
+  (void)nveto;
 }
