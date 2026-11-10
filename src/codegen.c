@@ -3941,6 +3941,25 @@ int scope_reads_callee(Compiler *c, int si) {
   return 0;
 }
 
+/* Does this scope read the match registers: `$~`, `$&`, `` $` ``, `$'`,
+   `$+`, `$1`.., or Regexp.last_match? */
+static int scope_reads_match_regs(Compiler *c, int si) {
+  const NodeTable *nt = c->nt;
+  int nids = 0; const int *ids = cg_scope_nodes(c, si, &nids);
+  for (int k = 0; k < nids; k++) {
+    int id = ids[k];
+    NodeKind nk = nt_kind(nt, id);
+    if (nk == NK_BackReferenceReadNode || nk == NK_NumberedReferenceReadNode) return 1;
+    const char *nm = nt_str(nt, id, "name");
+    if (!nm) continue;
+    if (nk == NK_GlobalVariableReadNode &&
+        (sp_streq(nm, "$~") || sp_streq(nm, "$&") || sp_streq(nm, "$`") || sp_streq(nm, "$'") || sp_streq(nm, "$+")))
+      return 1;
+    if (nk == NK_CallNode && sp_streq(nm, "last_match")) return 1;
+  }
+  return 0;
+}
+
 static int scope_performs_match(Compiler *c, int si) {
   const NodeTable *nt = c->nt;
   static const char *const mnames[] = {
@@ -4107,9 +4126,15 @@ void emit_scope_decls_ends(Compiler *c, Scope *s, Buf *b, size_t *ends) {
   /* $~ and the $1.. globals derived from it are frame-local in Ruby: a match
      inside this method must not outlive it. The cleanup attribute puts the
      caller's registers back on every ordinary exit, early returns included. */
-  if (s->name && s->def_node >= 0 && scope_performs_match(c, si))
-    buf_puts(b, "    sp_re_frame _sp_rf SP_CLEANUP(sp_re_frame_pop);"
-                " sp_re_frame_push(&_sp_rf);\n");
+  /* A method that reads them starts with none of its own: `$~` there is
+     nil until the method matches, whatever its caller matched. */
+  if (s->name && s->def_node >= 0) {
+    int reads = scope_reads_match_regs(c, si);
+    if (reads || scope_performs_match(c, si))
+      buf_puts(b, "    sp_re_frame _sp_rf SP_CLEANUP(sp_re_frame_pop);"
+                  " sp_re_frame_push(&_sp_rf);\n");
+    if (reads) buf_puts(b, "    sp_re_clear_last_match();\n");
+  }
   /* Take the name this call spelled, and clear the channel so a call that did
      not write it (or a later nested one) cannot be mistaken for ours (#3729). */
   if (s->name && s->def_node >= 0 && scope_reads_callee(c, si))
