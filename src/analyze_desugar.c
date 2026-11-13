@@ -22808,7 +22808,8 @@ int desugar_inherited_aliases(Compiler *c) {
         /* the caller's block reaches the builtin, as through the alias (`raw_each { ... }` of Hash#each):
            only where the program calls the alias with one, as a builtin that takes no block
            (Array#size) is no call of the builtin with a block argument */
-        if (alias_called_with_block(nt, nwb, n0)) {
+        int with_block = alias_called_with_block(nt, nwb, n0);
+        if (with_block) {
           int bp = fwd_new_node_like(nt, s, "BlockParameterNode"), ba = fwd_new_node_like(nt, s, "BlockArgumentNode");
           nt_node_set_str(nt, bp, "name", "spinel_alias_b__");
           nt_node_set_ref(nt, ps, "block", bp);
@@ -22818,8 +22819,37 @@ int desugar_inherited_aliases(Compiler *c) {
         nt_node_set_str(nt, call, "name", odb);
         nt_node_set_ref(nt, call, "receiver", self);
         nt_node_set_int(nt, call, "builtin_only", 1);
+        int top = call;
+        /* Without a block, the builtin's Enumerator calls the method by its
+           own name on the receiver once it runs (`raw_each.to_a` runs the
+           class's own each): it is `to_enum(:od, ...)`, the builtin's call
+           only where the caller passes a block */
+        if (builtin_blockless_self_enum(root, odb, ar)) {
+          int te = fwd_new_node_like(nt, s, "CallNode"), tself = fwd_new_node_like(nt, s, "SelfNode");
+          int targs = fwd_new_node_like(nt, s, "ArgumentsNode"), sym = fwd_new_node_like(nt, s, "SymbolNode");
+          nt_node_set_str(nt, sym, "value", odb);
+          nt_node_set_str(nt, sym, "unescaped", odb);
+          int tv[9] = { sym };
+          for (int a = 0; a < ar; a++) tv[a + 1] = local_read_like(nt, s, nt_str(nt, req[a], "name"));
+          nt_node_set_arr(nt, targs, "arguments", tv, ar + 1);
+          nt_node_set_str(nt, te, "name", "to_enum");
+          nt_node_set_ref(nt, te, "receiver", tself);
+          nt_node_set_ref(nt, te, "arguments", targs);
+          top = te;
+          if (with_block) {
+            int ifn = fwd_new_node_like(nt, s, "IfNode"), ys = fwd_new_node_like(nt, s, "StatementsNode");
+            int ns = fwd_new_node_like(nt, s, "StatementsNode"), el = fwd_new_node_like(nt, s, "ElseNode");
+            nt_node_set_arr(nt, ys, "body", &call, 1);
+            nt_node_set_arr(nt, ns, "body", &te, 1);
+            nt_node_set_ref(nt, el, "statements", ns);
+            nt_node_set_ref(nt, ifn, "predicate", local_read_like(nt, s, "spinel_alias_b__"));
+            nt_node_set_ref(nt, ifn, "statements", ys);
+            nt_node_set_ref(nt, ifn, "subsequent", el);
+            top = ifn;
+          }
+        }
         int bd = fwd_new_node_like(nt, s, "StatementsNode");
-        nt_node_set_arr(nt, bd, "body", &call, 1);
+        nt_node_set_arr(nt, bd, "body", &top, 1);
         nt_node_set_str(nt, fd, "name", nwb);
         nt_node_set_ref(nt, fd, "parameters", ps);
         nt_node_set_ref(nt, fd, "body", bd);

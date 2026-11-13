@@ -1865,6 +1865,36 @@ int is_lazy_chain_name(const char *n) {
     "slice_before", "slice_when", "take", "take_while", "uniq", "with_index", NULL };
   return n && builtin_name_in(n, LAZY);
 }
+/* Does root's builtin method m (root Array, Hash or String), called with argc
+   arguments and no block, answer an Enumerator that calls m again by its
+   name on the receiver once it runs? An alias of m then makes one that runs
+   a subclass's own m. From a CRuby 4.0 run: each such call on a subclass
+   whose own m comes after `alias_method :raw, :m`, with `raw(*args)` asked
+   for its first element. chain, lazy, slice_after, slice_before and
+   yield_self make another kind of Enumerator, which does not call m. */
+int builtin_blockless_self_enum(const char *root, const char *m, int argc) {
+  static const char *const ARY0[] = { "bsearch", "bsearch_index", "chunk", "collect", "collect!", "collect_concat",
+    "cycle", "delete_if", "detect", "drop_while", "each", "each_entry", "each_index", "each_with_index", "filter",
+    "filter!", "filter_map", "find", "find_all", "find_index", "flat_map", "group_by", "index", "keep_if", "map",
+    "map!", "max_by", "min_by", "minmax_by", "partition", "permutation", "reject", "reject!", "reverse_each",
+    "rfind", "rindex", "select", "select!", "sort_by", "sort_by!", "take_while", "then", NULL };
+  static const char *const ARY1[] = { "combination", "each_cons", "each_slice", "each_with_object",
+    "repeated_combination", "repeated_permutation", NULL };
+  static const char *const HASH0[] = { "chunk", "collect", "collect_concat", "cycle", "delete_if", "detect",
+    "drop_while", "each", "each_entry", "each_key", "each_pair", "each_value", "each_with_index", "filter",
+    "filter!", "filter_map", "find", "find_all", "find_index", "flat_map", "group_by", "keep_if", "map", "max_by",
+    "min_by", "minmax_by", "partition", "reject", "reject!", "reverse_each", "select", "select!", "sort_by",
+    "take_while", "then", "transform_keys", "transform_keys!", "transform_values", "transform_values!", NULL };
+  static const char *const HASH1[] = { "each_cons", "each_slice", "each_with_object", NULL };
+  static const char *const STR0[] = { "each_byte", "each_char", "each_codepoint", "each_grapheme_cluster",
+    "each_line", "then", NULL };
+  static const char *const STR1[] = { "gsub", "gsub!", "upto", NULL };
+  if (!root || !m || argc < 0 || argc > 1) return 0;
+  const char *const *v = sp_streq(root, "Array") ? (argc ? ARY1 : ARY0)
+                       : sp_streq(root, "Hash") ? (argc ? HASH1 : HASH0)
+                       : sp_streq(root, "String") ? (argc ? STR1 : STR0) : NULL;
+  return v && builtin_name_in(m, v);
+}
 /* A call on a lazy enumerator that runs its chain before it answers, with a
    value that is not the chain: always (first, to_a, sum, ...), or given a
    block (each, find, group_by, ...: with none, each answers the chain on as

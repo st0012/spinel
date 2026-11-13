@@ -489,6 +489,7 @@ int is_clear_name(const char *n); /* clear */
 int is_enumerator_with(const char *n); /* with_index with_object: an enumerator link */
 int is_lazy_name(const char *n);       /* lazy */
 int is_lazy_chain_name(const char *n);   /* a Lazy's call that answers a Lazy: map, select, take, ... */
+int builtin_blockless_self_enum(const char *root, const char *m, int argc); /* Array#each, Hash#map, ...: no block, an Enumerator calling m by name */
 int is_lazy_forcing_name(const char *n, int block); /* a Lazy's call that forces it: first, to_a, each { }, ... */
 int is_concat_name(const char *n);     /* concat */
 int is_array_constructor(const char *recv, const char *meth); /* Array.new */
