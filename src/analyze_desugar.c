@@ -22825,7 +22825,7 @@ int desugar_inherited_aliases(Compiler *c) {
            class's own each): it is `to_enum(:od, ...)`, the builtin's call
            only where the caller passes a block */
         if (builtin_blockless_self_enum(root, odb, ar)) {
-          int te = fwd_new_node_like(nt, s, "CallNode"), tself = fwd_new_node_like(nt, s, "SelfNode");
+          int te = fwd_new_node_like(nt, s, "CallNode");
           int targs = fwd_new_node_like(nt, s, "ArgumentsNode"), sym = fwd_new_node_like(nt, s, "SymbolNode");
           nt_node_set_str(nt, sym, "value", odb);
           nt_node_set_str(nt, sym, "unescaped", odb);
@@ -22833,7 +22833,6 @@ int desugar_inherited_aliases(Compiler *c) {
           for (int a = 0; a < ar; a++) tv[a + 1] = local_read_like(nt, s, nt_str(nt, req[a], "name"));
           nt_node_set_arr(nt, targs, "arguments", tv, ar + 1);
           nt_node_set_str(nt, te, "name", "to_enum");
-          nt_node_set_ref(nt, te, "receiver", tself);
           nt_node_set_ref(nt, te, "arguments", targs);
           top = te;
           if (with_block) {
